@@ -1461,7 +1461,7 @@ private fun AnnotationDialog(
     val savedDraft = remember(draftKey, initialTimestamp) { draftStore.load(draftKey) }
     val baseTimestamp = savedDraft?.timestamp ?: initial?.timestamp ?: initialTimestamp
     var dateText by remember(initial?.id, initialTimestamp) {
-        mutableStateOf(formatEpoch(baseTimestamp, formatter))
+        mutableStateOf(savedDraft?.dateText?.takeIf { it.isNotBlank() } ?: formatEpoch(baseTimestamp, formatter))
     }
     var title by remember(initial?.id, initialTimestamp) {
         mutableStateOf(savedDraft?.title ?: initial?.title.orEmpty())
@@ -1492,6 +1492,7 @@ private fun AnnotationDialog(
             draftKey,
             AnnotationDraft(
                 timestamp = ts,
+                dateText = dateText,
                 title = title,
                 note = note,
                 sensorId = sensorId,
