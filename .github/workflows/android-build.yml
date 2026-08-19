@@ -48,13 +48,13 @@ jobs:
       - name: Stage named APK
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/debug/app-debug.apk artifacts/FabData-v0.4-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk artifacts/FabData-v0.5-debug.apk
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.4-debug
-          path: artifacts/FabData-v0.4-debug.apk
+          name: FabData-v0.5-debug
+          path: artifacts/FabData-v0.5-debug.apk
           if-no-files-found: error
 
       - name: Publish APK on branch
@@ -62,10 +62,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add artifacts/FabData-v0.4-debug.apk
+          git add artifacts/FabData-v0.5-debug.apk
           if git diff --cached --quiet; then
             echo "APK unchanged"
           else
-            git commit -m "Build FabData v0.4 APK"
+            git commit -m "Build FabData v0.5 APK"
             git push
           fi
