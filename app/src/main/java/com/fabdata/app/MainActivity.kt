@@ -181,6 +181,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val context = LocalContext.current
     val importer = remember { CsvImporter(context, db) }
     val backup = remember { FabDataBackup(context, db) }
+    val draftStore = remember { AnnotationDraftStore(context) }
     val prefsStore = remember { FabPrefs(context) }
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
@@ -504,6 +505,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             initialTimestamp = ts,
             initial = editingAnnotation,
             sensors = sensors,
+            draftStore = draftStore,
             onDismiss = {
                 annotationTimestamp = null
                 editingAnnotation = null
@@ -1450,22 +1452,54 @@ private fun AnnotationDialog(
     initialTimestamp: Long,
     initial: AnnotationItem?,
     sensors: List<Sensor>,
+    draftStore: AnnotationDraftStore,
     onDismiss: () -> Unit,
     onSave: (Long?, Long, String, String, Long?, String?, String?) -> Unit
 ) {
     val formatter = remember { DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm") }
+    val draftKey = remember(initial?.id) { initial?.id?.let { "edit_$it" } ?: "new" }
+    val savedDraft = remember(draftKey, initialTimestamp) { draftStore.load(draftKey) }
+    val baseTimestamp = savedDraft?.timestamp ?: initial?.timestamp ?: initialTimestamp
     var dateText by remember(initial?.id, initialTimestamp) {
-        mutableStateOf(formatEpoch(initial?.timestamp ?: initialTimestamp, formatter))
+        mutableStateOf(formatEpoch(baseTimestamp, formatter))
     }
-    var title by remember(initial?.id) { mutableStateOf(initial?.title.orEmpty()) }
-    var note by remember(initial?.id) { mutableStateOf(initial?.note.orEmpty()) }
-    var sensorId by remember(initial?.id) { mutableStateOf(initial?.sensorId) }
-    var roomName by remember(initial?.id) {
-        mutableStateOf(initial?.roomName ?: initial?.sensorId?.let { id -> sensors.firstOrNull { it.id == id }?.room }.orEmpty())
+    var title by remember(initial?.id, initialTimestamp) {
+        mutableStateOf(savedDraft?.title ?: initial?.title.orEmpty())
     }
-    var type by remember(initial?.id) { mutableStateOf(initial?.type.orEmpty()) }
+    var note by remember(initial?.id, initialTimestamp) {
+        mutableStateOf(savedDraft?.note ?: initial?.note.orEmpty())
+    }
+    var sensorId by remember(initial?.id, initialTimestamp) {
+        mutableStateOf(savedDraft?.sensorId ?: initial?.sensorId)
+    }
+    var roomName by remember(initial?.id, initialTimestamp) {
+        mutableStateOf(
+            savedDraft?.roomName
+                ?: initial?.roomName
+                ?: initial?.sensorId?.let { id -> sensors.firstOrNull { it.id == id }?.room }
+                .orEmpty()
+        )
+    }
+    var type by remember(initial?.id, initialTimestamp) {
+        mutableStateOf(savedDraft?.type ?: initial?.type.orEmpty())
+    }
     var sensorMenu by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf(false) }
+
+    LaunchedEffect(dateText, title, note, sensorId, roomName, type, draftKey) {
+        val ts = parseLocalDate(dateText, formatter) ?: baseTimestamp
+        draftStore.save(
+            draftKey,
+            AnnotationDraft(
+                timestamp = ts,
+                title = title,
+                note = note,
+                sensorId = sensorId,
+                roomName = roomName,
+                type = type
+            )
+        )
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1475,6 +1509,11 @@ private fun AnnotationDialog(
                 Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Text(
+                    "Brouillon sauvegardé automatiquement",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
                 OutlinedTextField(
                     dateText,
                     { dateText = it; error = false },
@@ -1541,6 +1580,7 @@ private fun AnnotationDialog(
                 if (ts == null) {
                     error = true
                 } else {
+                    draftStore.clear(draftKey)
                     onSave(
                         initial?.id,
                         ts,
