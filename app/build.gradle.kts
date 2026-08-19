@@ -4,6 +4,17 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val uploadStorePath = System.getenv("FABDATA_KEYSTORE_PATH")
+val uploadStorePassword = System.getenv("FABDATA_KEYSTORE_PASSWORD")
+val uploadKeyAlias = System.getenv("FABDATA_KEY_ALIAS")
+val uploadKeyPassword = System.getenv("FABDATA_KEY_PASSWORD")
+val hasUploadSigning = listOf(
+    uploadStorePath,
+    uploadStorePassword,
+    uploadKeyAlias,
+    uploadKeyPassword
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.fabdata.app"
     compileSdk = 36
@@ -12,15 +23,33 @@ android {
         applicationId = "com.fabdata.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.6"
+        versionCode = 7
+        versionName = "0.7"
+    }
+
+    signingConfigs {
+        if (hasUploadSigning) {
+            create("upload") {
+                storeFile = file(uploadStorePath!!)
+                storePassword = uploadStorePassword
+                keyAlias = uploadKeyAlias
+                keyPassword = uploadKeyPassword
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            // GitHub Actions utilise la vraie clé d'import Google Play quand les
+            // secrets sont présents. Sans secrets, on garde une signature de
+            // développement afin de continuer à produire un APK installable.
+            signingConfig = if (hasUploadSigning) {
+                signingConfigs.getByName("upload")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
