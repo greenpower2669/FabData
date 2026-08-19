@@ -38,7 +38,10 @@ data class AnnotationItem(
     val timestamp: Long,
     val title: String,
     val note: String,
-    val sensorId: Long?
+    val sensorId: Long?,
+    val roomName: String?,
+    val type: String?,
+    val updatedAt: Long
 )
 
 data class SensorStats(
@@ -63,7 +66,7 @@ data class ImportResult(
     val lastTimestamp: Long?
 )
 
-class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 1) {
+class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             """
@@ -99,7 +102,10 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
                 title TEXT NOT NULL,
                 note TEXT NOT NULL DEFAULT '',
                 sensor_id INTEGER,
+                room_name TEXT,
+                type TEXT,
                 created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
                 FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE SET NULL
             )
             """.trimIndent()
@@ -107,7 +113,14 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         db.execSQL("CREATE INDEX idx_annotations_time ON annotations(timestamp)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE annotations ADD COLUMN room_name TEXT")
+            db.execSQL("ALTER TABLE annotations ADD COLUMN type TEXT")
+            db.execSQL("ALTER TABLE annotations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("UPDATE annotations SET updated_at = created_at WHERE updated_at = 0")
+        }
+    }
 
     override fun onConfigure(db: SQLiteDatabase) {
         super.onConfigure(db)
@@ -202,29 +215,40 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         }
     }
 
-    fun querySamples(sensorId: Long, from: Long, to: Long, maxPoints: Int = 2600): List<SamplePoint> {
-        val count = readableDatabase.rawQuery(
-            "SELECT COUNT(*) FROM samples WHERE sensor_id = ? AND timestamp BETWEEN ? AND ?",
-            arrayOf(sensorId.toString(), from.toString(), to.toString())
-        ).use { c -> c.moveToFirst(); c.getInt(0) }
-        if (count == 0) return emptyList()
-        val stride = ceil(count.toDouble() / maxPoints.coerceAtLeast(1)).toInt().coerceAtLeast(1)
-        val out = ArrayList<SamplePoint>(minOf(count, maxPoints + 2))
-        var index = 0
-        var last: SamplePoint? = null
+    /**
+     * Returns a display-friendly series while preserving local extrema in long histories.
+     * The database always keeps every imported point. Downsampling only affects rendering.
+     */
+    fun querySamples(sensorId: Long, from: Long, to: Long, maxPoints: Int = 5000): List<SamplePoint> {
+        val all = ArrayList<SamplePoint>()
         readableDatabase.rawQuery(
             "SELECT timestamp, temperature, humidity FROM samples WHERE sensor_id = ? AND timestamp BETWEEN ? AND ? ORDER BY timestamp",
             arrayOf(sensorId.toString(), from.toString(), to.toString())
         ).use { c ->
             while (c.moveToNext()) {
-                val p = SamplePoint(sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2))
-                last = p
-                if (index % stride == 0) out += p
-                index++
+                all += SamplePoint(sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2))
             }
         }
-        if (last != null && (out.isEmpty() || out.last().timestamp != last!!.timestamp)) out += last!!
-        return out
+        if (all.size <= maxPoints) return all
+
+        val targetBuckets = (maxPoints / 4).coerceAtLeast(1)
+        val bucketSize = ceil(all.size.toDouble() / targetBuckets.toDouble()).toInt().coerceAtLeast(1)
+        val out = ArrayList<SamplePoint>(maxPoints + 8)
+        var start = 0
+        while (start < all.size) {
+            val end = minOf(all.size, start + bucketSize)
+            val bucket = all.subList(start, end)
+            val selected = linkedSetOf<SamplePoint>()
+            selected += bucket.first()
+            selected += bucket.minByOrNull { it.temperature } ?: bucket.first()
+            selected += bucket.maxByOrNull { it.temperature } ?: bucket.first()
+            selected += bucket.minByOrNull { it.humidity } ?: bucket.first()
+            selected += bucket.maxByOrNull { it.humidity } ?: bucket.first()
+            selected += bucket.last()
+            out += selected.sortedBy { it.timestamp }
+            start = end
+        }
+        return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
     }
 
     fun stats(sensorId: Long, from: Long, to: Long): SensorStats? {
@@ -250,25 +274,66 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         }
     }
 
-    fun addAnnotation(timestamp: Long, title: String, note: String, sensorId: Long?) {
+    fun addAnnotation(
+        timestamp: Long,
+        title: String,
+        note: String,
+        sensorId: Long?,
+        roomName: String?,
+        type: String?
+    ): Long {
+        val now = System.currentTimeMillis()
         val values = ContentValues().apply {
             put("timestamp", timestamp)
-            put("title", title.trim().ifBlank { "Annotation" })
+            put("title", title.trim().ifBlank { "Événement" })
             put("note", note.trim())
             if (sensorId == null) putNull("sensor_id") else put("sensor_id", sensorId)
-            put("created_at", System.currentTimeMillis())
+            if (roomName.isNullOrBlank()) putNull("room_name") else put("room_name", roomName.trim())
+            if (type.isNullOrBlank()) putNull("type") else put("type", type.trim())
+            put("created_at", now)
+            put("updated_at", now)
         }
-        writableDatabase.insertOrThrow("annotations", null, values)
+        return writableDatabase.insertOrThrow("annotations", null, values)
+    }
+
+    fun updateAnnotation(
+        id: Long,
+        timestamp: Long,
+        title: String,
+        note: String,
+        sensorId: Long?,
+        roomName: String?,
+        type: String?
+    ) {
+        val values = ContentValues().apply {
+            put("timestamp", timestamp)
+            put("title", title.trim().ifBlank { "Événement" })
+            put("note", note.trim())
+            if (sensorId == null) putNull("sensor_id") else put("sensor_id", sensorId)
+            if (roomName.isNullOrBlank()) putNull("room_name") else put("room_name", roomName.trim())
+            if (type.isNullOrBlank()) putNull("type") else put("type", type.trim())
+            put("updated_at", System.currentTimeMillis())
+        }
+        writableDatabase.update("annotations", values, "id = ?", arrayOf(id.toString()))
     }
 
     fun annotations(from: Long, to: Long): List<AnnotationItem> {
         val out = mutableListOf<AnnotationItem>()
         readableDatabase.rawQuery(
-            "SELECT id, timestamp, title, note, sensor_id FROM annotations WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
+            "SELECT id, timestamp, title, note, sensor_id, room_name, type, updated_at FROM annotations WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp",
             arrayOf(from.toString(), to.toString())
         ).use { c ->
             while (c.moveToNext()) {
-                out += AnnotationItem(c.getLong(0), c.getLong(1), c.getString(2), c.getString(3), if (c.isNull(4)) null else c.getLong(4))
+                out += AnnotationItem(
+                    id = c.getLong(0),
+                    timestamp = c.getLong(1),
+                    title = c.getString(2),
+                    note = c.getString(3),
+                    sensorId = if (c.isNull(4)) null else c.getLong(4),
+                    roomName = if (c.isNull(5)) null else c.getString(5),
+                    type = if (c.isNull(6)) null else c.getString(6),
+                    updatedAt = if (c.isNull(7)) 0L else c.getLong(7)
+                )
             }
         }
         return out
