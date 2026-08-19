@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -179,6 +180,7 @@ private data class LoadedData(
 private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val context = LocalContext.current
     val importer = remember { CsvImporter(context, db) }
+    val backup = remember { FabDataBackup(context, db) }
     val prefsStore = remember { FabPrefs(context) }
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
@@ -204,23 +206,48 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val showHumidity = remember { mutableStateMapOf<Long, Boolean>() }
     var initialHandled by remember { mutableStateOf(false) }
 
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        if (uri != null) {
+            scope.launch {
+                busy = true
+                val result = withContext(Dispatchers.IO) { runCatching { backup.export(uri) } }
+                busy = false
+                snackbar.showSnackbar(
+                    result.fold(
+                        onSuccess = {
+                            "Sauvegarde créée : ${it.measurements} mesures · ${it.events} événement(s) · ${it.sensors} capteur(s)"
+                        },
+                        onFailure = { "Sauvegarde impossible : ${it.message ?: "erreur inconnue"}" }
+                    )
+                )
+            }
+        }
+    }
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
             scope.launch {
                 busy = true
                 val results = withContext(Dispatchers.IO) {
-                    uris.map { uri -> runCatching { importer.import(uri) } }
+                    uris.map { uri ->
+                        runCatching {
+                            backup.importIfBackup(uri) ?: importer.import(uri).toFabDataImportSummary()
+                        }
+                    }
                 }
                 val ok = results.mapNotNull { it.getOrNull() }
                 val errors = results.count { it.isFailure }
-                val added = ok.sumOf { it.added }
-                val duplicates = ok.sumOf { it.duplicates }
+                val measuresAdded = ok.sumOf { it.measurementsAdded }
+                val measuresDuplicates = ok.sumOf { it.measurementsDuplicates }
+                val eventsAdded = ok.sumOf { it.eventsAdded }
+                val eventsDuplicates = ok.sumOf { it.eventsDuplicates }
                 val invalid = ok.sumOf { it.invalid }
                 busy = false
                 reloadToken++
                 snackbar.showSnackbar(
-                    "Import : $added ajoutées · $duplicates déjà présentes · $invalid invalides" +
-                        if (errors > 0) " · $errors fichier(s) en erreur" else ""
+                    "Import : $measuresAdded mesure(s) ajoutée(s) · $measuresDuplicates déjà présente(s) · " +
+                        "$eventsAdded événement(s) restauré(s) · $eventsDuplicates événement(s) déjà présent(s) · " +
+                        "$invalid invalide(s)" + if (errors > 0) " · $errors fichier(s) en erreur" else ""
                 )
             }
         }
@@ -230,12 +257,19 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (!initialHandled && initialImport != null) {
             initialHandled = true
             busy = true
-            val result = withContext(Dispatchers.IO) { runCatching { importer.import(initialImport) } }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    backup.importIfBackup(initialImport) ?: importer.import(initialImport).toFabDataImportSummary()
+                }
+            }
             busy = false
             reloadToken++
             snackbar.showSnackbar(
                 result.fold(
-                    onSuccess = { "${it.added} mesure(s) ajoutée(s), ${it.duplicates} déjà présentes" },
+                    onSuccess = {
+                        "Import : ${it.measurementsAdded} mesure(s) ajoutée(s) · ${it.measurementsDuplicates} déjà présente(s) · " +
+                            "${it.eventsAdded} événement(s) restauré(s) · ${it.eventsDuplicates} déjà présent(s)"
+                    },
                     onFailure = { "Import impossible : ${it.message ?: "format inconnu"}" }
                 )
             )
@@ -294,6 +328,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     IconButton(onClick = {
                         picker.launch(arrayOf("text/*", "application/csv", "application/vnd.ms-excel"))
                     }) { Icon(Icons.Default.FileOpen, contentDescription = "Importer des CSV") }
+                    IconButton(onClick = {
+                        exportLauncher.launch("FabData_sauvegarde.csv")
+                    }) {
+                        Icon(Icons.Default.FileDownload, contentDescription = "Exporter / sauvegarder FabData")
+                    }
                     IconButton(onClick = { reloadToken++ }) {
                         Icon(Icons.Default.Refresh, contentDescription = "Actualiser")
                     }
