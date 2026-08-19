@@ -1345,7 +1345,10 @@ private fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = { Text("Réglages FabData") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 SettingSwitch("Grille du graphique", grid) { grid = it }
                 SettingSwitch("Afficher les points", points) { points = it }
                 Text("Épaisseur des courbes : ${String.format(Locale.FRANCE, "%.1f", width)}")
@@ -1367,6 +1370,20 @@ private fun SettingsDialog(
                     { highHum = it },
                     label = { Text("Humidité haute (%)") },
                     singleLine = true
+                )
+                HorizontalDivider()
+                Text("Politique de confidentialité · FabData v0.7", fontWeight = FontWeight.Bold)
+                Text(
+                    "Les mesures, noms de pièces et événements sont traités localement sur cet appareil. " +
+                        "FabData n'envoie aucune donnée utilisateur à un serveur, n'intègre ni publicité ni analytique " +
+                        "et ne crée aucun compte utilisateur.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "Les imports et sauvegardes CSV sont déclenchés explicitement par l'utilisateur via le sélecteur " +
+                        "de fichiers Android. Contact confidentialité : dépôt GitHub greenpower2669/FabData.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 HorizontalDivider()
                 TextButton(onClick = onClear) {
