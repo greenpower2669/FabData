@@ -4,6 +4,7 @@ import android.content.Context
 
 data class AnnotationDraft(
     val timestamp: Long,
+    val dateText: String,
     val title: String,
     val note: String,
     val sensorId: Long?,
@@ -19,6 +20,7 @@ class AnnotationDraftStore(context: Context) {
         val sensor = prefs.getLong("$key.sensor", Long.MIN_VALUE).let { if (it == Long.MIN_VALUE) null else it }
         return AnnotationDraft(
             timestamp = prefs.getLong("$key.timestamp", System.currentTimeMillis()),
+            dateText = prefs.getString("$key.date_text", "").orEmpty(),
             title = prefs.getString("$key.title", "").orEmpty(),
             note = prefs.getString("$key.note", "").orEmpty(),
             sensorId = sensor,
@@ -31,6 +33,7 @@ class AnnotationDraftStore(context: Context) {
         prefs.edit()
             .putBoolean("$key.exists", true)
             .putLong("$key.timestamp", draft.timestamp)
+            .putString("$key.date_text", draft.dateText)
             .putString("$key.title", draft.title)
             .putString("$key.note", draft.note)
             .putLong("$key.sensor", draft.sensorId ?: Long.MIN_VALUE)
@@ -43,6 +46,7 @@ class AnnotationDraftStore(context: Context) {
         prefs.edit()
             .remove("$key.exists")
             .remove("$key.timestamp")
+            .remove("$key.date_text")
             .remove("$key.title")
             .remove("$key.note")
             .remove("$key.sensor")
