@@ -31,6 +31,7 @@ jobs:
           python3 scripts/apply-v05-backup-fix.py
           python3 scripts/apply-v06-draft-patch.py
           python3 scripts/apply-v06-draft-date-fix.py
+          python3 scripts/apply-v07-play-policy.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
