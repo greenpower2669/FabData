@@ -6,6 +6,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -14,6 +15,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,8 +28,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
@@ -39,12 +43,15 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -106,8 +113,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class RangePreset(val label: String, val hours: Int?) {
-    H1("1 h", 1), H6("6 h", 6), H12("12 h", 12), H24("24 h", 24), ALL("Tout", null)
+private enum class TimePreset(val label: String, val spanMs: Long) {
+    HOUR("Heure", 60L * 60L * 1000L),
+    DAY("Jour", 24L * 60L * 60L * 1000L),
+    WEEK("Semaine", 7L * 24L * 60L * 60L * 1000L),
+    MONTH("Mois", 31L * 24L * 60L * 60L * 1000L),
+    YEAR("Année", 366L * 24L * 60L * 60L * 1000L)
 }
 
 private data class ChartPrefs(
@@ -121,6 +132,7 @@ private data class ChartPrefs(
 
 private class FabPrefs(context: Context) {
     private val p = context.getSharedPreferences("fabdata_prefs", Context.MODE_PRIVATE)
+
     fun load() = ChartPrefs(
         showGrid = p.getBoolean("show_grid", true),
         showPoints = p.getBoolean("show_points", false),
@@ -129,6 +141,7 @@ private class FabPrefs(context: Context) {
         lowHumidity = p.getString("low_humidity", "30")?.toDoubleOrNull() ?: 30.0,
         highHumidity = p.getString("high_humidity", "70")?.toDoubleOrNull() ?: 70.0
     )
+
     fun save(v: ChartPrefs) {
         p.edit()
             .putBoolean("show_grid", v.showGrid)
@@ -142,8 +155,23 @@ private class FabPrefs(context: Context) {
 }
 
 private val palette = listOf(
-    Color(0xFF1769AA), Color(0xFFD1495B), Color(0xFF2A9D8F), Color(0xFFE08E0B),
-    Color(0xFF6A4C93), Color(0xFF0081A7), Color(0xFFB56576), Color(0xFF588157)
+    Color(0xFF1769AA),
+    Color(0xFFD1495B),
+    Color(0xFF2A9D8F),
+    Color(0xFFE08E0B),
+    Color(0xFF6A4C93),
+    Color(0xFF0081A7),
+    Color(0xFFB56576),
+    Color(0xFF588157)
+)
+
+private data class LoadedData(
+    val sensors: List<Sensor>,
+    val globalBounds: LongRange?,
+    val viewBounds: LongRange?,
+    val samples: Map<Long, List<SamplePoint>>,
+    val stats: Map<Long, SensorStats>,
+    val annotations: List<AnnotationItem>
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -159,13 +187,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var sampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var statsMap by remember { mutableStateOf<Map<Long, SensorStats>>(emptyMap()) }
     var annotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
-    var bounds by remember { mutableStateOf<LongRange?>(null) }
-    var preset by rememberSaveable { mutableStateOf(RangePreset.ALL) }
+    var globalBounds by remember { mutableStateOf<LongRange?>(null) }
+    var viewBounds by remember { mutableStateOf<LongRange?>(null) }
+    var preset by rememberSaveable { mutableStateOf(TimePreset.WEEK) }
     var reloadToken by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var selectedTimestamp by remember { mutableStateOf<Long?>(null) }
+    var selectedAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
+    var detailAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
-    var annotationOpen by remember { mutableStateOf(false) }
+    var annotationTimestamp by remember { mutableStateOf<Long?>(null) }
+    var editingAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var editSensor by remember { mutableStateOf<Sensor?>(null) }
     var prefs by remember { mutableStateOf(prefsStore.load()) }
     val showTemp = remember { mutableStateMapOf<Long, Boolean>() }
@@ -186,7 +218,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 val invalid = ok.sumOf { it.invalid }
                 busy = false
                 reloadToken++
-                snackbar.showSnackbar("Import : $added ajoutées · $duplicates déjà présentes · $invalid invalides${if (errors > 0) " · $errors fichier(s) en erreur" else ""}")
+                snackbar.showSnackbar(
+                    "Import : $added ajoutées · $duplicates déjà présentes · $invalid invalides" +
+                        if (errors > 0) " · $errors fichier(s) en erreur" else ""
+                )
             }
         }
     }
@@ -198,10 +233,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             val result = withContext(Dispatchers.IO) { runCatching { importer.import(initialImport) } }
             busy = false
             reloadToken++
-            snackbar.showSnackbar(result.fold(
-                onSuccess = { "${it.added} mesure(s) ajoutée(s), ${it.duplicates} déjà présentes" },
-                onFailure = { "Import impossible : ${it.message ?: "format inconnu"}" }
-            ))
+            snackbar.showSnackbar(
+                result.fold(
+                    onSuccess = { "${it.added} mesure(s) ajoutée(s), ${it.duplicates} déjà présentes" },
+                    onFailure = { "Import impossible : ${it.message ?: "format inconnu"}" }
+                )
+            )
         }
     }
 
@@ -209,23 +246,26 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         busy = true
         val loaded = withContext(Dispatchers.IO) {
             val s = db.sensors()
-            val allBounds = db.globalTimeBounds()
-            val chosenBounds = if (allBounds == null) null else {
-                val end = allBounds.last
-                val start = preset.hours?.let { max(allBounds.first, end - it * 60L * 60L * 1000L) } ?: allBounds.first
-                start..end
+            val all = db.globalTimeBounds()
+            val chosen = all?.let {
+                val end = it.last
+                max(it.first, end - preset.spanMs)..end
             }
-            if (chosenBounds == null) {
-                LoadedData(s, null, emptyMap(), emptyMap(), emptyList())
+            if (chosen == null) {
+                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyList())
             } else {
-                val samples = s.associate { sensor -> sensor.id to db.querySamples(sensor.id, chosenBounds.first, chosenBounds.last) }
-                val stat = s.mapNotNull { sensor -> db.stats(sensor.id, chosenBounds.first, chosenBounds.last)?.let { sensor.id to it } }.toMap()
-                val notes = db.annotations(chosenBounds.first, chosenBounds.last)
-                LoadedData(s, chosenBounds, samples, stat, notes)
+                val samples = s.associate { sensor ->
+                    sensor.id to db.querySamples(sensor.id, chosen.first, chosen.last)
+                }
+                val stat = s.mapNotNull { sensor ->
+                    db.stats(sensor.id, chosen.first, chosen.last)?.let { value -> sensor.id to value }
+                }.toMap()
+                LoadedData(s, all, chosen, samples, stat, db.annotations(chosen.first, chosen.last))
             }
         }
         sensors = loaded.sensors
-        bounds = loaded.bounds
+        globalBounds = loaded.globalBounds
+        viewBounds = loaded.viewBounds
         sampleMap = loaded.samples
         statsMap = loaded.stats
         annotations = loaded.annotations
@@ -244,16 +284,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     Column {
                         Text("FabData", fontWeight = FontWeight.Bold)
                         Text(
-                            if (busy) "Mise à jour…" else "Analyse thermo-hygrométrique",
+                            if (busy) "Mise à jour…" else "Courbes & événements",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
-                    IconButton(onClick = { picker.launch(arrayOf("text/*", "application/csv", "application/vnd.ms-excel")) }) {
-                        Icon(Icons.Default.FileOpen, contentDescription = "Importer des CSV")
-                    }
+                    IconButton(onClick = {
+                        picker.launch(arrayOf("text/*", "application/csv", "application/vnd.ms-excel"))
+                    }) { Icon(Icons.Default.FileOpen, contentDescription = "Importer des CSV") }
                     IconButton(onClick = { reloadToken++ }) {
                         Icon(Icons.Default.Refresh, contentDescription = "Actualiser")
                     }
@@ -264,25 +304,35 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { annotationOpen = true }, containerColor = MaterialTheme.colorScheme.primaryContainer) {
+            FloatingActionButton(
+                onClick = {
+                    editingAnnotation = null
+                    annotationTimestamp = selectedTimestamp ?: viewBounds?.last ?: System.currentTimeMillis()
+                },
+                containerColor = MaterialTheme.colorScheme.primaryContainer
+            ) {
                 Icon(Icons.Default.Add, contentDescription = "Ajouter une annotation")
             }
         }
     ) { padding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(14.dp),
+            contentPadding = PaddingValues(14.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-                DashboardSummary(sensors, statsMap, bounds)
+                TimeTabs(preset = preset, onSelect = {
+                    preset = it
+                    selectedTimestamp = null
+                    selectedAnnotation = null
+                })
             }
-            item {
-                RangeSelector(preset = preset, onSelect = { preset = it })
-            }
+
             if (sensors.isEmpty()) {
                 item {
-                    EmptyState(onImport = { picker.launch(arrayOf("text/*", "application/csv", "application/vnd.ms-excel")) })
+                    EmptyState {
+                        picker.launch(arrayOf("text/*", "application/csv", "application/vnd.ms-excel"))
+                    }
                 }
             } else {
                 item {
@@ -293,6 +343,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         onEdit = { editSensor = it }
                     )
                 }
+
                 item {
                     ChartCard(
                         sensors = sensors,
@@ -300,36 +351,86 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         showTemp = showTemp,
                         showHumidity = showHumidity,
                         annotations = annotations,
-                        bounds = bounds,
+                        bounds = viewBounds,
                         prefs = prefs,
                         selectedTimestamp = selectedTimestamp,
-                        onSelectTimestamp = { selectedTimestamp = it }
+                        onSelectTimestamp = {
+                            selectedTimestamp = it
+                            selectedAnnotation = null
+                        },
+                        onAnnotationClick = {
+                            selectedAnnotation = it
+                            selectedTimestamp = it.timestamp
+                        },
+                        onAnnotationDoubleClick = {
+                            detailAnnotation = it
+                            selectedAnnotation = it
+                        },
+                        onRequestAnnotation = { ts ->
+                            editingAnnotation = null
+                            annotationTimestamp = ts
+                            selectedTimestamp = ts
+                        }
                     )
                 }
+
+                selectedAnnotation?.let { note ->
+                    item {
+                        AnnotationPreviewCard(
+                            annotation = note,
+                            sensors = sensors,
+                            sampleMap = sampleMap,
+                            onOpen = { detailAnnotation = note },
+                            onClose = { selectedAnnotation = null }
+                        )
+                    }
+                }
+
                 selectedTimestamp?.let { ts ->
                     item {
                         InspectorCard(ts, sensors, sampleMap, showTemp, showHumidity)
                     }
                 }
+
                 item {
-                    Text("Résumé par pièce", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    PeriodSummaryCard(
+                        preset = preset,
+                        statsMap = statsMap,
+                        sensors = sensors,
+                        viewBounds = viewBounds,
+                        globalBounds = globalBounds
+                    )
                 }
+
+                item {
+                    Text(
+                        "Résumé par pièce",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
                 items(sensors, key = { it.id }) { sensor ->
                     SensorStatsCard(sensor, statsMap[sensor.id], prefs)
                 }
+
                 item {
                     AnnotationSection(
                         annotations = annotations,
                         sensors = sensors,
+                        onOpen = { detailAnnotation = it },
                         onDelete = { id ->
                             scope.launch {
                                 withContext(Dispatchers.IO) { db.deleteAnnotation(id) }
+                                if (selectedAnnotation?.id == id) selectedAnnotation = null
+                                if (detailAnnotation?.id == id) detailAnnotation = null
                                 reloadToken++
                             }
                         }
                     )
                 }
-                item { Spacer(Modifier.height(70.dp)) }
+
+                item { Spacer(Modifier.height(72.dp)) }
             }
         }
     }
@@ -346,7 +447,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             onClear = {
                 scope.launch {
                     withContext(Dispatchers.IO) { db.clearAll() }
-                    showTemp.clear(); showHumidity.clear(); selectedTimestamp = null
+                    showTemp.clear()
+                    showHumidity.clear()
+                    selectedTimestamp = null
+                    selectedAnnotation = null
+                    detailAnnotation = null
                     reloadToken++
                     settingsOpen = false
                     snackbar.showSnackbar("Base FabData vidée")
@@ -355,15 +460,26 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         )
     }
 
-    if (annotationOpen) {
+    annotationTimestamp?.let { ts ->
         AnnotationDialog(
-            initialTimestamp = selectedTimestamp ?: bounds?.last ?: System.currentTimeMillis(),
+            initialTimestamp = ts,
+            initial = editingAnnotation,
             sensors = sensors,
-            onDismiss = { annotationOpen = false },
-            onSave = { timestamp, title, note, sensorId ->
+            onDismiss = {
+                annotationTimestamp = null
+                editingAnnotation = null
+            },
+            onSave = { id, timestamp, title, note, sensorId, roomName, type ->
                 scope.launch {
-                    withContext(Dispatchers.IO) { db.addAnnotation(timestamp, title, note, sensorId) }
-                    annotationOpen = false
+                    withContext(Dispatchers.IO) {
+                        if (id == null) {
+                            db.addAnnotation(timestamp, title, note, sensorId, roomName, type)
+                        } else {
+                            db.updateAnnotation(id, timestamp, title, note, sensorId, roomName, type)
+                        }
+                    }
+                    annotationTimestamp = null
+                    editingAnnotation = null
                     reloadToken++
                 }
             }
@@ -384,8 +500,31 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             onDelete = {
                 scope.launch {
                     withContext(Dispatchers.IO) { db.deleteSensor(sensor.id) }
-                    showTemp.remove(sensor.id); showHumidity.remove(sensor.id)
+                    showTemp.remove(sensor.id)
+                    showHumidity.remove(sensor.id)
                     editSensor = null
+                    reloadToken++
+                }
+            }
+        )
+    }
+
+    detailAnnotation?.let { note ->
+        AnnotationDetailSheet(
+            annotation = note,
+            sensors = sensors,
+            sampleMap = sampleMap,
+            onDismiss = { detailAnnotation = null },
+            onEdit = {
+                editingAnnotation = note
+                annotationTimestamp = note.timestamp
+                detailAnnotation = null
+            },
+            onDelete = {
+                scope.launch {
+                    withContext(Dispatchers.IO) { db.deleteAnnotation(note.id) }
+                    selectedAnnotation = null
+                    detailAnnotation = null
                     reloadToken++
                 }
             }
@@ -393,60 +532,44 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 }
 
-private data class LoadedData(
-    val sensors: List<Sensor>,
-    val bounds: LongRange?,
-    val samples: Map<Long, List<SamplePoint>>,
-    val stats: Map<Long, SensorStats>,
-    val annotations: List<AnnotationItem>
-)
-
 @Composable
-private fun DashboardSummary(sensors: List<Sensor>, stats: Map<Long, SensorStats>, bounds: LongRange?) {
-    val points = stats.values.sumOf { it.count }
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)),
-        shape = RoundedCornerShape(22.dp)
-    ) {
-        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Vue d’ensemble", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Row(horizontalArrangement = Arrangement.spacedBy(22.dp)) {
-                Metric("Capteurs", sensors.size.toString())
-                Metric("Points", points.toString())
-                Metric("Fenêtre", bounds?.let { compactDuration(it.last - it.first) } ?: "—")
-            }
-            if (bounds != null) {
-                Text(
-                    "${formatDateTime(bounds.first)} → ${formatDateTime(bounds.last)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun Metric(label: String, value: String) {
-    Column {
-        Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    }
-}
-
-@Composable
-private fun RangeSelector(preset: RangePreset, onSelect: (RangePreset) -> Unit) {
+private fun TimeTabs(preset: TimePreset, onSelect: (TimePreset) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("Période", style = MaterialTheme.typography.labelLarge)
-        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            RangePreset.entries.forEach { item ->
-                AssistChip(
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            TimePreset.entries.forEach { item ->
+                Surface(
                     onClick = { onSelect(item) },
-                    label = { Text(item.label) },
-                    leadingIcon = if (item == preset) ({ Text("✓") }) else null
-                )
+                    color = if (item == preset) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(
+                        Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            item.label,
+                            fontWeight = if (item == preset) FontWeight.Bold else FontWeight.Normal,
+                            color = if (item == preset) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (item == preset) {
+                            Spacer(Modifier.height(4.dp))
+                            Box(
+                                Modifier.width(34.dp).height(3.dp)
+                                    .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                            )
+                        }
+                    }
+                }
             }
         }
+        Text(
+            "Pince = zoom temps · glisse = déplacer · double tap fond = reset · appui long = événement",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 
@@ -460,7 +583,7 @@ private fun EmptyState(onImport: () -> Unit) {
         ) {
             Icon(Icons.Default.FileOpen, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
             Text("Aucune donnée", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Text("Importe un ou plusieurs exports CSV. Les réimports chevauchants complètent automatiquement la base sans dupliquer les dates.")
+            Text("Importe tes exports CSV. Un réimport chevauchant complète la base sans dupliquer les dates.")
             Button(onClick = onImport) { Text("Importer des CSV") }
         }
     }
@@ -475,21 +598,42 @@ private fun SeriesSelector(
 ) {
     Card(shape = RoundedCornerShape(20.dp)) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Superposition des courbes", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            Text("Coche les séries à comparer. T° = température, % = humidité.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Superposition", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(
+                "Chaque pièce peut afficher T°, humidité, les deux ou aucune.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             sensors.forEach { sensor ->
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(11.dp).background(palette[sensor.colorIndex % palette.size], RoundedCornerShape(6.dp)))
+                    Box(
+                        Modifier.size(12.dp)
+                            .background(palette[sensor.colorIndex % palette.size], RoundedCornerShape(6.dp))
+                    )
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
                         Text(sensor.room, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (sensor.name != sensor.room) Text(sensor.name, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (sensor.name != sensor.room) {
+                            Text(
+                                sensor.name,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                     Text("T°", style = MaterialTheme.typography.labelMedium)
-                    Checkbox(checked = showTemp[sensor.id] == true, onCheckedChange = { showTemp[sensor.id] = it })
+                    Checkbox(
+                        checked = showTemp[sensor.id] == true,
+                        onCheckedChange = { showTemp[sensor.id] = it }
+                    )
                     Text("%", style = MaterialTheme.typography.labelMedium)
-                    Checkbox(checked = showHumidity[sensor.id] == true, onCheckedChange = { showHumidity[sensor.id] = it })
-                    IconButton(onClick = { onEdit(sensor) }) { Icon(Icons.Default.Edit, contentDescription = "Modifier le capteur") }
+                    Checkbox(
+                        checked = showHumidity[sensor.id] == true,
+                        onCheckedChange = { showHumidity[sensor.id] = it }
+                    )
+                    IconButton(onClick = { onEdit(sensor) }) {
+                        Icon(Icons.Default.Edit, contentDescription = "Modifier la pièce")
+                    }
                 }
             }
         }
@@ -506,23 +650,37 @@ private fun ChartCard(
     bounds: LongRange?,
     prefs: ChartPrefs,
     selectedTimestamp: Long?,
-    onSelectTimestamp: (Long) -> Unit
+    onSelectTimestamp: (Long) -> Unit,
+    onAnnotationClick: (AnnotationItem) -> Unit,
+    onAnnotationDoubleClick: (AnnotationItem) -> Unit,
+    onRequestAnnotation: (Long) -> Unit
 ) {
     var resetKey by remember { mutableIntStateOf(0) }
-    Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+
+    Card(
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
         Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Courbes", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Text("Pince pour zoomer · glisse pour parcourir · touche pour inspecter", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Courbes interactives", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    Text(
+                        "Point épais = événement · 1 clic = aperçu · double clic = fiche",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
-                OutlinedButton(onClick = { resetKey++ }) { Text("Reset zoom") }
+                OutlinedButton(onClick = { resetKey++ }) { Text("Reset") }
             }
+
             if (bounds == null) {
-                Box(Modifier.fillMaxWidth().height(300.dp), contentAlignment = Alignment.Center) { Text("Pas de données") }
+                Box(Modifier.fillMaxWidth().height(340.dp), contentAlignment = Alignment.Center) {
+                    Text("Pas de données")
+                }
             } else {
                 InteractiveChart(
-                    modifier = Modifier.fillMaxWidth().height(360.dp),
+                    modifier = Modifier.fillMaxWidth().height(390.dp),
                     sensors = sensors,
                     sampleMap = sampleMap,
                     showTemp = showTemp,
@@ -533,7 +691,10 @@ private fun ChartCard(
                     prefs = prefs,
                     selectedTimestamp = selectedTimestamp,
                     resetKey = resetKey,
-                    onSelectTimestamp = onSelectTimestamp
+                    onSelectTimestamp = onSelectTimestamp,
+                    onAnnotationClick = onAnnotationClick,
+                    onAnnotationDoubleClick = onAnnotationDoubleClick,
+                    onRequestAnnotation = onRequestAnnotation
                 )
             }
         }
@@ -553,47 +714,110 @@ private fun InteractiveChart(
     prefs: ChartPrefs,
     selectedTimestamp: Long?,
     resetKey: Int,
-    onSelectTimestamp: (Long) -> Unit
+    onSelectTimestamp: (Long) -> Unit,
+    onAnnotationClick: (AnnotationItem) -> Unit,
+    onAnnotationDoubleClick: (AnnotationItem) -> Unit,
+    onRequestAnnotation: (Long) -> Unit
 ) {
     var zoom by remember(resetKey, from, to) { mutableFloatStateOf(1f) }
     var center by remember(resetKey, from, to) { mutableFloatStateOf(0.5f) }
-    val axisColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.55f)
+
+    val axisColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.60f)
     val gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
     val textColor = MaterialTheme.colorScheme.onSurfaceVariant
     val annotationColor = MaterialTheme.colorScheme.tertiary
     val selectColor = MaterialTheme.colorScheme.primary
+    val surfaceColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.20f)
+
+    fun visibleWindow(): LongRange {
+        val fullSpan = (to - from).coerceAtLeast(1L)
+        val visibleFraction = 1f / zoom
+        val startFraction = (center - visibleFraction / 2f).coerceIn(0f, 1f - visibleFraction)
+        val endFraction = startFraction + visibleFraction
+        return (from + (fullSpan * startFraction).toLong())..
+            (from + (fullSpan * endFraction).toLong())
+    }
 
     Canvas(
         modifier = modifier
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.22f), RoundedCornerShape(16.dp))
+            .background(surfaceColor, RoundedCornerShape(16.dp))
             .pointerInput(from, to, resetKey) {
                 detectTransformGestures { _, pan, zoomChange, _ ->
-                    val newZoom = (zoom * zoomChange).coerceIn(1f, 180f)
                     val oldVisible = 1f / zoom
+                    val newZoom = (zoom * zoomChange).coerceIn(1f, 720f)
                     zoom = newZoom
                     val visible = 1f / zoom
                     center = (center - (pan.x / size.width.toFloat()) * oldVisible)
                         .coerceIn(visible / 2f, 1f - visible / 2f)
                 }
             }
-            .pointerInput(from, to, resetKey, zoom, center) {
-                detectTapGestures { p ->
-                    val visibleFraction = 1f / zoom
-                    val startFraction = (center - visibleFraction / 2f).coerceIn(0f, 1f - visibleFraction)
-                    val left = 52.dp.toPx()
-                    val right = size.width - 44.dp.toPx()
-                    if (p.x in left..right) {
-                        val xFraction = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
-                        val fraction = startFraction + xFraction * visibleFraction
-                        onSelectTimestamp(from + ((to - from) * fraction).toLong())
+            .pointerInput(from, to, resetKey, zoom, center, annotations) {
+                detectTapGestures(
+                    onLongPress = { p ->
+                        val left = 52.dp.toPx()
+                        val right = size.width - 44.dp.toPx()
+                        if (p.x in left..right) {
+                            val window = visibleWindow()
+                            val span = (window.last - window.first).coerceAtLeast(1L)
+                            val frac = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
+                            onRequestAnnotation(window.first + (span * frac).toLong())
+                        }
+                    },
+                    onDoubleTap = { p ->
+                        val left = 52.dp.toPx()
+                        val right = size.width - 44.dp.toPx()
+                        val window = visibleWindow()
+                        val span = (window.last - window.first).coerceAtLeast(1L)
+                        val hitPx = 20.dp.toPx()
+                        val hit = annotations
+                            .filter { it.timestamp in window }
+                            .minByOrNull { note ->
+                                val x = left + ((note.timestamp - window.first).toDouble() / span.toDouble()).toFloat() * (right - left)
+                                abs(x - p.x)
+                            }
+                            ?.takeIf { note ->
+                                val x = left + ((note.timestamp - window.first).toDouble() / span.toDouble()).toFloat() * (right - left)
+                                abs(x - p.x) <= hitPx
+                            }
+                        if (hit != null) {
+                            onAnnotationDoubleClick(hit)
+                        } else {
+                            zoom = 1f
+                            center = 0.5f
+                        }
+                    },
+                    onTap = { p ->
+                        val left = 52.dp.toPx()
+                        val right = size.width - 44.dp.toPx()
+                        if (p.x in left..right) {
+                            val window = visibleWindow()
+                            val span = (window.last - window.first).coerceAtLeast(1L)
+                            val hitPx = 18.dp.toPx()
+                            val hit = annotations
+                                .filter { it.timestamp in window }
+                                .minByOrNull { note ->
+                                    val x = left + ((note.timestamp - window.first).toDouble() / span.toDouble()).toFloat() * (right - left)
+                                    abs(x - p.x)
+                                }
+                                ?.takeIf { note ->
+                                    val x = left + ((note.timestamp - window.first).toDouble() / span.toDouble()).toFloat() * (right - left)
+                                    abs(x - p.x) <= hitPx
+                                }
+                            if (hit != null) {
+                                onAnnotationClick(hit)
+                            } else {
+                                val frac = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
+                                onSelectTimestamp(window.first + (span * frac).toLong())
+                            }
+                        }
                     }
-                }
+                )
             }
     ) {
         val left = 52.dp.toPx()
         val right = size.width - 44.dp.toPx()
-        val top = 18.dp.toPx()
-        val bottom = size.height - 36.dp.toPx()
+        val top = 22.dp.toPx()
+        val bottom = size.height - 38.dp.toPx()
         val plotW = (right - left).coerceAtLeast(1f)
         val plotH = (bottom - top).coerceAtLeast(1f)
         val fullSpan = (to - from).coerceAtLeast(1L)
@@ -604,17 +828,20 @@ private fun InteractiveChart(
         val visibleTo = from + (fullSpan * endFraction).toLong()
         val visibleSpan = (visibleTo - visibleFrom).coerceAtLeast(1L)
 
-        val activeTemp = sensors.filter { showTemp[it.id] == true }
+        val tempValues = sensors
+            .filter { showTemp[it.id] == true }
             .flatMap { sampleMap[it.id].orEmpty() }
             .filter { it.timestamp in visibleFrom..visibleTo }
             .map { it.temperature }
-        val activeHum = sensors.filter { showHumidity[it.id] == true }
+
+        val humidityValues = sensors
+            .filter { showHumidity[it.id] == true }
             .flatMap { sampleMap[it.id].orEmpty() }
             .filter { it.timestamp in visibleFrom..visibleTo }
             .map { it.humidity }
 
-        val tempRange = paddedRange(activeTemp, fallbackMin = 15.0, fallbackMax = 35.0, clampMin = -50.0, clampMax = 80.0)
-        val humRange = paddedRange(activeHum, fallbackMin = 30.0, fallbackMax = 70.0, clampMin = 0.0, clampMax = 100.0)
+        val tempRange = paddedRange(tempValues, 15.0, 35.0, -50.0, 80.0)
+        val humRange = paddedRange(humidityValues, 30.0, 70.0, 0.0, 100.0)
 
         if (prefs.showGrid) {
             for (i in 0..4) {
@@ -626,6 +853,7 @@ private fun InteractiveChart(
                 drawLine(gridColor, Offset(x, top), Offset(x, bottom), strokeWidth = 1f)
             }
         }
+
         drawLine(axisColor, Offset(left, top), Offset(left, bottom), 1.5f)
         drawLine(axisColor, Offset(right, top), Offset(right, bottom), 1.5f)
         drawLine(axisColor, Offset(left, bottom), Offset(right, bottom), 1.5f)
@@ -638,67 +866,177 @@ private fun InteractiveChart(
         val rightPaint = android.graphics.Paint(paint).apply { textAlign = android.graphics.Paint.Align.RIGHT }
         val centerPaint = android.graphics.Paint(paint).apply { textAlign = android.graphics.Paint.Align.CENTER }
 
-        if (activeTemp.isNotEmpty()) {
+        if (tempValues.isNotEmpty()) {
             for (i in 0..4) {
                 val v = tempRange.second - (tempRange.second - tempRange.first) * i / 4.0
                 val y = top + plotH * i / 4f
-                drawContext.canvas.nativeCanvas.drawText(String.format(Locale.FRANCE, "%.1f°", v), 4.dp.toPx(), y + 4.dp.toPx(), paint)
+                drawContext.canvas.nativeCanvas.drawText(
+                    String.format(Locale.FRANCE, "%.1f°", v),
+                    4.dp.toPx(),
+                    y + 4.dp.toPx(),
+                    paint
+                )
             }
         }
-        if (activeHum.isNotEmpty()) {
+
+        if (humidityValues.isNotEmpty()) {
             for (i in 0..4) {
                 val v = humRange.second - (humRange.second - humRange.first) * i / 4.0
                 val y = top + plotH * i / 4f
-                drawContext.canvas.nativeCanvas.drawText(String.format(Locale.FRANCE, "%.0f%%", v), size.width - 3.dp.toPx(), y + 4.dp.toPx(), rightPaint)
+                drawContext.canvas.nativeCanvas.drawText(
+                    String.format(Locale.FRANCE, "%.0f%%", v),
+                    size.width - 3.dp.toPx(),
+                    y + 4.dp.toPx(),
+                    rightPaint
+                )
             }
         }
+
         for (i in 0..4) {
             val ts = visibleFrom + visibleSpan * i / 4L
             val x = left + plotW * i / 4f
-            drawContext.canvas.nativeCanvas.drawText(formatAxisTime(ts, visibleSpan), x, size.height - 9.dp.toPx(), centerPaint)
+            drawContext.canvas.nativeCanvas.drawText(
+                formatAxisTime(ts, visibleSpan),
+                x,
+                size.height - 10.dp.toPx(),
+                centerPaint
+            )
         }
 
-        fun mapX(ts: Long): Float = left + ((ts - visibleFrom).toDouble() / visibleSpan.toDouble()).toFloat() * plotW
-        fun mapTemp(v: Double): Float = bottom - (((v - tempRange.first) / (tempRange.second - tempRange.first)).toFloat() * plotH)
-        fun mapHum(v: Double): Float = bottom - (((v - humRange.first) / (humRange.second - humRange.first)).toFloat() * plotH)
+        fun mapX(ts: Long): Float =
+            left + ((ts - visibleFrom).toDouble() / visibleSpan.toDouble()).toFloat() * plotW
 
-        annotations.filter { it.timestamp in visibleFrom..visibleTo }.forEach { note ->
-            val x = mapX(note.timestamp)
-            drawLine(annotationColor.copy(alpha = 0.8f), Offset(x, top), Offset(x, bottom), 1.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 7f)))
-            val notePaint = android.graphics.Paint(paint).apply { color = annotationColor.toArgbCompat(); textSize = 9.dp.toPx() }
-            drawContext.canvas.nativeCanvas.drawText(note.title.take(18), x + 3.dp.toPx(), top + 12.dp.toPx(), notePaint)
-        }
+        fun mapTemp(v: Double): Float =
+            bottom - (((v - tempRange.first) / (tempRange.second - tempRange.first)).toFloat() * plotH)
+
+        fun mapHum(v: Double): Float =
+            bottom - (((v - humRange.first) / (humRange.second - humRange.first)).toFloat() * plotH)
 
         sensors.forEach { sensor ->
             val color = palette[sensor.colorIndex % palette.size]
             val points = sampleMap[sensor.id].orEmpty().filter { it.timestamp in visibleFrom..visibleTo }
+
             if (showTemp[sensor.id] == true && points.size >= 2) {
                 val path = Path()
                 points.forEachIndexed { index, p ->
-                    val x = mapX(p.timestamp); val y = mapTemp(p.temperature)
+                    val x = mapX(p.timestamp)
+                    val y = mapTemp(p.temperature)
                     if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
                 }
                 drawPath(path, color, style = Stroke(width = prefs.lineWidth.dp.toPx()))
-                if (prefs.showPoints || zoom > 20f) {
-                    points.forEach { p -> drawCircle(color, radius = 2.2.dp.toPx(), center = Offset(mapX(p.timestamp), mapTemp(p.temperature))) }
+                if (prefs.showPoints || zoom > 18f) {
+                    points.forEach { p ->
+                        drawCircle(color, 2.2.dp.toPx(), Offset(mapX(p.timestamp), mapTemp(p.temperature)))
+                    }
                 }
             }
+
             if (showHumidity[sensor.id] == true && points.size >= 2) {
                 val path = Path()
                 points.forEachIndexed { index, p ->
-                    val x = mapX(p.timestamp); val y = mapHum(p.humidity)
+                    val x = mapX(p.timestamp)
+                    val y = mapHum(p.humidity)
                     if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
                 }
-                drawPath(path, color.copy(alpha = 0.8f), style = Stroke(width = max(1.2f, prefs.lineWidth - 0.5f).dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 7f))))
-                if (prefs.showPoints || zoom > 20f) {
-                    points.forEach { p -> drawCircle(color.copy(alpha = 0.8f), radius = 2.dp.toPx(), center = Offset(mapX(p.timestamp), mapHum(p.humidity))) }
+                drawPath(
+                    path,
+                    color.copy(alpha = 0.82f),
+                    style = Stroke(
+                        width = max(1.2f, prefs.lineWidth - 0.5f).dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 7f))
+                    )
+                )
+                if (prefs.showPoints || zoom > 18f) {
+                    points.forEach { p ->
+                        drawCircle(color.copy(alpha = 0.82f), 2.dp.toPx(), Offset(mapX(p.timestamp), mapHum(p.humidity)))
+                    }
                 }
+            }
+        }
+
+        annotations.filter { it.timestamp in visibleFrom..visibleTo }.forEach { note ->
+            val x = mapX(note.timestamp)
+            val sensor = note.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
+            val point = sensor?.let { nearest(sampleMap[it.id].orEmpty(), note.timestamp) }
+
+            val markerY = when {
+                sensor != null && point != null && showTemp[sensor.id] == true -> mapTemp(point.temperature)
+                sensor != null && point != null && showHumidity[sensor.id] == true -> mapHum(point.humidity)
+                else -> top + 14.dp.toPx()
+            }
+
+            if (sensor == null || point == null) {
+                drawLine(
+                    annotationColor.copy(alpha = 0.55f),
+                    Offset(x, top),
+                    Offset(x, bottom),
+                    1.3f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(7f, 7f))
+                )
+            }
+
+            val markerColor = sensor?.let { palette[it.colorIndex % palette.size] } ?: annotationColor
+            drawCircle(Color.White, 8.dp.toPx(), Offset(x, markerY))
+            drawCircle(markerColor, 6.dp.toPx(), Offset(x, markerY))
+            drawCircle(Color.White.copy(alpha = 0.92f), 2.dp.toPx(), Offset(x, markerY))
+
+            if (zoom > 2.4f) {
+                val notePaint = android.graphics.Paint(paint).apply {
+                    color = markerColor.toArgbCompat()
+                    textSize = 9.dp.toPx()
+                }
+                drawContext.canvas.nativeCanvas.drawText(
+                    note.title.take(16),
+                    x + 7.dp.toPx(),
+                    (markerY - 7.dp.toPx()).coerceAtLeast(top + 9.dp.toPx()),
+                    notePaint
+                )
             }
         }
 
         selectedTimestamp?.takeIf { it in visibleFrom..visibleTo }?.let { ts ->
             val x = mapX(ts)
             drawLine(selectColor, Offset(x, top), Offset(x, bottom), strokeWidth = 2f)
+        }
+    }
+}
+
+@Composable
+private fun AnnotationPreviewCard(
+    annotation: AnnotationItem,
+    sensors: List<Sensor>,
+    sampleMap: Map<Long, List<SamplePoint>>,
+    onOpen: () -> Unit,
+    onClose: () -> Unit
+) {
+    val sensor = annotation.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
+    val point = sensor?.let { nearest(sampleMap[it.id].orEmpty(), annotation.timestamp) }
+
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.55f))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(annotation.title, fontWeight = FontWeight.Bold)
+                    Text(
+                        "${formatDateTime(annotation.timestamp)} · ${annotation.roomName ?: sensor?.room ?: "Toutes les pièces"}",
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+                IconButton(onClick = onClose) { Icon(Icons.Default.Close, contentDescription = "Fermer") }
+            }
+            if (annotation.note.isNotBlank()) {
+                Text(annotation.note, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+            if (point != null) {
+                Text(
+                    String.format(Locale.FRANCE, "Au point : %.1f °C · %.1f %%", point.temperature, point.humidity),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            TextButton(onClick = onOpen) { Text("Ouvrir la fiche") }
         }
     }
 }
@@ -711,17 +1049,54 @@ private fun InspectorCard(
     showTemp: Map<Long, Boolean>,
     showHumidity: Map<Long, Boolean>
 ) {
-    Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f))) {
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f))
+    ) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Text("Curseur · ${formatDateTime(timestamp)}", fontWeight = FontWeight.Bold)
             sensors.filter { showTemp[it.id] == true || showHumidity[it.id] == true }.forEach { sensor ->
                 nearest(sampleMap[sensor.id].orEmpty(), timestamp)?.let { point ->
                     Row(Modifier.fillMaxWidth()) {
                         Text(sensor.room, Modifier.weight(1f), fontWeight = FontWeight.Medium)
-                        if (showTemp[sensor.id] == true) Text(String.format(Locale.FRANCE, "%.1f °C", point.temperature), Modifier.width(78.dp))
-                        if (showHumidity[sensor.id] == true) Text(String.format(Locale.FRANCE, "%.1f %%", point.humidity), Modifier.width(72.dp))
+                        if (showTemp[sensor.id] == true) {
+                            Text(String.format(Locale.FRANCE, "%.1f °C", point.temperature), Modifier.width(78.dp))
+                        }
+                        if (showHumidity[sensor.id] == true) {
+                            Text(String.format(Locale.FRANCE, "%.1f %%", point.humidity), Modifier.width(72.dp))
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PeriodSummaryCard(
+    preset: TimePreset,
+    statsMap: Map<Long, SensorStats>,
+    sensors: List<Sensor>,
+    viewBounds: LongRange?,
+    globalBounds: LongRange?
+) {
+    val points = statsMap.values.sumOf { it.count }
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text("${preset.label} · synthèse", fontWeight = FontWeight.Bold)
+            Text("${sensors.size} capteur(s) · $points mesure(s)", style = MaterialTheme.typography.bodySmall)
+            viewBounds?.let {
+                Text("${formatDateTime(it.first)} → ${formatDateTime(it.last)}", style = MaterialTheme.typography.bodySmall)
+            }
+            globalBounds?.let {
+                Text(
+                    "Historique total : ${compactDuration(it.last - it.first)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
@@ -732,21 +1107,59 @@ private fun SensorStatsCard(sensor: Sensor, stats: SensorStats?, prefs: ChartPre
     Card(shape = RoundedCornerShape(18.dp)) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(11.dp).background(palette[sensor.colorIndex % palette.size], RoundedCornerShape(6.dp)))
+                Box(
+                    Modifier.size(11.dp)
+                        .background(palette[sensor.colorIndex % palette.size], RoundedCornerShape(6.dp))
+                )
                 Spacer(Modifier.width(8.dp))
-                Text(sensor.room, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Text(stats?.count?.let { "$it pts" } ?: "—", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    sensor.room,
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    stats?.count?.let { "$it pts" } ?: "—",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             if (stats == null) {
                 Text("Aucune mesure sur cette période")
             } else {
                 val latest = stats.latest
                 Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
-                    StatBlock("Dernière T°", latest?.let { String.format(Locale.FRANCE, "%.1f °C", it.temperature) } ?: "—", latest?.temperature?.let { it >= prefs.highTemp } == true)
-                    StatBlock("Dernière HR", latest?.let { String.format(Locale.FRANCE, "%.1f %%", it.humidity) } ?: "—", latest?.humidity?.let { it < prefs.lowHumidity || it > prefs.highHumidity } == true)
+                    StatBlock(
+                        "Dernière T°",
+                        latest?.let { String.format(Locale.FRANCE, "%.1f °C", it.temperature) } ?: "—",
+                        latest?.temperature?.let { it >= prefs.highTemp } == true
+                    )
+                    StatBlock(
+                        "Dernière HR",
+                        latest?.let { String.format(Locale.FRANCE, "%.1f %%", it.humidity) } ?: "—",
+                        latest?.humidity?.let { it < prefs.lowHumidity || it > prefs.highHumidity } == true
+                    )
                 }
-                Text(String.format(Locale.FRANCE, "T°  min %.1f · moy %.1f · max %.1f °C", stats.tempMin, stats.tempAvg, stats.tempMax), style = MaterialTheme.typography.bodySmall)
-                Text(String.format(Locale.FRANCE, "HR  min %.1f · moy %.1f · max %.1f %%", stats.humidityMin, stats.humidityAvg, stats.humidityMax), style = MaterialTheme.typography.bodySmall)
+                Text(
+                    String.format(
+                        Locale.FRANCE,
+                        "T° min %.1f · moy %.1f · max %.1f °C",
+                        stats.tempMin,
+                        stats.tempAvg,
+                        stats.tempMax
+                    ),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    String.format(
+                        Locale.FRANCE,
+                        "HR min %.1f · moy %.1f · max %.1f %%",
+                        stats.humidityMin,
+                        stats.humidityAvg,
+                        stats.humidityMax
+                    ),
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
     }
@@ -756,27 +1169,51 @@ private fun SensorStatsCard(sensor: Sensor, stats: SensorStats?, prefs: ChartPre
 private fun StatBlock(label: String, value: String, alert: Boolean) {
     Column {
         Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, fontWeight = FontWeight.Bold, color = if (alert) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+        Text(
+            value,
+            fontWeight = FontWeight.Bold,
+            color = if (alert) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+        )
     }
 }
 
 @Composable
-private fun AnnotationSection(annotations: List<AnnotationItem>, sensors: List<Sensor>, onDelete: (Long) -> Unit) {
+private fun AnnotationSection(
+    annotations: List<AnnotationItem>,
+    sensors: List<Sensor>,
+    onOpen: (AnnotationItem) -> Unit,
+    onDelete: (Long) -> Unit
+) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Annotations", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Text("Événements", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         if (annotations.isEmpty()) {
-            Text("Aucune annotation sur cette période.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "Aucun événement sur cette période.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         } else {
-            annotations.forEach { note ->
-                Card(shape = RoundedCornerShape(14.dp)) {
+            annotations.reversed().forEach { note ->
+                val sensor = note.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
+                Card(shape = RoundedCornerShape(14.dp), onClick = { onOpen(note) }) {
                     Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(note.title, fontWeight = FontWeight.SemiBold)
-                            Text(formatDateTime(note.timestamp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            note.sensorId?.let { id -> sensors.firstOrNull { it.id == id }?.let { Text(it.room, style = MaterialTheme.typography.labelSmall) } }
-                            if (note.note.isNotBlank()) Text(note.note, style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                "${formatDateTime(note.timestamp)} · ${note.roomName ?: sensor?.room ?: "Global"}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            note.type?.takeIf { it.isNotBlank() }?.let {
+                                Text(it, style = MaterialTheme.typography.labelSmall)
+                            }
+                            if (note.note.isNotBlank()) {
+                                Text(note.note, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                            }
                         }
-                        IconButton(onClick = { onDelete(note.id) }) { Icon(Icons.Default.Delete, contentDescription = "Supprimer l'annotation") }
+                        IconButton(onClick = { onDelete(note.id) }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Supprimer l'événement")
+                        }
                     }
                 }
             }
@@ -784,14 +1221,85 @@ private fun AnnotationSection(annotations: List<AnnotationItem>, sensors: List<S
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsDialog(initial: ChartPrefs, onDismiss: () -> Unit, onSave: (ChartPrefs) -> Unit, onClear: () -> Unit) {
+private fun AnnotationDetailSheet(
+    annotation: AnnotationItem,
+    sensors: List<Sensor>,
+    sampleMap: Map<Long, List<SamplePoint>>,
+    onDismiss: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val sensor = annotation.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
+    val point = sensor?.let { nearest(sampleMap[it.id].orEmpty(), annotation.timestamp) }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    annotation.title,
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Default.Close, contentDescription = "Fermer")
+                }
+            }
+            Text(formatDateTime(annotation.timestamp), fontWeight = FontWeight.SemiBold)
+            Text("Pièce : ${annotation.roomName ?: sensor?.room ?: "Toutes les pièces"}")
+            sensor?.let { Text("Capteur : ${it.name}") }
+            annotation.type?.takeIf { it.isNotBlank() }?.let { Text("Type : $it") }
+
+            if (point != null) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+                    )
+                ) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Mesure la plus proche", fontWeight = FontWeight.Bold)
+                        Text(String.format(Locale.FRANCE, "%.1f °C", point.temperature))
+                        Text(String.format(Locale.FRANCE, "%.1f %% HR", point.humidity))
+                        Text(formatDateTime(point.timestamp), style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            if (annotation.note.isBlank()) {
+                Text("Aucune note détaillée.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text(annotation.note, style = MaterialTheme.typography.bodyLarge)
+            }
+
+            HorizontalDivider()
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = onEdit) { Text("Modifier") }
+                OutlinedButton(onClick = onDelete) { Text("Supprimer") }
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+@Composable
+private fun SettingsDialog(
+    initial: ChartPrefs,
+    onDismiss: () -> Unit,
+    onSave: (ChartPrefs) -> Unit,
+    onClear: () -> Unit
+) {
     var grid by remember { mutableStateOf(initial.showGrid) }
     var points by remember { mutableStateOf(initial.showPoints) }
     var width by remember { mutableFloatStateOf(initial.lineWidth) }
     var highTemp by remember { mutableStateOf(initial.highTemp.toString()) }
     var lowHum by remember { mutableStateOf(initial.lowHumidity.toString()) }
     var highHum by remember { mutableStateOf(initial.highHumidity.toString()) }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Réglages FabData") },
@@ -801,18 +1309,37 @@ private fun SettingsDialog(initial: ChartPrefs, onDismiss: () -> Unit, onSave: (
                 SettingSwitch("Afficher les points", points) { points = it }
                 Text("Épaisseur des courbes : ${String.format(Locale.FRANCE, "%.1f", width)}")
                 Slider(value = width, onValueChange = { width = it }, valueRange = 1f..6f)
-                OutlinedTextField(highTemp, { highTemp = it }, label = { Text("Alerte température haute (°C)") }, singleLine = true)
-                OutlinedTextField(lowHum, { lowHum = it }, label = { Text("Humidité basse (%)") }, singleLine = true)
-                OutlinedTextField(highHum, { highHum = it }, label = { Text("Humidité haute (%)") }, singleLine = true)
+                OutlinedTextField(
+                    highTemp,
+                    { highTemp = it },
+                    label = { Text("Alerte température haute (°C)") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    lowHum,
+                    { lowHum = it },
+                    label = { Text("Humidité basse (%)") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    highHum,
+                    { highHum = it },
+                    label = { Text("Humidité haute (%)") },
+                    singleLine = true
+                )
                 HorizontalDivider()
-                TextButton(onClick = onClear) { Text("Vider toute la base locale", color = MaterialTheme.colorScheme.error) }
+                TextButton(onClick = onClear) {
+                    Text("Vider toute la base locale", color = MaterialTheme.colorScheme.error)
+                }
             }
         },
         confirmButton = {
             Button(onClick = {
                 onSave(
                     ChartPrefs(
-                        grid, points, width,
+                        grid,
+                        points,
+                        width,
                         highTemp.replace(',', '.').toDoubleOrNull() ?: initial.highTemp,
                         lowHum.replace(',', '.').toDoubleOrNull() ?: initial.lowHumidity,
                         highHum.replace(',', '.').toDoubleOrNull() ?: initial.highHumidity
@@ -833,10 +1360,16 @@ private fun SettingSwitch(label: String, checked: Boolean, onChecked: (Boolean) 
 }
 
 @Composable
-private fun SensorEditDialog(sensor: Sensor, onDismiss: () -> Unit, onSave: (String, String, Int) -> Unit, onDelete: () -> Unit) {
+private fun SensorEditDialog(
+    sensor: Sensor,
+    onDismiss: () -> Unit,
+    onSave: (String, String, Int) -> Unit,
+    onDelete: () -> Unit
+) {
     var name by remember { mutableStateOf(sensor.name) }
     var room by remember { mutableStateOf(sensor.room) }
     var colorIndex by remember { mutableIntStateOf(sensor.colorIndex) }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Capteur / pièce") },
@@ -845,21 +1378,30 @@ private fun SensorEditDialog(sensor: Sensor, onDismiss: () -> Unit, onSave: (Str
                 OutlinedTextField(name, { name = it }, label = { Text("Nom du capteur") }, singleLine = true)
                 OutlinedTextField(room, { room = it }, label = { Text("Nom de la pièce") }, singleLine = true)
                 Text("Couleur")
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     palette.forEachIndexed { index, color ->
                         Surface(
                             onClick = { colorIndex = index },
                             shape = RoundedCornerShape(50),
                             color = color,
-                            border = if (index == colorIndex) androidx.compose.foundation.BorderStroke(3.dp, MaterialTheme.colorScheme.onSurface) else null,
+                            border = if (index == colorIndex) {
+                                BorderStroke(3.dp, MaterialTheme.colorScheme.onSurface)
+                            } else null,
                             modifier = Modifier.size(34.dp)
                         ) {}
                     }
                 }
-                TextButton(onClick = onDelete) { Text("Supprimer ce capteur et ses mesures", color = MaterialTheme.colorScheme.error) }
+                TextButton(onClick = onDelete) {
+                    Text("Supprimer ce capteur et ses mesures", color = MaterialTheme.colorScheme.error)
+                }
             }
         },
-        confirmButton = { Button(onClick = { onSave(name, room, colorIndex) }) { Text("Enregistrer") } },
+        confirmButton = {
+            Button(onClick = { onSave(name, room, colorIndex) }) { Text("Enregistrer") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
     )
 }
@@ -867,32 +1409,89 @@ private fun SensorEditDialog(sensor: Sensor, onDismiss: () -> Unit, onSave: (Str
 @Composable
 private fun AnnotationDialog(
     initialTimestamp: Long,
+    initial: AnnotationItem?,
     sensors: List<Sensor>,
     onDismiss: () -> Unit,
-    onSave: (Long, String, String, Long?) -> Unit
+    onSave: (Long?, Long, String, String, Long?, String?, String?) -> Unit
 ) {
     val formatter = remember { DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm") }
-    var dateText by remember { mutableStateOf(formatEpoch(initialTimestamp, formatter)) }
-    var title by remember { mutableStateOf("") }
-    var note by remember { mutableStateOf("") }
-    var sensorId by remember { mutableStateOf<Long?>(null) }
+    var dateText by remember(initial?.id, initialTimestamp) {
+        mutableStateOf(formatEpoch(initial?.timestamp ?: initialTimestamp, formatter))
+    }
+    var title by remember(initial?.id) { mutableStateOf(initial?.title.orEmpty()) }
+    var note by remember(initial?.id) { mutableStateOf(initial?.note.orEmpty()) }
+    var sensorId by remember(initial?.id) { mutableStateOf(initial?.sensorId) }
+    var roomName by remember(initial?.id) {
+        mutableStateOf(initial?.roomName ?: initial?.sensorId?.let { id -> sensors.firstOrNull { it.id == id }?.room }.orEmpty())
+    }
+    var type by remember(initial?.id) { mutableStateOf(initial?.type.orEmpty()) }
     var sensorMenu by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf(false) }
+
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Nouvelle annotation") },
+        title = { Text(if (initial == null) "Nouvel événement" else "Modifier l’événement") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(dateText, { dateText = it; error = false }, label = { Text("Date / heure") }, supportingText = { if (error) Text("Format attendu : jj/MM/aaaa HH:mm") }, isError = error, singleLine = true)
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    dateText,
+                    { dateText = it; error = false },
+                    label = { Text("Date / heure") },
+                    supportingText = { if (error) Text("Format : jj/MM/aaaa HH:mm") },
+                    isError = error,
+                    singleLine = true
+                )
                 OutlinedTextField(title, { title = it }, label = { Text("Titre") }, singleLine = true)
-                OutlinedTextField(note, { note = it }, label = { Text("Note") }, minLines = 2)
+                OutlinedTextField(note, { note = it }, label = { Text("Note") }, minLines = 3)
+                OutlinedTextField(
+                    roomName,
+                    { roomName = it },
+                    label = { Text("Pièce / lieu") },
+                    supportingText = { Text("ex. SDB, chambre, chambre principale, salon") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    type,
+                    { type = it },
+                    label = { Text("Type d’événement (facultatif)") },
+                    singleLine = true
+                )
+
                 Box {
-                    OutlinedButton(onClick = { sensorMenu = true }) { Text(sensorId?.let { id -> sensors.firstOrNull { it.id == id }?.room } ?: "Toutes les pièces") }
-                    androidx.compose.material3.DropdownMenu(expanded = sensorMenu, onDismissRequest = { sensorMenu = false }) {
-                        androidx.compose.material3.DropdownMenuItem(text = { Text("Toutes les pièces") }, onClick = { sensorId = null; sensorMenu = false })
+                    OutlinedButton(onClick = { sensorMenu = true }) {
+                        Text(sensorId?.let { id -> sensors.firstOrNull { it.id == id }?.room } ?: "Aucun capteur précis")
+                    }
+                    DropdownMenu(expanded = sensorMenu, onDismissRequest = { sensorMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Aucun capteur précis") },
+                            onClick = {
+                                sensorId = null
+                                sensorMenu = false
+                            }
+                        )
                         sensors.forEach { sensor ->
-                            androidx.compose.material3.DropdownMenuItem(text = { Text(sensor.room) }, onClick = { sensorId = sensor.id; sensorMenu = false })
+                            DropdownMenuItem(
+                                text = { Text(sensor.room) },
+                                onClick = {
+                                    sensorId = sensor.id
+                                    if (roomName.isBlank()) roomName = sensor.room
+                                    sensorMenu = false
+                                }
+                            )
                         }
+                    }
+                }
+
+                Text("Pièces rapides", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf("SDB", "Chambre", "Chambre principale", "Salon").forEach { room ->
+                        AssistChip(onClick = { roomName = room }, label = { Text(room) })
                     }
                 }
             }
@@ -900,8 +1499,22 @@ private fun AnnotationDialog(
         confirmButton = {
             Button(onClick = {
                 val ts = parseLocalDate(dateText, formatter)
-                if (ts == null) error = true else onSave(ts, title, note, sensorId)
-            }) { Text("Ajouter") }
+                if (ts == null) {
+                    error = true
+                } else {
+                    onSave(
+                        initial?.id,
+                        ts,
+                        title,
+                        note,
+                        sensorId,
+                        roomName.trim().ifBlank { null },
+                        type.trim().ifBlank { null }
+                    )
+                }
+            }) {
+                Text(if (initial == null) "Ajouter" else "Enregistrer")
+            }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
     )
@@ -926,7 +1539,13 @@ private fun nearest(points: List<SamplePoint>, timestamp: Long): SamplePoint? {
     }
 }
 
-private fun paddedRange(values: List<Double>, fallbackMin: Double, fallbackMax: Double, clampMin: Double, clampMax: Double): Pair<Double, Double> {
+private fun paddedRange(
+    values: List<Double>,
+    fallbackMin: Double,
+    fallbackMax: Double,
+    clampMin: Double,
+    clampMax: Double
+): Pair<Double, Double> {
     if (values.isEmpty()) return fallbackMin to fallbackMax
     var low = values.minOrNull() ?: fallbackMin
     var high = values.maxOrNull() ?: fallbackMax
@@ -937,20 +1556,39 @@ private fun paddedRange(values: List<Double>, fallbackMin: Double, fallbackMax: 
     return low to high
 }
 
-private fun formatDateTime(epoch: Long): String = formatEpoch(epoch, DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm"))
-private fun formatEpoch(epoch: Long, formatter: DateTimeFormatter): String = Instant.ofEpochMilli(epoch).atZone(ZoneId.systemDefault()).format(formatter)
+private fun formatDateTime(epoch: Long): String =
+    formatEpoch(epoch, DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm"))
+
+private fun formatEpoch(epoch: Long, formatter: DateTimeFormatter): String =
+    Instant.ofEpochMilli(epoch).atZone(ZoneId.systemDefault()).format(formatter)
+
 private fun parseLocalDate(value: String, formatter: DateTimeFormatter): Long? = try {
-    LocalDateTime.parse(value.trim(), formatter).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-} catch (_: Exception) { null }
+    LocalDateTime.parse(value.trim(), formatter)
+        .atZone(ZoneId.systemDefault())
+        .toInstant()
+        .toEpochMilli()
+} catch (_: Exception) {
+    null
+}
 
 private fun formatAxisTime(epoch: Long, span: Long): String {
-    val formatter = if (span > 36L * 60L * 60L * 1000L) DateTimeFormatter.ofPattern("dd/MM HH'h'") else DateTimeFormatter.ofPattern("HH:mm")
+    val formatter = when {
+        span <= 2L * 60L * 60L * 1000L -> DateTimeFormatter.ofPattern("HH:mm")
+        span <= 2L * 24L * 60L * 60L * 1000L -> DateTimeFormatter.ofPattern("HH:mm")
+        span <= 14L * 24L * 60L * 60L * 1000L -> DateTimeFormatter.ofPattern("EEE HH'h'", Locale.FRANCE)
+        span <= 70L * 24L * 60L * 60L * 1000L -> DateTimeFormatter.ofPattern("dd/MM")
+        else -> DateTimeFormatter.ofPattern("MMM yy", Locale.FRANCE)
+    }
     return formatEpoch(epoch, formatter)
 }
 
 private fun compactDuration(ms: Long): String {
     val hours = ms / 3_600_000L
-    return if (hours < 48) "${hours} h" else "${hours / 24} j"
+    return when {
+        hours < 48 -> "${hours} h"
+        hours < 24L * 90L -> "${hours / 24} j"
+        else -> "${hours / (24L * 30L)} mois"
+    }
 }
 
 private fun Color.toArgbCompat(): Int = android.graphics.Color.argb(
@@ -970,6 +1608,7 @@ private fun FabDataTheme(content: @Composable () -> Unit) {
         secondary = Color(0xFF3A6073),
         secondaryContainer = Color(0xFFD6E5EE),
         tertiary = Color(0xFF8A4F7D),
+        tertiaryContainer = Color(0xFFF4D9EC),
         background = Color(0xFFF7F8FA),
         surface = Color(0xFFFFFFFF),
         surfaceVariant = Color(0xFFE9EEF3)
