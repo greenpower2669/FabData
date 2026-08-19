@@ -38,6 +38,26 @@ Si ces quatre secrets ne sont pas présents, GitHub Actions utilise volontaireme
 
 Quand les quatre secrets sont configurés, le fichier contient `google-play-upload-key`.
 
+### Certificat public de la clé d'import FabData
+
+Alias : `fabdata-upload`
+
+SHA-256 :
+
+```text
+E1:D3:A5:19:04:9A:2D:91:45:60:D7:0E:C7:DF:3F:2E:C4:E0:EA:FF:5F:FA:E4:FE:22:83:E9:89:7C:C7:67:22
+```
+
+SHA-1 :
+
+```text
+B9:5F:B8:A9:A6:8A:3D:A5:25:FA:2F:37:88:38:45:AA:DD:5C:88:08
+```
+
+Validité du certificat : jusqu'au 27 juin 2059.
+
+Ces empreintes sont publiques et peuvent être comparées à celles affichées dans la Play Console. Le keystore privé et ses mots de passe restent hors du dépôt.
+
 ## Ajouter les secrets depuis un téléphone
 
 Dans le navigateur du téléphone :
