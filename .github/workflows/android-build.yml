@@ -1,4 +1,4 @@
-name: Android APK
+name: Android APK + AAB
 
 on:
   push:
@@ -36,12 +36,12 @@ jobs:
         if: github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
           git add app/src/main/java/com/fabdata/app/MainActivity.kt app/src/main/java/com/fabdata/app/BackupLayer.kt
           if git diff --cached --quiet; then
             echo "Source patches already committed"
           else
-            git commit -m "Apply FabData v0.6 draft autosave"
+            git commit -m "Apply FabData source patches"
             git push
           fi
 
@@ -62,30 +62,60 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Build release APK
-        run: gradle --no-daemon :app:assembleRelease
+      - name: Restore Google Play upload key when configured
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+            echo "Google Play upload signing enabled"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+            echo "Google Play secrets are not configured; using development fallback signing"
+          fi
 
-      - name: Stage named APK
+      - name: Build release APK and Android App Bundle
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify generated packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.6-release.apk
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.7-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.7-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.7-signing-mode.txt
 
-      - name: Upload workflow artifact
+      - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.6-release
-          path: artifacts/FabData-v0.6-release.apk
+          name: FabData-v0.7-release
+          path: |
+            artifacts/FabData-v0.7-release.apk
+            artifacts/FabData-v0.7-release.aab
+            artifacts/FabData-v0.7-signing-mode.txt
           if-no-files-found: error
 
-      - name: Publish APK on branch
+      - name: Publish APK and AAB on branch
         if: github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.6-release.apk
+          git add artifacts/FabData-v0.7-release.apk artifacts/FabData-v0.7-release.aab artifacts/FabData-v0.7-signing-mode.txt
           if git diff --cached --quiet; then
-            echo "APK unchanged"
+            echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.6 release APK"
+            git commit -m "Build FabData v0.7 APK + AAB"
             git push
           fi
