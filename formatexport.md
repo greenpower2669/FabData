@@ -17,7 +17,7 @@ Le même bouton **Importer CSV** accepte les exports thermo-hygromètre d'origin
 - UTF-8
 - séparateur virgule `,`
 - champs contenant virgule, guillemet ou retour ligne protégés selon les règles CSV classiques
-- une ligne = un enregistrement
+- un enregistrement logique par ligne ; une note contenant un retour à la ligne reste correctement protégée entre guillemets et le parseur FabData la restitue intégralement
 
 ## En-tête exact
 
@@ -70,7 +70,7 @@ Une annotation / un événement créé dans FabData :
 - pièce ;
 - date/heure ;
 - titre ;
-- note complète ;
+- note complète, y compris les retours à la ligne ;
 - type d'événement ;
 - date de dernière modification.
 
