@@ -20,7 +20,6 @@ import java.time.format.DateTimeParseException
 import java.util.Locale
 import kotlin.math.ceil
 
-
 data class Sensor(
     val id: Long,
     val stableKey: String,
@@ -139,18 +138,21 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             arrayOf(stableKey)
         ).use { c ->
             if (c.moveToFirst()) {
+                val id = c.getLong(0)
                 return Sensor(
-                    id = c.getLong(0),
+                    id = id,
                     stableKey = c.getString(1),
                     name = c.getString(2),
                     room = c.getString(3),
                     colorIndex = c.getInt(4),
-                    latestTimestamp = latestTimestamp(c.getLong(0))
+                    latestTimestamp = latestTimestamp(id)
                 )
             }
         }
+
         val nextColor = readableDatabase.rawQuery("SELECT COUNT(*) FROM sensors", null).use { c ->
-            c.moveToFirst(); c.getInt(0) % 8
+            c.moveToFirst()
+            c.getInt(0) % 8
         }
         val values = ContentValues().apply {
             put("stable_key", stableKey)
@@ -191,8 +193,10 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         readableDatabase.rawQuery(
             """
             SELECT s.id, s.stable_key, s.name, s.room, s.color_index, MAX(p.timestamp)
-            FROM sensors s LEFT JOIN samples p ON p.sensor_id = s.id
-            GROUP BY s.id ORDER BY s.id
+            FROM sensors s
+            JOIN samples p ON p.sensor_id = s.id
+            GROUP BY s.id
+            ORDER BY s.id
             """.trimIndent(), null
         ).use { c ->
             while (c.moveToNext()) {
@@ -262,7 +266,8 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             """
             SELECT COUNT(*), MIN(temperature), MAX(temperature), AVG(temperature),
                    MIN(humidity), MAX(humidity), AVG(humidity)
-            FROM samples WHERE sensor_id = ? AND timestamp BETWEEN ? AND ?
+            FROM samples
+            WHERE sensor_id = ? AND timestamp BETWEEN ? AND ?
             """.trimIndent(),
             arrayOf(sensorId.toString(), from.toString(), to.toString())
         ).use { c ->
@@ -280,14 +285,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         }
     }
 
-    fun addAnnotation(
-        timestamp: Long,
-        title: String,
-        note: String,
-        sensorId: Long?,
-        roomName: String?,
-        type: String?
-    ): Long {
+    fun addAnnotation(timestamp: Long, title: String, note: String, sensorId: Long?, roomName: String?, type: String?): Long {
         val now = System.currentTimeMillis()
         val values = ContentValues().apply {
             put("timestamp", timestamp)
@@ -302,15 +300,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         return writableDatabase.insertOrThrow("annotations", null, values)
     }
 
-    fun updateAnnotation(
-        id: Long,
-        timestamp: Long,
-        title: String,
-        note: String,
-        sensorId: Long?,
-        roomName: String?,
-        type: String?
-    ) {
+    fun updateAnnotation(id: Long, timestamp: Long, title: String, note: String, sensorId: Long?, roomName: String?, type: String?) {
         val values = ContentValues().apply {
             put("timestamp", timestamp)
             put("title", title.trim().ifBlank { "Événement" })
@@ -331,10 +321,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         ).use { c ->
             while (c.moveToNext()) {
                 out += AnnotationItem(
-                    id = c.getLong(0),
-                    timestamp = c.getLong(1),
-                    title = c.getString(2),
-                    note = c.getString(3),
+                    id = c.getLong(0), timestamp = c.getLong(1), title = c.getString(2), note = c.getString(3),
                     sensorId = if (c.isNull(4)) null else c.getLong(4),
                     roomName = if (c.isNull(5)) null else c.getString(5),
                     type = if (c.isNull(6)) null else c.getString(6),
@@ -365,8 +352,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
     fun exportAllCsv(uri: Uri): Int {
         var count = 0
         val formatter = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss")
-        val output = appContext.contentResolver.openOutputStream(uri, "wt")
-            ?: error("Impossible de créer le fichier d’export")
+        val output = appContext.contentResolver.openOutputStream(uri, "wt") ?: error("Impossible de créer le fichier d’export")
         OutputStreamWriter(output, Charsets.UTF_8).buffered().use { writer ->
             writer.write("Capteur_ID,Capteur,Piece,Temps,Temperature_Celsius,Humidite_relative_Pourcentage\n")
             readableDatabase.rawQuery(
@@ -378,10 +364,8 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             ).use { c ->
                 while (c.moveToNext()) {
                     val ts = Instant.ofEpochMilli(c.getLong(3)).atZone(ZoneId.systemDefault()).format(formatter)
-                    val row = listOf(
-                        c.getString(0), c.getString(1), c.getString(2), ts,
-                        c.getDouble(4).toString(), c.getDouble(5).toString()
-                    ).joinToString(",") { csvEscape(it) }
+                    val row = listOf(c.getString(0), c.getString(1), c.getString(2), ts, c.getDouble(4).toString(), c.getDouble(5).toString())
+                        .joinToString(",") { csvEscape(it) }
                     writer.write(row)
                     writer.write("\n")
                     count++
@@ -392,10 +376,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
     }
 
     private fun latestTimestamp(sensorId: Long): Long? {
-        readableDatabase.rawQuery(
-            "SELECT MAX(timestamp) FROM samples WHERE sensor_id = ?",
-            arrayOf(sensorId.toString())
-        ).use { c ->
+        readableDatabase.rawQuery("SELECT MAX(timestamp) FROM samples WHERE sensor_id = ?", arrayOf(sensorId.toString())).use { c ->
             return if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
         }
     }
@@ -407,149 +388,158 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
 }
 
 class CsvImporter(private val context: Context, private val db: FabDataDb) {
-    private val localFormatters = listOf(
-        "yyyy/M/d H:m",
-        "yyyy/M/d H:m:s",
-        "yyyy/M/d H:m:s.SSS",
-        "yyyy-M-d H:m",
-        "yyyy-M-d H:m:s",
-        "yyyy-M-d H:m:s.SSS",
-        "yyyy.M.d H:m",
-        "yyyy.M.d H:m:s",
-        "d/M/yyyy H:m",
-        "d/M/yyyy H:m:s",
-        "d-M-yyyy H:m",
-        "d-M-yyyy H:m:s",
-        "d.M.yyyy H:m",
-        "d.M.yyyy H:m:s",
-        "M/d/yyyy h:m a",
-        "M/d/yyyy h:m:s a",
-        "yyyy/M/d h:m a",
-        "yyyy/M/d h:m:s a"
+    private data class ParsedPoint(val timestamp: Long, val temperature: Double, val humidity: Double)
+
+    private val genericLocalFormatters = listOf(
+        "uuuu/M/d H:m", "uuuu/M/d H:m:s", "uuuu/M/d H:m:s.SSS",
+        "uuuu-M-d H:m", "uuuu-M-d H:m:s", "uuuu-M-d H:m:s.SSS",
+        "uuuu.M.d H:m", "uuuu.M.d H:m:s",
+        "d/M/uuuu H:m", "d/M/uuuu H:m:s", "d-M-uuuu H:m", "d-M-uuuu H:m:s",
+        "d.M.uuuu H:m", "d.M.uuuu H:m:s", "M/d/uuuu h:m a", "M/d/uuuu h:m:s a"
     ).map { DateTimeFormatter.ofPattern(it, Locale.ROOT) } + listOf(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+
+    private val exactThermoTime = DateTimeFormatter.ofPattern("uuuu/MM/dd HH:mm", Locale.ROOT)
 
     fun import(uri: Uri): ImportResult {
         val sourceName = fileName(uri) ?: "import.csv"
         val sensorBase = sourceName.substringBefore("_Exporter", sourceName.substringBeforeLast('.'))
-            .replace('_', ' ')
-            .trim()
-            .ifBlank { "Thermo-hygromètre" }
+            .replace('_', ' ').trim().ifBlank { "Thermo-hygromètre" }
         val stableKey = normalize(sensorBase)
-        val sensor = db.getOrCreateSensor(stableKey, sensorBase)
-
-        var added = 0
-        var duplicates = 0
+        val parsed = mutableListOf<ParsedPoint>()
         var invalid = 0
-        var firstTs: Long? = null
-        var lastTs: Long? = null
 
         context.contentResolver.openInputStream(uri)?.use { input ->
             BufferedReader(InputStreamReader(input, Charsets.UTF_8)).use { reader ->
                 val headerLine = reader.readLine()?.removePrefix("\uFEFF") ?: error("Fichier CSV vide")
                 val delimiter = detectDelimiter(headerLine)
                 val headers = splitCsv(headerLine, delimiter).map(::normalize)
-                val timeIndex = findHeader(headers, listOf("temps", "heure", "time", "timestamp", "date", "datetime"))
-                val tempIndex = findHeader(headers, listOf("temperaturecelsius", "temperature", "temp", "tempc", "celsius"))
-                val humidityIndex = findHeader(headers, listOf("humiditerelativepourcentage", "humiditerelative", "humidite", "humidity", "relativehumidity", "rh", "hygrometrie"))
-                if (timeIndex < 0 || tempIndex < 0 || humidityIndex < 0) {
-                    error("Colonnes Temps / Température / Humidité introuvables")
-                }
+                val exactKnownFormat = delimiter == ',' && headers.size >= 3 &&
+                    headers[0] == "temps" && headers[1] == "temperaturecelsius" && headers[2] == "humiditerelativepourcentage"
 
-                db.inTransaction {
-                    reader.forEachLine { originalLine ->
-                        val line = originalLine.trimEnd('\r')
-                        if (line.isBlank()) return@forEachLine
-                        try {
-                            val fields = splitCsv(line, delimiter)
-                            val rawTime = fields.getOrNull(timeIndex).orEmpty()
-                            val rawTemp = fields.getOrNull(tempIndex).orEmpty()
-                            val rawHum = fields.getOrNull(humidityIndex).orEmpty()
-                            val ts = parseTime(rawTime)
-                            val temp = parseNumber(rawTemp)
-                            val hum = parseNumber(rawHum)
-                            if (ts == null || temp == null || hum == null || temp !in -100.0..150.0 || hum !in 0.0..100.0) {
-                                invalid++
-                            } else {
-                                firstTs = firstTs?.let { minOf(it, ts) } ?: ts
-                                lastTs = lastTs?.let { maxOf(it, ts) } ?: ts
-                                if (db.insertSample(sensor.id, ts, temp, hum)) added++ else duplicates++
-                            }
-                        } catch (_: Exception) {
-                            invalid++
+                val rows = reader.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() }.toList()
+                if (exactKnownFormat && rows.isNotEmpty()) {
+                    val firstFields = splitCsv(rows.first(), delimiter)
+                    val anchor = parseExactThermoTime(firstFields.getOrNull(0).orEmpty())
+                    val secondAnchor = rows.getOrNull(1)?.let { parseExactThermoTime(splitCsv(it, delimiter).getOrNull(0).orEmpty()) }
+                    if (anchor != null) {
+                        val stepMs = when {
+                            secondAnchor == null -> -60_000L
+                            secondAnchor < anchor -> -60_000L
+                            secondAnchor > anchor -> 60_000L
+                            else -> -60_000L
                         }
+                        rows.forEachIndexed { index, line ->
+                            try {
+                                val fields = splitCsv(line, delimiter)
+                                val temp = parseNumber(fields.getOrNull(1).orEmpty())
+                                val hum = parseNumber(fields.getOrNull(2).orEmpty())
+                                if (temp == null || hum == null || temp !in -100.0..150.0 || hum !in 0.0..100.0) {
+                                    invalid++
+                                } else {
+                                    parsed += ParsedPoint(anchor + index.toLong() * stepMs, temp, hum)
+                                }
+                            } catch (_: Exception) {
+                                invalid++
+                            }
+                        }
+                    } else {
+                        invalid += parseGenericRows(rows, delimiter, headers, parsed)
                     }
+                } else {
+                    invalid += parseGenericRows(rows, delimiter, headers, parsed)
                 }
             }
         } ?: error("Impossible d’ouvrir le fichier")
 
+        if (parsed.isEmpty()) return ImportResult(sourceName, sensorBase, 0, 0, invalid, null, null)
+
+        val sensor = db.getOrCreateSensor(stableKey, sensorBase)
+        var added = 0
+        var duplicates = 0
+        var firstTs: Long? = null
+        var lastTs: Long? = null
+        db.inTransaction {
+            parsed.forEach { point ->
+                firstTs = firstTs?.let { minOf(it, point.timestamp) } ?: point.timestamp
+                lastTs = lastTs?.let { maxOf(it, point.timestamp) } ?: point.timestamp
+                if (db.insertSample(sensor.id, point.timestamp, point.temperature, point.humidity)) added++ else duplicates++
+            }
+        }
         return ImportResult(sourceName, sensor.name, added, duplicates, invalid, firstTs, lastTs)
     }
+
+    private fun parseGenericRows(rows: List<String>, delimiter: Char, headers: List<String>, target: MutableList<ParsedPoint>): Int {
+        val timeIndex = findHeader(headers, listOf("temps", "heure", "time", "timestamp", "date", "datetime"))
+        val tempIndex = findHeader(headers, listOf("temperaturecelsius", "temperature", "temp", "tempc", "celsius"))
+        val humidityIndex = findHeader(headers, listOf("humiditerelativepourcentage", "humiditerelative", "humidite", "humidity", "relativehumidity", "rh", "hygrometrie"))
+        if (timeIndex < 0 || tempIndex < 0 || humidityIndex < 0) error("Colonnes Temps / Température / Humidité introuvables")
+        var invalid = 0
+        rows.forEach { line ->
+            try {
+                val fields = splitCsv(line, delimiter)
+                val ts = parseGenericTime(fields.getOrNull(timeIndex).orEmpty())
+                val temp = parseNumber(fields.getOrNull(tempIndex).orEmpty())
+                val hum = parseNumber(fields.getOrNull(humidityIndex).orEmpty())
+                if (ts == null || temp == null || hum == null || temp !in -100.0..150.0 || hum !in 0.0..100.0) invalid++
+                else target += ParsedPoint(ts, temp, hum)
+            } catch (_: Exception) {
+                invalid++
+            }
+        }
+        return invalid
+    }
+
+    private fun parseExactThermoTime(raw: String): Long? = try {
+        LocalDateTime.parse(raw.trim().trim('"'), exactThermoTime).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+    } catch (_: Exception) { null }
 
     private fun findHeader(headers: List<String>, aliases: List<String>): Int {
         val normalizedAliases = aliases.map(::normalize)
         return headers.indexOfFirst { h -> normalizedAliases.any { a -> h == a || h.contains(a) } }
     }
 
-    private fun parseTime(rawInput: String): Long? {
+    private fun parseGenericTime(rawInput: String): Long? {
         var raw = rawInput.trim().trim('"').replace('\u00A0', ' ').removePrefix("\uFEFF")
         if (raw.isBlank()) return null
         raw = raw.replace(Regex("\\s+"), " ")
-
         raw.toLongOrNull()?.let { n ->
             when {
                 n in 946684800L..4102444800L -> return n * 1000L
                 n in 946684800000L..4102444800000L -> return n
             }
         }
-
         try { return Instant.parse(raw).toEpochMilli() } catch (_: Exception) {}
         try { return OffsetDateTime.parse(raw, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant().toEpochMilli() } catch (_: Exception) {}
         try { return ZonedDateTime.parse(raw, DateTimeFormatter.ISO_ZONED_DATE_TIME).toInstant().toEpochMilli() } catch (_: Exception) {}
-
-        for (formatter in localFormatters) {
+        for (formatter in genericLocalFormatters) {
             try {
-                return LocalDateTime.parse(raw, formatter)
-                    .atZone(ZoneId.systemDefault())
-                    .toInstant()
-                    .toEpochMilli()
-            } catch (_: DateTimeParseException) {
-            }
+                return LocalDateTime.parse(raw, formatter).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+            } catch (_: DateTimeParseException) {}
         }
-
         val ymd = Regex("(\\d{4})[./-](\\d{1,2})[./-](\\d{1,2})[^0-9]+(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2}))?").find(raw)
-        if (ymd != null) {
-            return buildEpoch(
-                ymd.groupValues[1].toIntOrNull(), ymd.groupValues[2].toIntOrNull(), ymd.groupValues[3].toIntOrNull(),
-                ymd.groupValues[4].toIntOrNull(), ymd.groupValues[5].toIntOrNull(), ymd.groupValues[6].toIntOrNull() ?: 0
-            )
-        }
+        if (ymd != null) return buildEpoch(
+            ymd.groupValues[1].toIntOrNull(), ymd.groupValues[2].toIntOrNull(), ymd.groupValues[3].toIntOrNull(),
+            ymd.groupValues[4].toIntOrNull(), ymd.groupValues[5].toIntOrNull(), ymd.groupValues[6].toIntOrNull() ?: 0
+        )
         val dmy = Regex("(\\d{1,2})[./-](\\d{1,2})[./-](\\d{4})[^0-9]+(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2}))?").find(raw)
-        if (dmy != null) {
-            return buildEpoch(
-                dmy.groupValues[3].toIntOrNull(), dmy.groupValues[2].toIntOrNull(), dmy.groupValues[1].toIntOrNull(),
-                dmy.groupValues[4].toIntOrNull(), dmy.groupValues[5].toIntOrNull(), dmy.groupValues[6].toIntOrNull() ?: 0
-            )
-        }
+        if (dmy != null) return buildEpoch(
+            dmy.groupValues[3].toIntOrNull(), dmy.groupValues[2].toIntOrNull(), dmy.groupValues[1].toIntOrNull(),
+            dmy.groupValues[4].toIntOrNull(), dmy.groupValues[5].toIntOrNull(), dmy.groupValues[6].toIntOrNull() ?: 0
+        )
         return null
     }
 
     private fun buildEpoch(year: Int?, month: Int?, day: Int?, hour: Int?, minute: Int?, second: Int?): Long? {
         if (year == null || month == null || day == null || hour == null || minute == null || second == null) return null
         return try {
-            LocalDateTime.of(year, month, day, hour, minute, second)
-                .atZone(ZoneId.systemDefault())
-                .toInstant()
-                .toEpochMilli()
-        } catch (_: Exception) {
-            null
-        }
+            LocalDateTime.of(year, month, day, hour, minute, second).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        } catch (_: Exception) { null }
     }
 
     private fun parseNumber(rawInput: String): Double? {
         val raw = rawInput.trim().trim('"').replace('\u00A0', ' ')
         if (raw.isBlank()) return null
-        val normalized = raw.replace(',', '.')
-        normalized.toDoubleOrNull()?.let { return it }
+        raw.replace(',', '.').toDoubleOrNull()?.let { return it }
         val match = Regex("[-+]?\\d+(?:[.,]\\d+)?").find(raw) ?: return null
         return match.value.replace(',', '.').toDoubleOrNull()
     }
@@ -574,15 +564,9 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
         while (i < line.length) {
             val ch = line[i]
             when {
-                ch == '"' && quoted && i + 1 < line.length && line[i + 1] == '"' -> {
-                    cell.append('"')
-                    i++
-                }
+                ch == '"' && quoted && i + 1 < line.length && line[i + 1] == '"' -> { cell.append('"'); i++ }
                 ch == '"' -> quoted = !quoted
-                ch == delimiter && !quoted -> {
-                    out += cell.toString()
-                    cell.clear()
-                }
+                ch == delimiter && !quoted -> { out += cell.toString(); cell.clear() }
                 else -> cell.append(ch)
             }
             i++
