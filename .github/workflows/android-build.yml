@@ -25,19 +25,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.5 source patch
-        run: python3 scripts/apply-v05-patch.py
+      - name: Apply v0.5 source patches
+        run: |
+          python3 scripts/apply-v05-patch.py
+          python3 scripts/apply-v05-backup-fix.py
 
-      - name: Commit v0.5 source patch
+      - name: Commit v0.5 source patches
         if: github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/src/main/java/com/fabdata/app/MainActivity.kt
+          git add app/src/main/java/com/fabdata/app/MainActivity.kt app/src/main/java/com/fabdata/app/BackupLayer.kt
           if git diff --cached --quiet; then
-            echo "Source patch already committed"
+            echo "Source patches already committed"
           else
-            git commit -m "Wire FabData v0.5 backup import-export UI"
+            git commit -m "Finalize FabData v0.5 backup import-export"
             git push
           fi
 
