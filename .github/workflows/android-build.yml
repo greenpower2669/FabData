@@ -30,6 +30,7 @@ jobs:
           python3 scripts/apply-v05-patch.py
           python3 scripts/apply-v05-backup-fix.py
           python3 scripts/apply-v06-draft-patch.py
+          python3 scripts/apply-v06-draft-date-fix.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
@@ -80,7 +81,7 @@ jobs:
         if: github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
           git add artifacts/FabData-v0.6-release.apk
           if git diff --cached --quiet; then
             echo "APK unchanged"
