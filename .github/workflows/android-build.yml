@@ -32,6 +32,7 @@ jobs:
           python3 scripts/apply-v06-draft-patch.py
           python3 scripts/apply-v06-draft-date-fix.py
           python3 scripts/apply-v07-play-policy.py
+          python3 scripts/apply-v08-lyon-weather.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
@@ -94,18 +95,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.7-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.7-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.7-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.8-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.8-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.8-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.7-release
+          name: FabData-v0.8-release
           path: |
-            artifacts/FabData-v0.7-release.apk
-            artifacts/FabData-v0.7-release.aab
-            artifacts/FabData-v0.7-signing-mode.txt
+            artifacts/FabData-v0.8-release.apk
+            artifacts/FabData-v0.8-release.aab
+            artifacts/FabData-v0.8-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -113,10 +114,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.7-release.apk artifacts/FabData-v0.7-release.aab artifacts/FabData-v0.7-signing-mode.txt
+          git add artifacts/FabData-v0.8-release.apk artifacts/FabData-v0.8-release.aab artifacts/FabData-v0.8-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.7 APK + AAB"
+            git commit -m "Build FabData v0.8 APK + AAB"
             git push
           fi
