@@ -440,6 +440,24 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 )
                             }
                         },
+                        onCompleteLyon = {
+                            scope.launch {
+                                busy = true
+                                val result = withContext(Dispatchers.IO) {
+                                    runCatching { lyonWeather.completePhysicalPeriod() }
+                                }
+                                busy = false
+                                reloadToken++
+                                snackbar.showSnackbar(
+                                    result.fold(
+                                        onSuccess = {
+                                            "Lyon complété : ${it.added} mesure(s) · ${it.daysDownloaded} jour(s) téléchargé(s) · ${it.daysAlreadyComplete} déjà complet(s)"
+                                        },
+                                        onFailure = { "Compléter Lyon : ${it.message ?: "archives indisponibles"}" }
+                                    )
+                                )
+                            }
+                        },
                         onAddRemote = { remoteSensorDialogOpen = true },
                         onSyncRemote = { config ->
                             scope.launch {
@@ -688,6 +706,7 @@ private fun SensorSourcesCard(
     sensors: List<Sensor>,
     remoteConfigs: List<RemoteSensorConfig>,
     onSyncLyon: () -> Unit,
+    onCompleteLyon: () -> Unit,
     onAddRemote: () -> Unit,
     onSyncRemote: (RemoteSensorConfig) -> Unit,
     onDeleteRemote: (RemoteSensorConfig) -> Unit
@@ -697,7 +716,7 @@ private fun SensorSourcesCard(
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Sondes / stations météo", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Lyon est préconfigurée par défaut. Une sonde HTTP ajoutée une fois reste ensuite automatique.",
+                "Lyon est préconfigurée par défaut. 《 Compléter 》 aligne ses archives sur la période réelle des thermomètres connectés.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -711,6 +730,7 @@ private fun SensorSourcesCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                TextButton(onClick = onCompleteLyon) { Text("《 Compléter 》") }
                 OutlinedButton(onClick = onSyncLyon) { Text("Actualiser") }
             }
 

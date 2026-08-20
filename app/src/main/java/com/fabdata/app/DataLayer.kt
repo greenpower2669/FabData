@@ -222,6 +222,37 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         writableDatabase.delete("sensors", "id = ?", arrayOf(id.toString()))
     }
 
+    /**
+     * Période de référence des thermomètres réellement acquis/importés.
+     * Les stations météo et sondes HTTP distantes ne doivent pas allonger
+     * artificiellement cette fenêtre.
+     */
+    fun physicalSensorBounds(): LongRange? {
+        readableDatabase.rawQuery(
+            """
+            SELECT MIN(p.timestamp), MAX(p.timestamp)
+            FROM samples p
+            JOIN sensors s ON s.id = p.sensor_id
+            WHERE s.stable_key NOT LIKE 'meteo-%'
+              AND s.stable_key NOT LIKE 'http-get-%'
+            """.trimIndent(), null
+        ).use { c ->
+            if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
+            return c.getLong(0)..c.getLong(1)
+        }
+    }
+
+    fun existingSampleTimestamps(sensorId: Long, from: Long, to: Long): Set<Long> {
+        val out = linkedSetOf<Long>()
+        readableDatabase.rawQuery(
+            "SELECT timestamp FROM samples WHERE sensor_id = ? AND timestamp BETWEEN ? AND ?",
+            arrayOf(sensorId.toString(), from.toString(), to.toString())
+        ).use { c ->
+            while (c.moveToNext()) out += c.getLong(0)
+        }
+        return out
+    }
+
     fun globalTimeBounds(): LongRange? {
         readableDatabase.rawQuery("SELECT MIN(timestamp), MAX(timestamp) FROM samples", null).use { c ->
             if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
