@@ -21,18 +21,22 @@ L'application peut traiter les données que l'utilisateur choisit lui-même d'im
 - nom de la pièce ;
 - annotations et événements saisis par l'utilisateur.
 
+FabData v0.8 peut également télécharger les observations météorologiques publiques de la station Météo-France Lyon-Bron afin de créer localement la sonde virtuelle **Lyon**. Seules les valeurs météo publiques nécessaires au graphique (heure, température et humidité) sont enregistrées dans la base locale FabData.
+
 ## Collecte et partage
 
 Dans la version actuelle de FabData :
 
-- aucune donnée n'est envoyée à un serveur FabData ;
+- aucune mesure, annotation, pièce ou sauvegarde utilisateur n'est envoyée à un serveur FabData ;
 - aucune donnée utilisateur n'est vendue ;
 - aucune donnée utilisateur n'est partagée avec un tiers par l'application ;
 - aucun compte utilisateur n'est créé ;
 - aucun SDK publicitaire ou analytique n'est intégré ;
 - l'application ne demande pas l'accès à la localisation, au microphone, à la caméra, aux contacts ou aux journaux d'appels.
 
-Les données sont conservées localement sur l'appareil Android dans la base interne de l'application. Les sauvegardes CSV ne sont créées que lorsque l'utilisateur demande explicitement un export et choisit lui-même leur emplacement via le sélecteur de fichiers Android.
+Pour alimenter la sonde **Lyon**, l'application effectue une requête HTTPS vers une page publique Infoclimat présentant les observations de la station Météo-France Lyon-Bron. Comme pour toute connexion Internet, le serveur distant peut techniquement recevoir les informations réseau standard nécessaires à la requête, notamment l'adresse IP et les en-têtes HTTP. FabData n'ajoute à cette requête aucune mesure locale, annotation, nom de pièce, sauvegarde ou identifiant utilisateur.
+
+Les données de l'utilisateur sont conservées localement sur l'appareil Android dans la base interne de l'application. Les sauvegardes CSV ne sont créées que lorsque l'utilisateur demande explicitement un export et choisit lui-même leur emplacement via le sélecteur de fichiers Android.
 
 ## Accès aux fichiers
 
@@ -46,7 +50,7 @@ Les fichiers CSV exportés sont sous le contrôle de l'utilisateur et doivent ê
 
 ## Sécurité
 
-FabData limite le traitement aux données nécessaires à ses fonctions locales d'analyse et de visualisation. Aucun transfert réseau de ces données n'est effectué par l'application dans sa version actuelle.
+FabData limite le traitement aux données nécessaires à ses fonctions d'analyse et de visualisation. Les données personnelles ou mesures locales de l'utilisateur ne sont pas transférées par la fonction météo ; seule une consultation HTTPS d'une ressource météo publique est réalisée.
 
 ## Services de distribution
 
@@ -54,4 +58,4 @@ Google Play peut traiter certaines données liées au téléchargement, à l'ins
 
 ## Évolution de l'application
 
-Si une future version ajoute une synchronisation réseau, un service cloud, de l'analytique, de la publicité ou tout autre traitement de données, cette politique et la déclaration « Sécurité des données » de Google Play devront être mises à jour avant publication.
+Si une future version ajoute une synchronisation cloud des données utilisateur, de l'analytique, de la publicité ou tout autre traitement supplémentaire, cette politique et la déclaration « Sécurité des données » de Google Play devront être mises à jour avant publication.
