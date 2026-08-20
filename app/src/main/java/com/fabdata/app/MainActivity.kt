@@ -181,6 +181,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val context = LocalContext.current
     val importer = remember { CsvImporter(context, db) }
     val backup = remember { FabDataBackup(context, db) }
+    val lyonWeather = remember { LyonWeatherSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
     val prefsStore = remember { FabPrefs(context) }
     val scope = rememberCoroutineScope()
@@ -252,6 +253,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 )
             }
         }
+    }
+
+    // Synchronise silencieusement les observations mesurées du jour à Lyon-Bron.
+    // Une absence de réseau ne bloque jamais l'ouverture ni les imports CSV.
+    LaunchedEffect(Unit) {
+        val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
+        if (result.isSuccess) reloadToken++
     }
 
     LaunchedEffect(initialImport, initialHandled) {
@@ -334,8 +342,27 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }) {
                         Icon(Icons.Default.FileDownload, contentDescription = "Exporter / sauvegarder FabData")
                     }
-                    IconButton(onClick = { reloadToken++ }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Actualiser")
+                    IconButton(onClick = {
+                        scope.launch {
+                            busy = true
+                            val result = withContext(Dispatchers.IO) {
+                                runCatching { lyonWeather.syncToday() }
+                            }
+                            busy = false
+                            reloadToken++
+                            snackbar.showSnackbar(
+                                result.fold(
+                                    onSuccess = {
+                                        "Lyon : ${it.added} nouvelle(s) mesure(s) · ${it.duplicates} déjà présente(s)"
+                                    },
+                                    onFailure = {
+                                        "Lyon non actualisé : ${it.message ?: "réseau ou source indisponible"}"
+                                    }
+                                )
+                            )
+                        }
+                    }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Actualiser Lyon et les courbes")
                     }
                     IconButton(onClick = { settingsOpen = true }) {
                         Icon(Icons.Default.Settings, contentDescription = "Réglages")
@@ -1372,11 +1399,12 @@ private fun SettingsDialog(
                     singleLine = true
                 )
                 HorizontalDivider()
-                Text("Politique de confidentialité · FabData v0.7", fontWeight = FontWeight.Bold)
+                Text("Politique de confidentialité · FabData v0.8", fontWeight = FontWeight.Bold)
                 Text(
                     "Les mesures, noms de pièces et événements sont traités localement sur cet appareil. " +
                         "FabData n'envoie aucune donnée utilisateur à un serveur, n'intègre ni publicité ni analytique " +
-                        "et ne crée aucun compte utilisateur.",
+                        "et ne crée aucun compte utilisateur. La sonde Lyon consulte uniquement une page publique " +
+                        "d'observations météo Lyon-Bron afin d'importer température et humidité.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
