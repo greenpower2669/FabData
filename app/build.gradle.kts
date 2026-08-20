@@ -42,9 +42,6 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            // GitHub Actions utilise la vraie clé d'import Google Play quand les
-            // secrets sont présents. Sans secrets, on garde une signature de
-            // développement afin de continuer à produire un APK installable.
             signingConfig = if (hasUploadSigning) {
                 signingConfigs.getByName("upload")
             } else {
@@ -86,7 +83,6 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
-    implementation("org.jsoup:jsoup:1.23.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
