@@ -23,8 +23,8 @@ android {
         applicationId = "com.fabdata.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.7"
+        versionCode = 8
+        versionName = "0.8"
     }
 
     signingConfigs {
@@ -86,6 +86,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("org.jsoup:jsoup:1.23.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
