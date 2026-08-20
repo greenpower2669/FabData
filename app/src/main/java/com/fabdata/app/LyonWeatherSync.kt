@@ -2,6 +2,7 @@ package com.fabdata.app
 
 import org.jsoup.Jsoup
 import java.time.LocalDate
+import java.time.ZonedDateTime
 import java.time.ZoneId
 import java.util.Locale
 
@@ -42,12 +43,15 @@ class LyonWeatherSync(private val db: FabDataDb) {
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
     /**
-     * Synchronise toutes les mesures horaires déjà publiées pour la journée
-     * courante à Lyon. Les heures déjà présentes restent intactes grâce à la
-     * contrainte UNIQUE(sensor_id, timestamp).
+     * Synchronise les observations horaires actuellement publiées pour Lyon-Bron.
+     * Le tableau temps réel contient aussi les dernières heures de la veille :
+     * une heure supérieure à l'heure locale courante est donc rattachée à J-1.
+     * Les heures déjà présentes restent intactes grâce à la contrainte
+     * UNIQUE(sensor_id, timestamp).
      */
     fun syncToday(): LyonWeatherSyncResult {
-        val date = LocalDate.now(LYON_ZONE)
+        val now = ZonedDateTime.now(LYON_ZONE)
+        val date = now.toLocalDate()
         val document = Jsoup.connect(SOURCE_URL)
             .userAgent("FabData/0.8 (Android; weather observation import)")
             .referrer("https://www.infoclimat.fr/")
@@ -77,7 +81,8 @@ class LyonWeatherSync(private val db: FabDataDb) {
 
             if (temperature !in -100.0..150.0 || humidity !in 0.0..100.0) return@forEach
 
-            val timestamp = date.atTime(hour, 0)
+            val observationDate = if (hour > now.hour) date.minusDays(1) else date
+            val timestamp = observationDate.atTime(hour, 0)
                 .atZone(LYON_ZONE)
                 .toInstant()
                 .toEpochMilli()
