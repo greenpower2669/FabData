@@ -3,9 +3,9 @@ from pathlib import Path
 path = Path("app/src/main/java/com/fabdata/app/MainActivity.kt")
 text = path.read_text(encoding="utf-8")
 
-marker = "Politique de confidentialité · FabData v0.7"
-if marker in text:
-    print("FabData v0.7 privacy patch already applied")
+# Idempotence across later versions: once the privacy block exists, do nothing.
+if "Politique de confidentialité · FabData v0." in text:
+    print("FabData privacy patch already applied")
     raise SystemExit(0)
 
 old = '''        title = { Text("Réglages FabData") },
