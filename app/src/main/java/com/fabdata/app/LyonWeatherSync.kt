@@ -1,6 +1,8 @@
 package com.fabdata.app
 
-import org.jsoup.Jsoup
+import android.text.Html
+import java.net.HttpURLConnection
+import java.net.URL
 import java.time.LocalDate
 import java.time.ZonedDateTime
 import java.time.ZoneId
@@ -20,8 +22,7 @@ data class LyonWeatherSyncResult(
  *
  * La sonde est volontairement enregistrée avec le même modèle Sensor/Sample
  * que les thermo-hygromètres physiques. Elle est donc automatiquement incluse
- * dans le format de sauvegarde FabData v1 et restaurée par les anciennes
- * sauvegardes sans migration de schéma.
+ * dans le format de sauvegarde FabData v1 et restaurée sans migration de schéma.
  */
 class LyonWeatherSync(private val db: FabDataDb) {
     companion object {
@@ -38,34 +39,20 @@ class LyonWeatherSync(private val db: FabDataDb) {
         val humidity: Double
     )
 
+    private val rowRegex = Regex("(?is)<tr\\b[^>]*>(.*?)</tr>")
     private val hourRegex = Regex("(?:^|\\s)([01]?\\d|2[0-3])h(?:\\s|$)", RegexOption.IGNORE_CASE)
     private val temperatureRegex = Regex("(-?\\d+(?:[.,]\\d+)?)\\s*°C", RegexOption.IGNORE_CASE)
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
-    /**
-     * Synchronise les observations horaires actuellement publiées pour Lyon-Bron.
-     * Le tableau temps réel contient aussi les dernières heures de la veille :
-     * une heure supérieure à l'heure locale courante est donc rattachée à J-1.
-     * Les heures déjà présentes restent intactes grâce à la contrainte
-     * UNIQUE(sensor_id, timestamp).
-     */
     fun syncToday(): LyonWeatherSyncResult {
         val now = ZonedDateTime.now(LYON_ZONE)
         val date = now.toLocalDate()
-        val document = Jsoup.connect(SOURCE_URL)
-            .userAgent("FabData/0.8 (Android; weather observation import)")
-            .referrer("https://www.infoclimat.fr/")
-            .header("Accept-Language", "fr-FR,fr;q=0.9")
-            .timeout(15_000)
-            .followRedirects(true)
-            .get()
-
+        val html = downloadHtml()
         val points = linkedMapOf<Long, WeatherPoint>()
 
-        // Le tableau contient une ligne par heure. On reste volontairement
-        // tolérant sur les classes CSS pour ne pas dépendre de la présentation.
-        document.select("tr").forEach { row ->
-            val text = row.text()
+        rowRegex.findAll(html).forEach { match ->
+            val text = Html.fromHtml(match.groupValues[1], Html.FROM_HTML_MODE_LEGACY)
+                .toString()
                 .replace('\u00A0', ' ')
                 .replace(Regex("\\s+"), " ")
                 .trim()
@@ -90,9 +77,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
             points[timestamp] = WeatherPoint(timestamp, temperature, humidity)
         }
 
-        if (points.isEmpty()) {
-            error("Aucune observation Lyon-Bron exploitable reçue")
-        }
+        if (points.isEmpty()) error("Aucune observation Lyon-Bron exploitable reçue")
 
         val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
         var added = 0
@@ -107,18 +92,26 @@ class LyonWeatherSync(private val db: FabDataDb) {
             }
         }
 
-        return LyonWeatherSyncResult(
-            parsed = points.size,
-            added = added,
-            duplicates = duplicates,
-            date = date
-        )
+        return LyonWeatherSyncResult(points.size, added, duplicates, date)
     }
 
-    fun sourceDescription(): String = String.format(
-        Locale.FRANCE,
-        "%s · %s",
-        DISPLAY_NAME,
-        SOURCE_NAME
-    )
+    private fun downloadHtml(): String {
+        val connection = (URL(SOURCE_URL).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "FabData/0.8 (Android; weather observation import)")
+            setRequestProperty("Accept-Language", "fr-FR,fr;q=0.9")
+        }
+        return try {
+            val code = connection.responseCode
+            if (code !in 200..299) error("Source météo HTTP $code")
+            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun sourceDescription(): String = String.format(Locale.FRANCE, "%s · %s", DISPLAY_NAME, SOURCE_NAME)
 }
