@@ -45,6 +45,9 @@ class LyonWeatherSync(private val db: FabDataDb) {
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
     fun syncToday(): LyonWeatherSyncResult {
+        // Create the virtual sensor first so FabData can show it even if the
+        // remote weather source is temporarily unavailable.
+        val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
         val now = ZonedDateTime.now(LYON_ZONE)
         val date = now.toLocalDate()
         val html = downloadHtml()
@@ -79,7 +82,6 @@ class LyonWeatherSync(private val db: FabDataDb) {
 
         if (points.isEmpty()) error("Aucune observation Lyon-Bron exploitable reçue")
 
-        val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
         var added = 0
         var duplicates = 0
         db.inTransaction {
@@ -101,7 +103,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
             connectTimeout = 15_000
             readTimeout = 15_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "FabData/0.8 (Android; weather observation import)")
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.8")
             setRequestProperty("Accept-Language", "fr-FR,fr;q=0.9")
         }
         return try {

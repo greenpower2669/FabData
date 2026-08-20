@@ -259,7 +259,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     // Une absence de réseau ne bloque jamais l'ouverture ni les imports CSV.
     LaunchedEffect(Unit) {
         val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
-        if (result.isSuccess) reloadToken++
+        // Reload even on failure: Lyon has already been created and must remain
+        // visible so the user can distinguish "no data" from "no sensor".
+        reloadToken++
+        result.exceptionOrNull()?.let { error ->
+            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "réseau ou source indisponible"}")
+        }
     }
 
     LaunchedEffect(initialImport, initialHandled) {

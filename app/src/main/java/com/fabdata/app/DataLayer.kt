@@ -194,7 +194,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             """
             SELECT s.id, s.stable_key, s.name, s.room, s.color_index, MAX(p.timestamp)
             FROM sensors s
-            JOIN samples p ON p.sensor_id = s.id
+            LEFT JOIN samples p ON p.sensor_id = s.id
             GROUP BY s.id
             ORDER BY s.id
             """.trimIndent(), null
