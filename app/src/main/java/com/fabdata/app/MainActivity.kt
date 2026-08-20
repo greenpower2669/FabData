@@ -182,6 +182,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val importer = remember { CsvImporter(context, db) }
     val backup = remember { FabDataBackup(context, db) }
     val lyonWeather = remember { LyonWeatherSync(db) }
+    val remoteSensorStore = remember { RemoteSensorStore(context) }
+    val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
     val prefsStore = remember { FabPrefs(context) }
     val scope = rememberCoroutineScope()
@@ -200,6 +202,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var selectedAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var detailAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
+    var remoteSensorDialogOpen by remember { mutableStateOf(false) }
+    var remoteConfigs by remember { mutableStateOf(remoteSensorStore.load()) }
     var annotationTimestamp by remember { mutableStateOf<Long?>(null) }
     var editingAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var editSensor by remember { mutableStateOf<Sensor?>(null) }
@@ -264,6 +268,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         reloadToken++
         result.exceptionOrNull()?.let { error ->
             snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "réseau ou source indisponible"}")
+        }
+    }
+
+    // Les sondes HTTP ajoutées une fois restent automatiques ensuite.
+    LaunchedEffect(Unit) {
+        val configs = remoteSensorStore.load()
+        if (configs.isNotEmpty()) {
+            withContext(Dispatchers.IO) {
+                configs.forEach { config -> runCatching { remoteSensorSync.sync(config) } }
+            }
+            reloadToken++
         }
     }
 
@@ -408,6 +423,46 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
             } else {
                 item {
+                    SensorSourcesCard(
+                        sensors = sensors,
+                        remoteConfigs = remoteConfigs,
+                        onSyncLyon = {
+                            scope.launch {
+                                busy = true
+                                val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
+                                busy = false
+                                reloadToken++
+                                snackbar.showSnackbar(
+                                    result.fold(
+                                        onSuccess = { "Lyon : ${it.added} nouvelle(s) mesure(s)" },
+                                        onFailure = { "Lyon : ${it.message ?: "source indisponible"}" }
+                                    )
+                                )
+                            }
+                        },
+                        onAddRemote = { remoteSensorDialogOpen = true },
+                        onSyncRemote = { config ->
+                            scope.launch {
+                                busy = true
+                                val result = withContext(Dispatchers.IO) { runCatching { remoteSensorSync.sync(config) } }
+                                busy = false
+                                reloadToken++
+                                snackbar.showSnackbar(
+                                    result.fold(
+                                        onSuccess = { "${config.name} : ${if (it.added) "mesure ajoutée" else "déjà à jour"}" },
+                                        onFailure = { "${config.name} : ${it.message ?: "GET impossible"}" }
+                                    )
+                                )
+                            }
+                        },
+                        onDeleteRemote = { config ->
+                            remoteSensorStore.delete(config.id)
+                            remoteConfigs = remoteSensorStore.load()
+                        }
+                    )
+                }
+
+                item {
                     SeriesSelector(
                         sensors = sensors,
                         showTemp = showTemp,
@@ -532,6 +587,29 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         )
     }
 
+    if (remoteSensorDialogOpen) {
+        RemoteSensorDialog(
+            onDismiss = { remoteSensorDialogOpen = false },
+            onSave = { name, url, tempKey, humidityKey, timestampKey ->
+                val config = remoteSensorStore.add(name, url, tempKey, humidityKey, timestampKey)
+                remoteConfigs = remoteSensorStore.load()
+                remoteSensorDialogOpen = false
+                scope.launch {
+                    busy = true
+                    val result = withContext(Dispatchers.IO) { runCatching { remoteSensorSync.sync(config) } }
+                    busy = false
+                    reloadToken++
+                    snackbar.showSnackbar(
+                        result.fold(
+                            onSuccess = { "${config.name} initialisée · synchro automatique activée" },
+                            onFailure = { "${config.name} enregistrée · GET initial : ${it.message ?: "échec"}" }
+                        )
+                    )
+                }
+            }
+        )
+    }
+
     annotationTimestamp?.let { ts ->
         AnnotationDialog(
             initialTimestamp = ts,
@@ -603,6 +681,135 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
         )
     }
+}
+
+@Composable
+private fun SensorSourcesCard(
+    sensors: List<Sensor>,
+    remoteConfigs: List<RemoteSensorConfig>,
+    onSyncLyon: () -> Unit,
+    onAddRemote: () -> Unit,
+    onSyncRemote: (RemoteSensorConfig) -> Unit,
+    onDeleteRemote: (RemoteSensorConfig) -> Unit
+) {
+    val lyon = sensors.firstOrNull { it.stableKey == LyonWeatherSync.STABLE_KEY }
+    Card(shape = RoundedCornerShape(20.dp)) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Sondes / stations météo", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(
+                "Lyon est préconfigurée par défaut. Une sonde HTTP ajoutée une fois reste ensuite automatique.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Lyon", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (lyon?.latestTimestamp != null) "Station météo · active" else "Station météo · en attente de mesure",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                OutlinedButton(onClick = onSyncLyon) { Text("Actualiser") }
+            }
+
+            remoteConfigs.forEach { config ->
+                HorizontalDivider()
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(config.name, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "HTTP GET · automatique",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    TextButton(onClick = { onSyncRemote(config) }) { Text("Actualiser") }
+                    IconButton(onClick = { onDeleteRemote(config) }) {
+                        Icon(Icons.Default.Delete, contentDescription = "Supprimer la sonde HTTP")
+                    }
+                }
+            }
+
+            OutlinedButton(onClick = onAddRemote, modifier = Modifier.fillMaxWidth()) {
+                Text("+ Ajouter une sonde HTTP GET")
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteSensorDialog(
+    onDismiss: () -> Unit,
+    onSave: (String, String, String, String, String) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("") }
+    var temperatureKey by remember { mutableStateOf("temperature") }
+    var humidityKey by remember { mutableStateOf("humidity") }
+    var timestampKey by remember { mutableStateOf("timestamp") }
+    var error by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Ajouter une sonde HTTP GET") },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("À faire une seule fois : ensuite FabData synchronise cette sonde automatiquement.")
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Nom de la sonde") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it; error = false },
+                    label = { Text("URL GET (http:// ou https://)") },
+                    isError = error,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("Réponse JSON ou texte : temperature=23.4&humidity=51", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(
+                    value = temperatureKey,
+                    onValueChange = { temperatureKey = it },
+                    label = { Text("Champ température") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = humidityKey,
+                    onValueChange = { humidityKey = it },
+                    label = { Text("Champ humidité") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = timestampKey,
+                    onValueChange = { timestampKey = it },
+                    label = { Text("Champ date/heure (optionnel)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (!url.trim().startsWith("http://") && !url.trim().startsWith("https://")) {
+                    error = true
+                } else {
+                    onSave(name, url, temperatureKey, humidityKey, timestampKey)
+                }
+            }) { Text("Initialiser") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
+    )
 }
 
 @Composable
