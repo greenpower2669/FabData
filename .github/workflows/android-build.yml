@@ -129,3 +129,21 @@ jobs:
             git commit -m "Build FabData v0.8.3 APK + AAB"
             git push
           fi
+
+      - name: Publish GitHub Release with APK and AAB
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.8.3
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "FabData v0.8.3" \
+              --notes "FabData v0.8.3 — station Lyon par défaut, sondes HTTP GET automatiques et bouton 《 Compléter 》 pour récupérer les archives météo sur la période réellement couverte par les thermomètres connectés."
+          fi
+          gh release upload "$TAG" \
+            artifacts/FabData-v0.8.3-release.apk \
+            artifacts/FabData-v0.8.3-release.aab \
+            artifacts/FabData-v0.8.3-signing-mode.txt \
+            --clobber
