@@ -38,6 +38,50 @@ La section d'annotations devra pouvoir proposer au minimum :
 
 Une annotation hors zoom ne doit jamais donner l'impression d'avoir été supprimée.
 
+## Mini-barre de navigation sur l'historique total
+
+Ajouter au-dessus ou sous le graphique principal une **mini-barre graphique compacte**, façon mini-carte/minimap temporelle.
+
+Cette mini-barre représente **la totalité de l'historique réellement stocké**, indépendamment du zoom du graphique principal.
+
+Objectifs :
+
+- donner immédiatement une vue de la présence des données sur toute la période ;
+- rendre visibles les éventuels trous ou blocs séparés ;
+- éviter qu'une ancienne partie de courbe semble perdue alors qu'elle est simplement loin dans le temps ;
+- permettre de naviguer instantanément dans l'historique sans multiplier les boutons.
+
+### Interaction principale
+
+Un tap/clic à un endroit de cette mini-barre sélectionne cet instant comme centre de navigation et ouvre dans le graphique principal une **fenêtre détaillée de 48 heures** autour de ce point.
+
+Comportement souhaité :
+
+- tap au milieu de l'historique → affichage détaillé des 48 h centrées sur ce point ;
+- tap près du début → fenêtre 48 h recalée pour ne pas dépasser le début réel ;
+- tap près de la fin → fenêtre 48 h recalée pour ne pas dépasser la fin réelle.
+
+La zone de 48 h actuellement ouverte dans le graphique principal doit être visible dans la mini-barre sous forme d'une **fenêtre/surbrillance de sélection**.
+
+Cette fenêtre pourra ensuite idéalement être déplaçable horizontalement pour parcourir l'historique, mais le tap direct doit rester le geste simple principal.
+
+### Règles techniques
+
+La mini-barre ne doit jamais utiliser uniquement les données déjà filtrées du graphique principal.
+
+Elle doit être construite à partir des bornes de **tout l'historique stocké** et d'une représentation allégée/downsamplée de celui-ci.
+
+Le downsampling est uniquement graphique :
+
+- ne supprimer aucune mesure SQLite ;
+- préserver les trous temporels ;
+- ne jamais relier artificiellement deux blocs séparés ;
+- conserver la position temporelle réelle des segments.
+
+La mini-barre peut être volontairement très fine et simplifiée : son rôle est la navigation et la perception globale, pas l'analyse précise des valeurs.
+
+Le zoom détaillé par défaut déclenché depuis cette barre est **48 h**, cohérent avec le futur preset 48 h. Si l'architecture permet ensuite de choisir 1 h / 24 h / 48 h / semaine / mois comme fenêtre de navigation, conserver 48 h comme valeur initiale.
+
 ## Format/import temporel à corriger
 
 Point à surveiller séparément : l'importeur du format thermo reconnu reconstruit actuellement les timestamps à partir de la première ligne avec un pas fixe de 60 secondes, après avoir seulement déterminé le sens grâce à la seconde ligne.
@@ -81,8 +125,9 @@ Ne pas fusionner automatiquement. Détecter et proposer une fusion contrôlée s
 1. Sauvegarder la base actuelle.
 2. Auditer SQLite et confirmer ou infirmer l'hypothèse 1.
 3. Si les données sont présentes : corriger l'affichage/fenêtrage sans toucher aux données.
-4. Corriger ensuite l'import temporel pour respecter chaque timestamp réel.
-5. Seulement après : reprendre le checkpoint EVO (zoom 48 h, curseur, étiquettes, styles, auras, opacité, etc.).
+4. Ajouter la mini-barre de navigation sur l'historique total et sa fenêtre détaillée 48 h.
+5. Corriger ensuite l'import temporel pour respecter chaque timestamp réel.
+6. Seulement après : reprendre le checkpoint EVO (zoom 48 h, curseur, étiquettes, styles, auras, opacité, etc.).
 
 ## Règle d'or
 
