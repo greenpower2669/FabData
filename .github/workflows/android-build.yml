@@ -70,7 +70,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Source patches already committed"
           else
-            git commit -m "Apply FabData v0.9.2 source patches"
+            git commit -m "Apply FabData v0.9.3 source patches"
             git push
           fi
 
@@ -78,7 +78,6 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -122,18 +121,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.9.2-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.9.2-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.9.2-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.9.3-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.9.3-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.9.3-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.9.2-release
+          name: FabData-v0.9.3-release
           path: |
-            artifacts/FabData-v0.9.2-release.apk
-            artifacts/FabData-v0.9.2-release.aab
-            artifacts/FabData-v0.9.2-signing-mode.txt
+            artifacts/FabData-v0.9.3-release.apk
+            artifacts/FabData-v0.9.3-release.aab
+            artifacts/FabData-v0.9.3-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -141,11 +140,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.9.2-release.apk artifacts/FabData-v0.9.2-release.aab artifacts/FabData-v0.9.2-signing-mode.txt
+          git add artifacts/FabData-v0.9.3-release.apk artifacts/FabData-v0.9.3-release.aab artifacts/FabData-v0.9.3-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.9.2 APK + AAB"
+            git commit -m "Build FabData v0.9.3 APK + AAB"
             git push
           fi
 
@@ -153,16 +152,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.9.2
+          TAG: v0.9.3
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$GITHUB_SHA" \
-              --title "FabData v0.9.2" \
-              --notes "FabData v0.9.2 — Lyon redevient une sonde système permanente : toujours visible, avec Lyon reconstruit toujours présent. Le token Météo-France devient facultatif pour l’affichage : officiel 6 min prioritaire quand disponible, secours automatique sinon. La reconstruction utilise le secours uniquement sous l’officiel et filtre les excursions en V suspectes avant interpolation."
+              --title "FabData v0.9.3" \
+              --notes "FabData v0.9.3 — historique Lyon juillet-août 2026 embarqué et reconstruit à l'heure, import CSV Lyon détecté automatiquement et arrondi par interpolation douce sans modifier les ancres. Les points reconstruits restent provisoires et peuvent être remplacés par les observations Météo-France réelles via Actualiser/Compléter."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.9.2-release.apk \
-            artifacts/FabData-v0.9.2-release.aab \
-            artifacts/FabData-v0.9.2-signing-mode.txt \
+            artifacts/FabData-v0.9.3-release.apk \
+            artifacts/FabData-v0.9.3-release.aab \
+            artifacts/FabData-v0.9.3-signing-mode.txt \
             --clobber
