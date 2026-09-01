@@ -1,5 +1,6 @@
 package com.fabdata.app
 
+import android.content.ContentValues
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.cos
@@ -10,12 +11,15 @@ import kotlin.math.PI
  *
  * Les extrema journaliers proviennent de la base préparée pour FabData ; les valeurs
  * horaires intermédiaires sont reconstruites par interpolation cosinus afin d'obtenir
- * une courbe douce. Ces points servent uniquement de filet de sécurité historique :
- * insertSample() n'écrase jamais une mesure déjà présente, et les synchronisations
- * météo observées peuvent ensuite corriger le même timestamp.
+ * une courbe douce. Ces points servent uniquement de filet de sécurité historique.
+ *
+ * Chaque heure reconstruite est marquée PROVISOIRE : une observation réelle ou un
+ * import Lyon pourra la remplacer, et le bouton « Compléter » ne la considère jamais
+ * comme une observation météo définitive.
  */
 object LyonEmbeddedHistory {
     private val LYON_ZONE: ZoneId = ZoneId.of("Europe/Paris")
+    private const val MARKER_TABLE = "lyon_reconstructed_seed"
 
     private data class Day(
         val year: Int,
@@ -61,10 +65,17 @@ object LyonEmbeddedHistory {
         Day(2026,8,30,87.8,68.0,35.0,78.0), Day(2026,8,31,82.4,68.0,30.0,88.0)
     )
 
+    private fun ensureMarkerTable(db: FabDataDb) {
+        db.writableDatabase.execSQL(
+            "CREATE TABLE IF NOT EXISTS $MARKER_TABLE (timestamp INTEGER PRIMARY KEY)"
+        )
+    }
+
     /**
      * Ajoute seulement les timestamps absents. Retourne le nombre de points réellement créés.
      */
     fun seed(db: FabDataDb): Int {
+        ensureMarkerTable(db)
         val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
         var added = 0
         db.inTransaction {
@@ -78,11 +89,46 @@ object LyonEmbeddedHistory {
                         .atZone(LYON_ZONE)
                         .toInstant()
                         .toEpochMilli()
-                    if (db.insertSample(sensor.id, timestamp, temperature, humidity)) added++
+                    if (db.insertSample(sensor.id, timestamp, temperature, humidity)) {
+                        markProvisional(db, timestamp)
+                        added++
+                    }
                 }
             }
         }
         return added
+    }
+
+    fun markProvisional(db: FabDataDb, timestamp: Long) {
+        ensureMarkerTable(db)
+        val values = ContentValues().apply { put("timestamp", timestamp) }
+        db.writableDatabase.insertWithOnConflict(
+            MARKER_TABLE,
+            null,
+            values,
+            android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE
+        )
+    }
+
+    fun markObserved(db: FabDataDb, timestamp: Long) {
+        ensureMarkerTable(db)
+        db.writableDatabase.delete(MARKER_TABLE, "timestamp=?", arrayOf(timestamp.toString()))
+    }
+
+    fun isProvisional(db: FabDataDb, timestamp: Long): Boolean {
+        ensureMarkerTable(db)
+        db.readableDatabase.rawQuery(
+            "SELECT 1 FROM $MARKER_TABLE WHERE timestamp=? LIMIT 1",
+            arrayOf(timestamp.toString())
+        ).use { c -> return c.moveToFirst() }
+    }
+
+    fun hasProvisional(db: FabDataDb, from: Long, to: Long): Boolean {
+        ensureMarkerTable(db)
+        db.readableDatabase.rawQuery(
+            "SELECT 1 FROM $MARKER_TABLE WHERE timestamp BETWEEN ? AND ? LIMIT 1",
+            arrayOf(from.toString(), to.toString())
+        ).use { c -> return c.moveToFirst() }
     }
 
     private fun hourlyValue(day: Day, previous: Day?, next: Day?, hour: Int): Pair<Double, Double> {
