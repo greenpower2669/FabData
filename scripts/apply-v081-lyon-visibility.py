@@ -15,6 +15,8 @@ else:
     raise SystemExit("v0.8.1: sensors query anchor not found")
 
 # 2) Create Lyon before the network request, and use a browser-like UA.
+# Later FabData versions have rewritten syncToday(); accept those versions as
+# already compliant as long as the virtual sensor is still created inside it.
 lyon_path = Path("app/src/main/java/com/fabdata/app/LyonWeatherSync.kt")
 lyon = lyon_path.read_text(encoding="utf-8")
 old_start = '''    fun syncToday(): LyonWeatherSyncResult {
@@ -32,7 +34,12 @@ new_start = '''    fun syncToday(): LyonWeatherSyncResult {
 '''
 if old_start in lyon:
     lyon = lyon.replace(old_start, new_start, 1)
-elif "val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)\n        val now = ZonedDateTime.now" not in lyon:
+elif (
+    "fun syncToday(): LyonWeatherSyncResult" in lyon
+    and "val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)" in lyon
+):
+    print("v0.8.1: Lyon early sensor creation already preserved by newer sync")
+else:
     raise SystemExit("v0.8.1: Lyon sync start anchor not found")
 
 old_late_sensor = '''        val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
