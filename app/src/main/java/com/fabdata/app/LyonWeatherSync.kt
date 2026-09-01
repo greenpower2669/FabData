@@ -63,9 +63,15 @@ class LyonWeatherSync(private val db: FabDataDb) {
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
     fun syncToday(): LyonWeatherSyncResult {
+        // Crée la sonde même si la source distante est indisponible.
         val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
         val date = ZonedDateTime.now(LYON_ZONE).toLocalDate()
-        val points = mergedObservedDay(date)
+
+        // Préfère l'URL datée : on ne devine plus la date d'une ligne à partir
+        // de l'heure courante. Le temps-réel reste un repli pour la journée en cours.
+        val html = runCatching { downloadHtml(archiveUrl(date)) }
+            .getOrElse { downloadHtml() }
+        val points = parseArchiveDay(html, date)
 
         var added = 0
         var corrected = 0
@@ -78,6 +84,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
                         sensor.id, point.timestamp, point.temperature, point.humidity
                     )
                 ) {
+                    // Les doublons météo peuvent être corrigés après revalidation.
                     corrected++
                 } else {
                     duplicates++
