@@ -90,13 +90,11 @@ class LyonWeatherSync(private val db: FabDataDb) {
                         sensor.id, point.timestamp, point.temperature, point.humidity
                     )
                 ) {
+                    // Les doublons météo peuvent être corrigés après revalidation.
                     corrected++
                 } else {
                     duplicates++
                 }
-                // Même si la valeur observée est identique à la reconstruction,
-                // elle cesse d'être provisoire dès qu'une vraie observation la confirme.
-                LyonEmbeddedHistory.markObserved(db, point.timestamp)
             }
         }
 
