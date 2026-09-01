@@ -5,6 +5,18 @@ MAIN = Path("app/src/main/java/com/fabdata/app/MainActivity.kt")
 text = MAIN.read_text(encoding="utf-8")
 original = text
 
+# Newer preview versions (v0.8.6+) preserve the v0.8.5 tap/double-tap contract
+# but have different help text and gesture bodies. Treat them as already applied.
+if (
+    "private fun HistoryOverviewCard(" in text
+    and "selectedTimestamp: Long?" in text
+    and "onSelectTimestamp: (Long) -> Unit" in text
+    and "onNavigate: (Long) -> Unit" in text
+    and "onNavigate(ts)" in text
+):
+    print("FabData v0.8.5 preview double-tap navigation already preserved by newer preview")
+    raise SystemExit(0)
+
 old_call = '''                    HistoryOverviewCard(
                         sensors = sensors,
                         sampleMap = overviewSampleMap,
