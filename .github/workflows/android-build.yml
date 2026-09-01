@@ -42,6 +42,7 @@ jobs:
           python3 scripts/apply-v087-lyon-continuity.py
           python3 scripts/apply-v090-lyon-lab.py
           python3 scripts/apply-v091-compile-fix.py
+          python3 scripts/apply-v092-meteofrance-route-fix.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
