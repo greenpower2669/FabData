@@ -493,7 +493,12 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
         val sourceName = fileName(uri) ?: "import.csv"
         val sensorBase = sourceName.substringBefore("_Exporter", sourceName.substringBeforeLast('.'))
             .replace('_', ' ').trim().ifBlank { "Thermo-hygromètre" }
-        val stableKey = normalize(sensorBase)
+        val normalizedSensorBase = normalize(sensorBase)
+        val normalizedSourceName = normalize(sourceName.substringBeforeLast('.'))
+        val isLyonImport = normalizedSensorBase == "lyon" ||
+            normalizedSensorBase.startsWith("lyon") || normalizedSourceName.startsWith("lyon")
+        val stableKey = if (isLyonImport) LyonWeatherSync.STABLE_KEY else normalizedSensorBase
+        val displayName = if (isLyonImport) LyonWeatherSync.DISPLAY_NAME else sensorBase
         val parsed = mutableListOf<ParsedPoint>()
         var invalid = 0
 
@@ -507,9 +512,8 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
 
                 val rows = reader.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() }.toList()
                 if (exactKnownFormat && rows.isNotEmpty()) {
-                    // Respecte le timestamp REEL de chaque ligne.
-                    // Ne reconstruit plus artificiellement la série à pas fixe de 60 s :
-                    // les trous, coupures et blocs discontinus restent à leur vraie place.
+                    // Les capteurs physiques conservent strictement leurs timestamps réels.
+                    // Lyon pourra ensuite être densifié à l'heure sans modifier les ancres importées.
                     rows.forEach { line ->
                         try {
                             val fields = splitCsv(line, delimiter)
@@ -533,21 +537,68 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
             }
         } ?: error("Impossible d’ouvrir le fichier")
 
-        if (parsed.isEmpty()) return ImportResult(sourceName, sensorBase, 0, 0, invalid, null, null)
+        if (parsed.isEmpty()) return ImportResult(sourceName, displayName, 0, 0, invalid, null, null)
 
-        val sensor = db.getOrCreateSensor(stableKey, sensorBase)
+        // Un import identifié Lyon est automatiquement densifié à 1 point/heure entre
+        // ancres voisines (max 30 h). Interpolation cosinus = tangente douce aux ancres.
+        // Les points d'origine restent inchangés ; seules les heures manquantes sont créées.
+        val pointsToStore = if (isLyonImport) smoothLyonHourly(parsed) else parsed.sortedBy { it.timestamp }
+        val sensor = db.getOrCreateSensor(stableKey, displayName)
         var added = 0
         var duplicates = 0
         var firstTs: Long? = null
         var lastTs: Long? = null
         db.inTransaction {
-            parsed.forEach { point ->
+            pointsToStore.forEach { point ->
                 firstTs = firstTs?.let { minOf(it, point.timestamp) } ?: point.timestamp
                 lastTs = lastTs?.let { maxOf(it, point.timestamp) } ?: point.timestamp
-                if (db.insertSample(sensor.id, point.timestamp, point.temperature, point.humidity)) added++ else duplicates++
+                if (db.insertSample(sensor.id, point.timestamp, point.temperature, point.humidity)) {
+                    added++
+                    if (isLyonImport) LyonEmbeddedHistory.markProvisional(db, point.timestamp)
+                } else if (
+                    isLyonImport && LyonEmbeddedHistory.isProvisional(db, point.timestamp) &&
+                    db.updateSampleIfDifferent(sensor.id, point.timestamp, point.temperature, point.humidity)
+                ) {
+                    // Un fichier Lyon peut préciser/remplacer notre propre reconstruction,
+                    // mais n'écrase jamais une heure déjà confirmée par une source réelle.
+                    added++
+                    LyonEmbeddedHistory.markProvisional(db, point.timestamp)
+                } else {
+                    duplicates++
+                }
             }
         }
         return ImportResult(sourceName, sensor.name, added, duplicates, invalid, firstTs, lastTs)
+    }
+
+    private fun smoothLyonHourly(input: List<ParsedPoint>): List<ParsedPoint> {
+        val anchors = input.sortedBy { it.timestamp }.distinctBy { it.timestamp }
+        if (anchors.size < 2) return anchors
+        val hourMs = 60L * 60L * 1000L
+        val maxBridgeMs = 30L * hourMs
+        val out = mutableListOf<ParsedPoint>()
+
+        anchors.zipWithNext().forEach { (left, right) ->
+            if (out.lastOrNull()?.timestamp != left.timestamp) out += left
+            val gap = right.timestamp - left.timestamp
+            if (gap > hourMs && gap <= maxBridgeMs) {
+                var ts = left.timestamp + hourMs
+                while (ts < right.timestamp) {
+                    val fraction = (ts - left.timestamp).toDouble() / gap.toDouble()
+                    val eased = (1.0 - kotlin.math.cos(kotlin.math.PI * fraction)) / 2.0
+                    val temperature = left.temperature + (right.temperature - left.temperature) * eased
+                    val humidity = left.humidity + (right.humidity - left.humidity) * eased
+                    out += ParsedPoint(
+                        ts,
+                        kotlin.math.round(temperature * 10.0) / 10.0,
+                        (kotlin.math.round(humidity * 10.0) / 10.0).coerceIn(0.0, 100.0)
+                    )
+                    ts += hourMs
+                }
+            }
+        }
+        out += anchors.last()
+        return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
     }
 
     private fun parseGenericRows(rows: List<String>, delimiter: Char, headers: List<String>, target: MutableList<ParsedPoint>): Int {
