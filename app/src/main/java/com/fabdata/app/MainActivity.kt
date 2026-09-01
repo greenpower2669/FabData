@@ -136,6 +136,75 @@ private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
 private const val LYON_RECONSTRUCTED_SENSOR_ID = -6902900103L
 private const val LYON_RECONSTRUCTED_STABLE_KEY = "lyon-reconstructed"
 
+private data class LyonHybridSyncResult(
+    val received: Int,
+    val stored: Int,
+    val label: String
+)
+
+private suspend fun syncLyonHybrid(
+    db: FabDataDb,
+    legacy: LyonWeatherSync,
+    official: MeteoFranceOfficialClient,
+    credentials: MeteoFranceCredentialStore
+): LyonHybridSyncResult = withContext(Dispatchers.IO) {
+    // System invariant: Lyon exists before any network call.
+    db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+
+    if (credentials.hasCredential()) {
+        runCatching { official.syncSixMinute24h() }
+            .fold(
+                onSuccess = { LyonHybridSyncResult(it.received, it.stored, "Lyon officiel · 6 min") },
+                onFailure = {
+                    val fallback = legacy.syncToday()
+                    LyonHybridSyncResult(
+                        fallback.parsed,
+                        fallback.added + fallback.corrected,
+                        "Lyon secours auto · officiel indisponible"
+                    )
+                }
+            )
+    } else {
+        val fallback = legacy.syncToday()
+        LyonHybridSyncResult(
+            fallback.parsed,
+            fallback.added + fallback.corrected,
+            "Lyon secours auto · sans token"
+        )
+    }
+}
+
+private suspend fun completeLyonHybrid(
+    db: FabDataDb,
+    legacy: LyonWeatherSync,
+    official: MeteoFranceOfficialClient,
+    credentials: MeteoFranceCredentialStore
+): LyonHybridSyncResult = withContext(Dispatchers.IO) {
+    db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+    if (credentials.hasCredential()) {
+        val bounds = db.physicalSensorBounds() ?: error("Aucune période physique")
+        runCatching { official.syncHourly(bounds.first, bounds.last) }
+            .fold(
+                onSuccess = { LyonHybridSyncResult(it.received, it.stored, "Lyon horaire officiel") },
+                onFailure = {
+                    val fallback = legacy.completePhysicalPeriod()
+                    LyonHybridSyncResult(
+                        fallback.daysDownloaded,
+                        fallback.added + fallback.corrected,
+                        "Lyon secours historique · officiel indisponible"
+                    )
+                }
+            )
+    } else {
+        val fallback = legacy.completePhysicalPeriod()
+        LyonHybridSyncResult(
+            fallback.daysDownloaded,
+            fallback.added + fallback.corrected,
+            "Lyon secours historique · sans token"
+        )
+    }
+}
+
 private data class ChartPrefs(
     val showGrid: Boolean,
     val showPoints: Boolean,
@@ -303,15 +372,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    // v0.9 : la source principale devient l'API officielle Météo-France.
-    // Sans clé configurée, on n'écrit rien et l'application démarre normalement.
+    // v0.9.2 : Lyon est une sonde système permanente.
+    // Officiel si possible, secours automatique sinon. Le token n'agit jamais sur la visibilité.
     LaunchedEffect(Unit) {
-        if (meteoCredentials.hasCredential()) {
-            val result = withContext(Dispatchers.IO) { runCatching { meteoOfficial.syncSixMinute24h() } }
-            reloadToken++
-            result.exceptionOrNull()?.let { error ->
-                snackbar.showSnackbar("Lyon officiel non actualisé : ${error.message ?: "source indisponible"}")
-            }
+        val result = runCatching { syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
+        reloadToken++
+        result.exceptionOrNull()?.let { error ->
+            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "source indisponible"}")
         }
     }
 
@@ -323,6 +390,18 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 configs.forEach { config -> runCatching { remoteSensorSync.sync(config) } }
             }
             reloadToken++
+        }
+    }
+
+    // Synchronise silencieusement les observations mesurées du jour à Lyon-Bron.
+    // Une absence de réseau ne bloque jamais l'ouverture ni les imports CSV.
+    LaunchedEffect(Unit) {
+        val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
+        // Reload even on failure: Lyon has already been created and must remain
+        // visible so the user can distinguish "no data" from "no sensor".
+        reloadToken++
+        result.exceptionOrNull()?.let { error ->
+            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "réseau ou source indisponible"}")
         }
     }
 
@@ -396,11 +475,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     sensor.id to value
                 }
-                val lyonReconstructed = if (s.any { it.stableKey == LyonWeatherSync.STABLE_KEY }) {
-                    lyonLab.reconstruct(chosen.first, chosen.last).points.map {
-                        SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity)
-                    }
-                } else emptyList()
+                val lyonReconstructed = lyonLab.reconstruct(chosen.first, chosen.last).points.map {
+                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity)
+                }
                 val overview = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         val hourly = lyonLab.queryOfficial(LyonSeriesKind.HOURLY, all.first, all.last)
@@ -450,13 +527,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
             if (!showHumidity.containsKey(sensor.id)) showHumidity[sensor.id] = false
         }
-        if (sensors.any { it.stableKey == LyonWeatherSync.STABLE_KEY }) {
-            if (!showTemp.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
-                showTemp[LYON_RECONSTRUCTED_SENSOR_ID] = loaded.lyonReconstructedSamples.isNotEmpty()
-            }
-            if (!showHumidity.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
-                showHumidity[LYON_RECONSTRUCTED_SENSOR_ID] = false
-            }
+        if (!showTemp.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
+            // Always checked: if data arrives later the curve appears without another user action.
+            showTemp[LYON_RECONSTRUCTED_SENSOR_ID] = true
+        }
+        if (!showHumidity.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
+            showHumidity[LYON_RECONSTRUCTED_SENSOR_ID] = false
         }
         busy = false
     }
@@ -469,12 +545,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         colorIndex = 3,
         latestTimestamp = lyonReconstructedSamples.lastOrNull()?.timestamp
     )
-    val chartSensors = if (sensors.any { it.stableKey == LyonWeatherSync.STABLE_KEY }) {
-        sensors + lyonReconstructedSensor
-    } else sensors
-    val chartSampleMap = if (chartSensors.any { it.id == LYON_RECONSTRUCTED_SENSOR_ID }) {
-        sampleMap + (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples)
-    } else sampleMap
+    // Permanent virtual curve: never hidden by token/network/source state.
+    val chartSensors = sensors.filterNot { it.id == LYON_RECONSTRUCTED_SENSOR_ID } + lyonReconstructedSensor
+    val chartSampleMap = sampleMap + (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples)
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
@@ -502,19 +575,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     IconButton(onClick = {
                         scope.launch {
                             busy = true
-                            val result = withContext(Dispatchers.IO) {
-                                runCatching { meteoOfficial.syncSixMinute24h() }
-                            }
+                            val result = runCatching { syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
                             busy = false
                             reloadToken++
                             snackbar.showSnackbar(
                                 result.fold(
-                                    onSuccess = {
-                                        "Lyon 6 min officiel : ${it.received} reçue(s) · ${it.stored} stockée(s)"
-                                    },
-                                    onFailure = {
-                                        "Lyon non actualisé : ${it.message ?: "réseau ou source indisponible"}"
-                                    }
+                                    onSuccess = { "${it.label} : ${it.received} reçue(s) · ${it.stored} stockée(s)" },
+                                    onFailure = { "Lyon non actualisé : ${it.message ?: "réseau ou source indisponible"}" }
                                 )
                             )
                         }
@@ -568,12 +635,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         onSyncLyon = {
                             scope.launch {
                                 busy = true
-                                val result = withContext(Dispatchers.IO) { runCatching { meteoOfficial.syncSixMinute24h() } }
+                                val result = runCatching { syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
                                 busy = false
                                 reloadToken++
                                 snackbar.showSnackbar(
                                     result.fold(
-                                        onSuccess = { "Lyon 6 min officiel : ${it.received} reçue(s) · ${it.stored} stockée(s)" },
+                                        onSuccess = { "${it.label} : ${it.received} reçue(s) · ${it.stored} stockée(s)" },
                                         onFailure = { "Lyon : ${it.message ?: "source indisponible"}" }
                                     )
                                 )
@@ -582,19 +649,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         onCompleteLyon = {
                             scope.launch {
                                 busy = true
-                                val result = withContext(Dispatchers.IO) {
-                                    runCatching {
-                                    val b = db.physicalSensorBounds() ?: error("Aucune période physique")
-                                    meteoOfficial.syncHourly(b.first, b.last)
-                                }
-                                }
+                                val result = runCatching { completeLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
                                 busy = false
                                 reloadToken++
                                 snackbar.showSnackbar(
                                     result.fold(
-                                        onSuccess = {
-                                            "Lyon horaire officiel : ${it.received} reçue(s) · ${it.stored} stockée(s)"
-                                        },
+                                        onSuccess = { "${it.label} : ${it.received} lot(s) · ${it.stored} valeur(s) stockée(s)" },
                                         onFailure = { "Compléter Lyon : ${it.message ?: "archives indisponibles"}" }
                                     )
                                 )
@@ -947,7 +1007,7 @@ private fun SensorSourcesCard(
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Sondes / stations météo", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Lyon-Bron officiel : 6 min sur 24 h + archive horaire. Détail = brut / horaire / reconstruit.",
+                "Lyon-Bron permanent : officiel 6 min prioritaire, secours auto sans token. Reconstruit reste toujours disponible.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1146,7 +1206,7 @@ private fun SeriesSelector(
                     Column(Modifier.weight(1f)) {
                         val displayRoom = when {
                             sensor.id == LYON_RECONSTRUCTED_SENSOR_ID -> "Lyon reconstruit"
-                            sensor.stableKey == LyonWeatherSync.STABLE_KEY -> "Lyon officiel · 6 min"
+                            sensor.stableKey == LyonWeatherSync.STABLE_KEY -> "Lyon brut · officiel/secours"
                             else -> sensor.room
                         }
                         Text(displayRoom, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)

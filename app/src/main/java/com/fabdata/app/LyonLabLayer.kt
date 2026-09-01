@@ -238,17 +238,28 @@ class LyonLabStore(private val db: FabDataDb) {
         }
     }
 
+    private fun queryLegacyFallback(from: Long, to: Long): List<LyonLabPoint> {
+        val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+        return db.querySamples(sensor.id, from, to).map {
+            LyonLabPoint(it.timestamp, it.temperature, it.humidity, LyonSeriesKind.RECONSTRUCTED)
+        }
+    }
+
     fun reconstruct(from: Long, to: Long): LyonReconstruction {
         val paddedFrom = from - 2L * HOUR_MS
         val paddedTo = to + 2L * HOUR_MS
         val six = queryOfficial(LyonSeriesKind.SIX_MIN, paddedFrom, paddedTo).sortedBy { it.timestamp }
         val hourly = queryOfficial(LyonSeriesKind.HOURLY, paddedFrom, paddedTo).sortedBy { it.timestamp }
+        val fallback = queryLegacyFallback(paddedFrom, paddedTo).sortedBy { it.timestamp }
         val overrides = queryOverrides(from, to)
 
         val sixByTs = six.associateBy { it.timestamp }
-        val hourByTs = hourly.associateBy { it.timestamp }
         val validSix = six.filterIndexed { index, p -> !isSuspectSix(p, index, six, hourly) }
+        val validFallback = fallback.filterIndexed { index, p -> !isSuspectFallback(p, index, fallback, hourly) }
+        val fallbackByTs = validFallback.associateBy { it.timestamp }
         val anchorsByTs = linkedMapOf<Long, LyonLabPoint>()
+        // Priority: fallback < hourly official < six-minute official < manual override.
+        validFallback.forEach { anchorsByTs[it.timestamp] = it }
         hourly.forEach { anchorsByTs[it.timestamp] = it }
         validSix.forEach { anchorsByTs[it.timestamp] = it }
         overrides.values.forEach { o ->
@@ -285,6 +296,14 @@ class LyonLabStore(private val db: FabDataDb) {
                 continue
             }
 
+            // Exact fallback point is accepted only after anomaly filtering.
+            val rawFallback = fallbackByTs[ts]
+            if (raw6 == null && rawFallback != null) {
+                out += LyonLabPoint(ts, rawFallback.temperature, rawFallback.humidity, LyonSeriesKind.RECONSTRUCTED)
+                ts += SIX_MIN_MS
+                continue
+            }
+
             val interpolated = interpolateAt(anchors, ts)
             if (interpolated != null) {
                 val p = LyonLabPoint(ts, interpolated.first, interpolated.second, LyonSeriesKind.RECONSTRUCTED)
@@ -299,7 +318,7 @@ class LyonLabStore(private val db: FabDataDb) {
                     decisions += LyonDecision(
                         ts, null, rawHour, p, "INTERPOLÉ",
                         "Aucune observation 6 min fiable à cet instant.",
-                        "Continuité bornée entre deux ancres officielles fiables.", false
+                        "Continuité bornée entre ancres fiables ; l’officiel garde la priorité.", false
                     )
                 }
             }
@@ -338,6 +357,32 @@ class LyonLabStore(private val db: FabDataDb) {
         val returnSpike = prev != null && next != null &&
             abs(point.temperature - prev.temperature) >= 6.0 && abs(next.temperature - prev.temperature) <= 2.5
         return (spike && contradictsHourly) || (returnSpike && abs(point.temperature - (hour?.temperature ?: prev!!.temperature)) >= 6.0)
+    }
+
+    private fun isSuspectFallback(
+        point: LyonLabPoint,
+        index: Int,
+        fallback: List<LyonLabPoint>,
+        hourly: List<LyonLabPoint>
+    ): Boolean {
+        if (point.temperature !in -35.0..50.0 || point.humidity !in 0.0..100.0) return true
+        if (index !in fallback.indices) return false
+
+        val hour = nearestWithin(hourly, point.timestamp, 31L * 60L * 1000L)
+        if (hour != null && abs(point.temperature - hour.temperature) >= 5.0) return true
+
+        // Reject a short-lived V/peak: a nearby value before and after agree,
+        // while the current point is >= 5 °C away from their baseline.
+        val before = fallback.subList(max(0, index - 4), index)
+        val after = fallback.subList(index + 1, min(fallback.size, index + 5))
+        val excursion = before.any { left ->
+            point.timestamp - left.timestamp <= 4L * HOUR_MS && after.any { right ->
+                right.timestamp - point.timestamp <= 4L * HOUR_MS &&
+                    abs(left.temperature - right.temperature) <= 3.0 &&
+                    abs(point.temperature - ((left.temperature + right.temperature) / 2.0)) >= 5.0
+            }
+        }
+        return excursion
     }
 
     private fun interpolateAt(anchors: List<LyonLabPoint>, timestamp: Long): Pair<Double, Double>? {
@@ -837,7 +882,7 @@ fun LyonDetailSheet(
                 value = credential,
                 onValueChange = { credential = it },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Clé / token Météo-France") },
+                label = { Text("Clé / token Météo-France (facultatif)") },
                 singleLine = true
             )
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
