@@ -49,6 +49,7 @@ jobs:
           python3 scripts/apply-v092-meteofrance-route-fix.py
           python3 scripts/apply-v093-lyon-reconstructed-toggle.py
           python3 scripts/apply-v094-lyon-system-hybrid.py
+          python3 scripts/apply-v095-lyon-hybrid-cleanup.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
