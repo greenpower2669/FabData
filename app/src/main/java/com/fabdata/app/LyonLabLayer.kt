@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -787,6 +788,14 @@ fun LyonDetailSheet(
     var points by remember { mutableStateOf<List<LyonLabPoint>>(emptyList()) }
     var decisions by remember { mutableStateOf<List<LyonDecision>>(emptyList()) }
 
+    var lyonStyleTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            lyonStyleTick = System.currentTimeMillis()
+            delay(180L)
+        }
+    }
+
     val now = System.currentTimeMillis()
     val bounds = initialBounds ?: (now - 48L * HOUR_MS)..now
 
@@ -860,6 +869,8 @@ fun LyonDetailSheet(
             LyonMiniChart(
                 points = points,
                 selectedTimestamp = selected,
+                visualPrefs = styleStore.load("lyon:${kind.dbKey}"),
+                styleTick = lyonStyleTick,
                 onTap = { selected = it },
                 onDoubleTap = {
                     selected = it
@@ -941,11 +952,15 @@ fun LyonDetailSheet(
 private fun LyonMiniChart(
     points: List<LyonLabPoint>,
     selectedTimestamp: Long?,
+    visualPrefs: CurveVisualPrefs,
+    styleTick: Long,
     onTap: (Long) -> Unit,
     onDoubleTap: (Long) -> Unit
 ) {
     val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-    val line = MaterialTheme.colorScheme.primary
+    val line = resolveCurveColor(MaterialTheme.colorScheme.primary, visualPrefs, styleTick)
+        ?: Color.Transparent
+    val aura = resolveAuraColor(visualPrefs, styleTick)
     val select = MaterialTheme.colorScheme.tertiary
     if (points.size < 2) {
         Box(Modifier.fillMaxWidth().height(220.dp).background(surface, RoundedCornerShape(14.dp)), contentAlignment = Alignment.Center) {
@@ -974,6 +989,7 @@ private fun LyonMiniChart(
             val y = size.height - (((p.temperature - minT) / range).toFloat() * size.height)
             if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
+        aura?.let { drawPath(path, it, style = Stroke(width = 10.dp.toPx())) }
         drawPath(path, line, style = Stroke(width = 2.5.dp.toPx()))
         selectedTimestamp?.takeIf { it in from..to }?.let { ts ->
             val x = ((ts - from).toDouble() / span.toDouble()).toFloat() * size.width
@@ -1022,3 +1038,20 @@ private fun LyonOverrideDialog(
 private fun formatLyonTime(epoch: Long): String = Instant.ofEpochMilli(epoch)
     .atZone(ZoneId.systemDefault())
     .format(DateTimeFormatter.ofPattern("dd/MM HH:mm", Locale.FRANCE))
+
+
+fun sensorStatsFromSamples(sensorId: Long, points: List<SamplePoint>): SensorStats? {
+    if (points.isEmpty()) return null
+    val latest = points.maxByOrNull { it.timestamp }
+    return SensorStats(
+        sensorId = sensorId,
+        count = points.size,
+        tempMin = points.minOf { it.temperature },
+        tempMax = points.maxOf { it.temperature },
+        tempAvg = points.map { it.temperature }.average(),
+        humidityMin = points.minOf { it.humidity },
+        humidityMax = points.maxOf { it.humidity },
+        humidityAvg = points.map { it.humidity }.average(),
+        latest = latest
+    )
+}

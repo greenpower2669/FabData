@@ -90,6 +90,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -194,7 +195,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val context = LocalContext.current
     val importer = remember { CsvImporter(context, db) }
     val backup = remember { FabDataBackup(context, db) }
-    val lyonWeather = remember { LyonWeatherSync(db) }
+    val lyonWeather = remember { LyonWeatherSync(db) } // legacy read-only fallback
+    val lyonLab = remember { LyonLabStore(db) }
+    val meteoCredentials = remember { MeteoFranceCredentialStore(context) }
+    val meteoOfficial = remember { MeteoFranceOfficialClient(context, lyonLab, meteoCredentials) }
+    val curveStyleStore = remember { CurveStyleStore(context) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
@@ -224,10 +229,25 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var annotationTimestamp by remember { mutableStateOf<Long?>(null) }
     var editingAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var editSensor by remember { mutableStateOf<Sensor?>(null) }
+    var lyonDetailOpen by remember { mutableStateOf(false) }
+    var styleEditKey by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var styleVersion by remember { mutableIntStateOf(0) }
+    var styleTick by remember { mutableStateOf(System.currentTimeMillis()) }
     var prefs by remember { mutableStateOf(prefsStore.load()) }
     val showTemp = remember { mutableStateMapOf<Long, Boolean>() }
     val showHumidity = remember { mutableStateMapOf<Long, Boolean>() }
     var initialHandled by remember { mutableStateOf(false) }
+
+    val activeCurveStyles = remember(sensors, styleVersion) {
+        sensors.associate { sensor -> sensor.id to curveStyleStore.load("sensor:${sensor.stableKey}") }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            styleTick = System.currentTimeMillis()
+            delay(180L)
+        }
+    }
 
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
         if (uri != null) {
@@ -276,15 +296,15 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    // Synchronise silencieusement les observations mesurées du jour à Lyon-Bron.
-    // Une absence de réseau ne bloque jamais l'ouverture ni les imports CSV.
+    // v0.9 : la source principale devient l'API officielle Météo-France.
+    // Sans clé configurée, on n'écrit rien et l'application démarre normalement.
     LaunchedEffect(Unit) {
-        val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
-        // Reload even on failure: Lyon has already been created and must remain
-        // visible so the user can distinguish "no data" from "no sensor".
-        reloadToken++
-        result.exceptionOrNull()?.let { error ->
-            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "réseau ou source indisponible"}")
+        if (meteoCredentials.hasCredential()) {
+            val result = withContext(Dispatchers.IO) { runCatching { meteoOfficial.syncSixMinute24h() } }
+            reloadToken++
+            result.exceptionOrNull()?.let { error ->
+                snackbar.showSnackbar("Lyon officiel non actualisé : ${error.message ?: "source indisponible"}")
+            }
         }
     }
 
@@ -357,13 +377,35 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes)
             } else {
                 val samples = s.associate { sensor ->
-                    sensor.id to db.querySamples(sensor.id, chosen.first, chosen.last)
+                    val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
+                        val reconstructed = lyonLab.reconstruct(chosen.first, chosen.last).points.map {
+                            SamplePoint(sensor.id, it.timestamp, it.temperature, it.humidity)
+                        }
+                        // Tant que la clé officielle n'est pas configurée, l'ancien Lyon reste
+                        // visible comme secours, sans être réécrit ni mélangé aux tables officielles.
+                        reconstructed.ifEmpty { db.querySamples(sensor.id, chosen.first, chosen.last) }
+                    } else {
+                        db.querySamples(sensor.id, chosen.first, chosen.last)
+                    }
+                    sensor.id to value
                 }
                 val overview = s.associate { sensor ->
-                    sensor.id to db.querySamples(sensor.id, all.first, all.last, maxPoints = 600)
+                    val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
+                        val hourly = lyonLab.queryOfficial(LyonSeriesKind.HOURLY, all.first, all.last)
+                            .map { SamplePoint(sensor.id, it.timestamp, it.temperature, it.humidity) }
+                        hourly.ifEmpty { db.querySamples(sensor.id, all.first, all.last, maxPoints = 600) }
+                    } else {
+                        db.querySamples(sensor.id, all.first, all.last, maxPoints = 600)
+                    }
+                    sensor.id to value
                 }
                 val stat = s.mapNotNull { sensor ->
-                    db.stats(sensor.id, chosen.first, chosen.last)?.let { value -> sensor.id to value }
+                    val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
+                        sensorStatsFromSamples(sensor.id, samples[sensor.id].orEmpty())
+                    } else {
+                        db.stats(sensor.id, chosen.first, chosen.last)
+                    }
+                    value?.let { sensor.id to it }
                 }.toMap()
                 LoadedData(
                     s, all, chosen, samples, overview, stat,
@@ -421,14 +463,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         scope.launch {
                             busy = true
                             val result = withContext(Dispatchers.IO) {
-                                runCatching { lyonWeather.syncToday() }
+                                runCatching { meteoOfficial.syncSixMinute24h() }
                             }
                             busy = false
                             reloadToken++
                             snackbar.showSnackbar(
                                 result.fold(
                                     onSuccess = {
-                                        "Lyon : ${it.added} ajoutée(s) · ${it.corrected} corrigée(s) · ${it.duplicates} inchangée(s)"
+                                        "Lyon 6 min officiel : ${it.received} reçue(s) · ${it.stored} stockée(s)"
                                     },
                                     onFailure = {
                                         "Lyon non actualisé : ${it.message ?: "réseau ou source indisponible"}"
@@ -482,15 +524,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     SensorSourcesCard(
                         sensors = sensors,
                         remoteConfigs = remoteConfigs,
+                        onOpenLyon = { lyonDetailOpen = true },
                         onSyncLyon = {
                             scope.launch {
                                 busy = true
-                                val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
+                                val result = withContext(Dispatchers.IO) { runCatching { meteoOfficial.syncSixMinute24h() } }
                                 busy = false
                                 reloadToken++
                                 snackbar.showSnackbar(
                                     result.fold(
-                                        onSuccess = { "Lyon : ${it.added} ajoutée(s) · ${it.corrected} corrigée(s)" },
+                                        onSuccess = { "Lyon 6 min officiel : ${it.received} reçue(s) · ${it.stored} stockée(s)" },
                                         onFailure = { "Lyon : ${it.message ?: "source indisponible"}" }
                                     )
                                 )
@@ -500,14 +543,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             scope.launch {
                                 busy = true
                                 val result = withContext(Dispatchers.IO) {
-                                    runCatching { lyonWeather.completePhysicalPeriod() }
+                                    runCatching {
+                                    val b = db.physicalSensorBounds() ?: error("Aucune période physique")
+                                    meteoOfficial.syncHourly(b.first, b.last)
+                                }
                                 }
                                 busy = false
                                 reloadToken++
                                 snackbar.showSnackbar(
                                     result.fold(
                                         onSuccess = {
-                                            "Lyon : ${it.added} ajoutée(s) · ${it.corrected} corrigée(s) · ${it.daysDownloaded} jour(s) vérifié(s)"
+                                            "Lyon horaire officiel : ${it.received} reçue(s) · ${it.stored} stockée(s)"
                                         },
                                         onFailure = { "Compléter Lyon : ${it.message ?: "archives indisponibles"}" }
                                     )
@@ -546,6 +592,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
+                    CurvePersonalizationCard(
+                        sensors = sensors,
+                        onEdit = { key, label -> styleEditKey = key to label }
+                    )
+                }
+
+                item {
                     HistoryOverviewCard(
                         sensors = sensors,
                         sampleMap = overviewSampleMap,
@@ -577,6 +630,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         annotations = annotations,
                         bounds = viewBounds,
                         prefs = prefs,
+                        curveStyles = activeCurveStyles,
+                        styleTick = styleTick,
                         selectedTimestamp = selectedTimestamp,
                         onSelectTimestamp = {
                             selectedTimestamp = it
@@ -714,6 +769,32 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         )
     }
 
+    if (lyonDetailOpen) {
+        LyonDetailSheet(
+            store = lyonLab,
+            client = meteoOfficial,
+            credentialStore = meteoCredentials,
+            styleStore = curveStyleStore,
+            initialBounds = viewBounds,
+            onDismiss = { lyonDetailOpen = false },
+            onDataChanged = { reloadToken++ },
+            onStyleEdit = { key, label -> styleEditKey = key to label }
+        )
+    }
+
+    styleEditKey?.let { (key, label) ->
+        CurveStyleDialog(
+            curveLabel = label,
+            initial = curveStyleStore.load(key),
+            onDismiss = { styleEditKey = null },
+            onSave = { value ->
+                curveStyleStore.save(key, value)
+                styleVersion++
+                styleEditKey = null
+            }
+        )
+    }
+
     if (remoteSensorDialogOpen) {
         RemoteSensorDialog(
             onDismiss = { remoteSensorDialogOpen = false },
@@ -814,6 +895,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 private fun SensorSourcesCard(
     sensors: List<Sensor>,
     remoteConfigs: List<RemoteSensorConfig>,
+    onOpenLyon: () -> Unit,
     onSyncLyon: () -> Unit,
     onCompleteLyon: () -> Unit,
     onAddRemote: () -> Unit,
@@ -825,7 +907,7 @@ private fun SensorSourcesCard(
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Sondes / stations météo", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Lyon est préconfigurée par défaut. 《 Compléter 》 aligne ses archives sur la période réelle des thermomètres connectés.",
+                "Lyon-Bron officiel : 6 min sur 24 h + archive horaire. Détail = brut / horaire / reconstruit.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -839,6 +921,7 @@ private fun SensorSourcesCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                TextButton(onClick = onOpenLyon) { Text("Détail") }
                 TextButton(onClick = onCompleteLyon) { Text("《 Compléter 》") }
                 OutlinedButton(onClick = onSyncLyon) { Text("Actualiser") }
             }
@@ -1277,6 +1360,8 @@ private fun ChartCard(
     annotations: List<AnnotationItem>,
     bounds: LongRange?,
     prefs: ChartPrefs,
+    curveStyles: Map<Long, CurveVisualPrefs>,
+    styleTick: Long,
     selectedTimestamp: Long?,
     onSelectTimestamp: (Long) -> Unit,
     onAnnotationClick: (AnnotationItem) -> Unit,
@@ -1318,6 +1403,8 @@ private fun ChartCard(
                     from = bounds.first,
                     to = bounds.last,
                     prefs = prefs,
+                    curveStyles = curveStyles,
+                    styleTick = styleTick,
                     selectedTimestamp = selectedTimestamp,
                     resetKey = resetKey,
                     onSelectTimestamp = onSelectTimestamp,
@@ -1342,6 +1429,8 @@ private fun InteractiveChart(
     from: Long,
     to: Long,
     prefs: ChartPrefs,
+    curveStyles: Map<Long, CurveVisualPrefs>,
+    styleTick: Long,
     selectedTimestamp: Long?,
     resetKey: Int,
     onSelectTimestamp: (Long) -> Unit,
@@ -1544,7 +1633,10 @@ private fun InteractiveChart(
             bottom - (((v - humRange.first) / (humRange.second - humRange.first)).toFloat() * plotH)
 
         sensors.forEach { sensor ->
-            val color = palette[sensor.colorIndex % palette.size]
+            val baseColor = palette[sensor.colorIndex % palette.size]
+            val visual = curveStyles[sensor.id] ?: CurveVisualPrefs()
+            val color = resolveCurveColor(baseColor, visual, styleTick) ?: Color.Transparent
+            val auraColor = resolveAuraColor(visual, styleTick)
             val points = sampleMap[sensor.id].orEmpty().filter { it.timestamp in visibleFrom..visibleTo }
 
             if (showTemp[sensor.id] == true && points.size >= 2) {
@@ -1557,6 +1649,9 @@ private fun InteractiveChart(
                         previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                     previous = p
+                }
+                auraColor?.let { aura ->
+                    drawPath(path, aura, style = Stroke(width = (prefs.lineWidth + 7f).dp.toPx()))
                 }
                 drawPath(path, color, style = Stroke(width = prefs.lineWidth.dp.toPx()))
                 if (prefs.showPoints || zoom > 18f) {

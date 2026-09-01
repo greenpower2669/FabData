@@ -69,7 +69,7 @@ data class ImportResult(
     val lastTimestamp: Long?
 )
 
-class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 2) {
+class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 3) {
     private val appContext = context.applicationContext
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -116,6 +116,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX idx_annotations_time ON annotations(timestamp)")
+        ensureLyonLabSchema(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -124,6 +125,10 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             db.execSQL("ALTER TABLE annotations ADD COLUMN type TEXT")
             db.execSQL("ALTER TABLE annotations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
             db.execSQL("UPDATE annotations SET updated_at = created_at WHERE updated_at = 0")
+        }
+        if (oldVersion < 3) {
+            // Migration strictement additive : aucune table historique n'est réécrite.
+            ensureLyonLabSchema(db)
         }
     }
 
