@@ -540,8 +540,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         sampleMap = overviewSampleMap,
                         historyBounds = globalBounds,
                         viewBounds = viewBounds,
-                        onSelect = { ts ->
-                            preset = TimePreset.TWO_DAYS
+                        selectedTimestamp = selectedTimestamp,
+                        onSelectTimestamp = { ts ->
+                            // Un simple tap ne modifie PAS la fenêtre principale.
+                            // Il déplace uniquement la sélection dans la mini-vue.
+                            selectedTimestamp = ts
+                            selectedAnnotation = null
+                        },
+                        onNavigate = { ts ->
+                            // Le double-tap recentre le graphe principal autour du point
+                            // en conservant le preset/zoom temporel actuellement choisi.
                             windowCenterTimestamp = ts
                             selectedTimestamp = ts
                             selectedAnnotation = null
@@ -1020,7 +1028,9 @@ private fun HistoryOverviewCard(
     sampleMap: Map<Long, List<SamplePoint>>,
     historyBounds: LongRange?,
     viewBounds: LongRange?,
-    onSelect: (Long) -> Unit
+    selectedTimestamp: Long?,
+    onSelectTimestamp: (Long) -> Unit,
+    onNavigate: (Long) -> Unit
 ) {
     Card(shape = RoundedCornerShape(18.dp)) {
         Column(
@@ -1029,7 +1039,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Tap sur l’historique = afficher 48 h autour de ce point",
+                "Tap = sélectionner · double tap = recentrer le graphe avec le zoom courant",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1044,6 +1054,7 @@ private fun HistoryOverviewCard(
                 val range = (maxTemp - minTemp).takeIf { it > 0.01 } ?: 1.0
                 val span = (bounds.last - bounds.first).coerceAtLeast(1L)
                 val highlight = MaterialTheme.colorScheme.primary
+                val selectionColor = MaterialTheme.colorScheme.tertiary
                 val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
 
                 Canvas(
@@ -1052,10 +1063,19 @@ private fun HistoryOverviewCard(
                         .height(86.dp)
                         .background(surface, RoundedCornerShape(12.dp))
                         .pointerInput(bounds, viewBounds) {
-                            detectTapGestures { p ->
-                                val frac = (p.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                onSelect(bounds.first + (span * frac).toLong())
-                            }
+                            detectTapGestures(
+                                onDoubleTap = { p ->
+                                    val frac = (p.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                    val ts = bounds.first + (span * frac).toLong()
+                                    onSelectTimestamp(ts)
+                                    onNavigate(ts)
+                                },
+                                onTap = { p ->
+                                    val frac = (p.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                    val ts = bounds.first + (span * frac).toLong()
+                                    onSelectTimestamp(ts)
+                                }
+                            )
                         }
                 ) {
                     sensors.forEach { sensor ->
@@ -1090,6 +1110,21 @@ private fun HistoryOverviewCard(
                             drawLine(highlight.copy(alpha = 0.8f), Offset(left, 0f), Offset(left, size.height), 2f)
                             drawLine(highlight.copy(alpha = 0.8f), Offset(right, 0f), Offset(right, size.height), 2f)
                         }
+                    }
+                    selectedTimestamp?.takeIf { it in bounds }?.let { selected ->
+                        val x = (((selected - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width)
+                            .coerceIn(0f, size.width)
+                        drawLine(
+                            selectionColor.copy(alpha = 0.95f),
+                            Offset(x, 0f),
+                            Offset(x, size.height),
+                            2.dp.toPx()
+                        )
+                        drawCircle(
+                            selectionColor,
+                            radius = 4.dp.toPx(),
+                            center = Offset(x, size.height / 2f)
+                        )
                     }
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
