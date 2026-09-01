@@ -40,7 +40,11 @@ jobs:
           python3 scripts/apply-v085-preview-doubletap.py
           python3 scripts/apply-v086-lyon-preview.py
           python3 scripts/apply-v087-lyon-continuity.py
-          python3 scripts/apply-v090-lyon-lab.py
+          if grep -q 'LYON_RECONSTRUCTED_SENSOR_ID' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo "v0.9 base layer already generated; preserving newer Lyon UI"
+          else
+            python3 scripts/apply-v090-lyon-lab.py
+          fi
           python3 scripts/apply-v091-compile-fix.py
           python3 scripts/apply-v092-meteofrance-route-fix.py
           python3 scripts/apply-v093-lyon-reconstructed-toggle.py
