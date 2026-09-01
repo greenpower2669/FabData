@@ -115,11 +115,11 @@ class MainActivity : ComponentActivity() {
 }
 
 private enum class TimePreset(val label: String, val spanMs: Long) {
-    HOUR("Heure", 60L * 60L * 1000L),
-    DAY("Jour", 24L * 60L * 60L * 1000L),
-    WEEK("Semaine", 7L * 24L * 60L * 60L * 1000L),
-    MONTH("Mois", 31L * 24L * 60L * 60L * 1000L),
-    YEAR("Année", 366L * 24L * 60L * 60L * 1000L)
+    HOUR("1 h", 60L * 60L * 1000L),
+    DAY("24 h", 24L * 60L * 60L * 1000L),
+    TWO_DAYS("48 h", 48L * 60L * 60L * 1000L),
+    WEEK("1 sem.", 7L * 24L * 60L * 60L * 1000L),
+    MONTH("1 mois", 31L * 24L * 60L * 60L * 1000L)
 }
 
 private data class ChartPrefs(
@@ -171,8 +171,10 @@ private data class LoadedData(
     val globalBounds: LongRange?,
     val viewBounds: LongRange?,
     val samples: Map<Long, List<SamplePoint>>,
+    val overviewSamples: Map<Long, List<SamplePoint>>,
     val stats: Map<Long, SensorStats>,
-    val annotations: List<AnnotationItem>
+    val annotations: List<AnnotationItem>,
+    val allAnnotations: List<AnnotationItem>
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -193,9 +195,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var sampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var statsMap by remember { mutableStateOf<Map<Long, SensorStats>>(emptyMap()) }
     var annotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
+    var allAnnotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
+    var overviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var globalBounds by remember { mutableStateOf<LongRange?>(null) }
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
-    var preset by rememberSaveable { mutableStateOf(TimePreset.WEEK) }
+    var preset by rememberSaveable { mutableStateOf(TimePreset.TWO_DAYS) }
+    var windowCenterTimestamp by remember { mutableStateOf<Long?>(null) }
+    var showAllAnnotations by rememberSaveable { mutableStateOf(true) }
     var reloadToken by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var selectedTimestamp by remember { mutableStateOf<Long?>(null) }
@@ -305,33 +311,71 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    LaunchedEffect(reloadToken, preset) {
+    LaunchedEffect(reloadToken, preset, windowCenterTimestamp) {
         busy = true
         val loaded = withContext(Dispatchers.IO) {
             val s = db.sensors()
-            val all = db.globalTimeBounds()
-            val chosen = all?.let {
-                val end = it.last
-                max(it.first, end - preset.spanMs)..end
+
+            // Les thermomètres physiques/importés définissent la période de navigation.
+            // Lyon et les sondes HTTP complètent cette période sans pousser l'ancien hors écran.
+            val all = db.physicalSensorBounds() ?: db.globalTimeBounds()
+            val chosen = all?.let { bounds ->
+                val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
+                val requested = minOf(preset.spanMs, fullSpan)
+                if (requested >= fullSpan) {
+                    bounds
+                } else {
+                    val defaultCenter = bounds.last - requested / 2L
+                    val center = (windowCenterTimestamp ?: defaultCenter).coerceIn(bounds.first, bounds.last)
+                    var windowStart = center - requested / 2L
+                    var windowEnd = windowStart + requested
+                    if (windowStart < bounds.first) {
+                        windowStart = bounds.first
+                        windowEnd = windowStart + requested
+                    }
+                    if (windowEnd > bounds.last) {
+                        windowEnd = bounds.last
+                        windowStart = windowEnd - requested
+                    }
+                    windowStart..windowEnd
+                }
             }
-            if (chosen == null) {
-                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyList())
+
+            val allNotes = db.annotationsAll()
+            if (chosen == null || all == null) {
+                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes)
             } else {
                 val samples = s.associate { sensor ->
                     sensor.id to db.querySamples(sensor.id, chosen.first, chosen.last)
                 }
+                val overview = s.associate { sensor ->
+                    sensor.id to db.querySamples(sensor.id, all.first, all.last, maxPoints = 600)
+                }
                 val stat = s.mapNotNull { sensor ->
                     db.stats(sensor.id, chosen.first, chosen.last)?.let { value -> sensor.id to value }
                 }.toMap()
-                LoadedData(s, all, chosen, samples, stat, db.annotations(chosen.first, chosen.last))
+                LoadedData(
+                    s, all, chosen, samples, overview, stat,
+                    db.annotations(chosen.first, chosen.last), allNotes
+                )
             }
         }
         sensors = loaded.sensors
         globalBounds = loaded.globalBounds
         viewBounds = loaded.viewBounds
         sampleMap = loaded.samples
+        overviewSampleMap = loaded.overviewSamples
         statsMap = loaded.stats
         annotations = loaded.annotations
+        allAnnotations = loaded.allAnnotations
+
+        loaded.viewBounds?.let { bounds ->
+            val current = selectedTimestamp
+            if (current == null || current !in bounds) {
+                selectedTimestamp = bounds.first + (bounds.last - bounds.first) / 2L
+            }
+        }
+
         sensors.forEach { sensor ->
             if (!showTemp.containsKey(sensor.id)) showTemp[sensor.id] = true
             if (!showHumidity.containsKey(sensor.id)) showHumidity[sensor.id] = false
@@ -410,7 +454,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             item {
                 TimeTabs(preset = preset, onSelect = {
                     preset = it
-                    selectedTimestamp = null
+                    windowCenterTimestamp = selectedTimestamp
+                        ?: viewBounds?.let { b -> b.first + (b.last - b.first) / 2L }
                     selectedAnnotation = null
                 })
             }
@@ -490,6 +535,21 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
+                    HistoryOverviewCard(
+                        sensors = sensors,
+                        sampleMap = overviewSampleMap,
+                        historyBounds = globalBounds,
+                        viewBounds = viewBounds,
+                        onSelect = { ts ->
+                            preset = TimePreset.TWO_DAYS
+                            windowCenterTimestamp = ts
+                            selectedTimestamp = ts
+                            selectedAnnotation = null
+                        }
+                    )
+                }
+
+                item {
                     ChartCard(
                         sensors = sensors,
                         sampleMap = sampleMap,
@@ -515,6 +575,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             editingAnnotation = null
                             annotationTimestamp = ts
                             selectedTimestamp = ts
+                        },
+                        onRequestZoom = { ts ->
+                            preset = TimePreset.TWO_DAYS
+                            windowCenterTimestamp = ts
+                            selectedTimestamp = ts
+                            selectedAnnotation = null
                         }
                     )
                 }
@@ -560,8 +626,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (showAllAnnotations) "Toutes les annotations" else "Annotations de la période",
+                            Modifier.weight(1f),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Switch(checked = showAllAnnotations, onCheckedChange = { showAllAnnotations = it })
+                    }
                     AnnotationSection(
-                        annotations = annotations,
+                        annotations = if (showAllAnnotations) allAnnotations else annotations,
                         sensors = sensors,
                         onOpen = { detailAnnotation = it },
                         onDelete = { id ->
@@ -866,7 +940,7 @@ private fun TimeTabs(preset: TimePreset, onSelect: (TimePreset) -> Unit) {
             }
         }
         Text(
-            "Pince = zoom temps · glisse = déplacer · double tap fond = reset · appui long = événement",
+            "Tap = curseur · double tap = événement · appui long = zoom 48 h · pince/glisse = ajuster",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -941,6 +1015,93 @@ private fun SeriesSelector(
 }
 
 @Composable
+private fun HistoryOverviewCard(
+    sensors: List<Sensor>,
+    sampleMap: Map<Long, List<SamplePoint>>,
+    historyBounds: LongRange?,
+    viewBounds: LongRange?,
+    onSelect: (Long) -> Unit
+) {
+    Card(shape = RoundedCornerShape(18.dp)) {
+        Column(
+            Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text("Vue globale", fontWeight = FontWeight.Bold)
+            Text(
+                "Tap sur l’historique = afficher 48 h autour de ce point",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            val bounds = historyBounds
+            val allPoints = sensors.flatMap { sensor -> sampleMap[sensor.id].orEmpty() }
+            if (bounds == null || allPoints.isEmpty()) {
+                Text("Historique global indisponible", style = MaterialTheme.typography.bodySmall)
+            } else {
+                val minTemp = allPoints.minOf { it.temperature }
+                val maxTemp = allPoints.maxOf { it.temperature }
+                val range = (maxTemp - minTemp).takeIf { it > 0.01 } ?: 1.0
+                val span = (bounds.last - bounds.first).coerceAtLeast(1L)
+                val highlight = MaterialTheme.colorScheme.primary
+                val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
+
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(86.dp)
+                        .background(surface, RoundedCornerShape(12.dp))
+                        .pointerInput(bounds, viewBounds) {
+                            detectTapGestures { p ->
+                                val frac = (p.x / size.width.toFloat()).coerceIn(0f, 1f)
+                                onSelect(bounds.first + (span * frac).toLong())
+                            }
+                        }
+                ) {
+                    sensors.forEach { sensor ->
+                        val points = sampleMap[sensor.id].orEmpty()
+                            .filter { it.timestamp in bounds }
+                            .sortedBy { it.timestamp }
+                        if (points.size >= 2) {
+                            val path = Path()
+                            points.forEachIndexed { index, point ->
+                                val x = ((point.timestamp - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width
+                                val y = size.height - (((point.temperature - minTemp) / range).toFloat() * size.height)
+                                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                            }
+                            drawPath(
+                                path,
+                                palette[sensor.colorIndex % palette.size].copy(alpha = 0.72f),
+                                style = Stroke(width = 1.5.dp.toPx())
+                            )
+                        }
+                    }
+                    viewBounds?.let { visible ->
+                        val left = (((visible.first - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width)
+                            .coerceIn(0f, size.width)
+                        val right = (((visible.last - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width)
+                            .coerceIn(0f, size.width)
+                        if (right > left) {
+                            drawRect(
+                                highlight.copy(alpha = 0.14f),
+                                topLeft = Offset(left, 0f),
+                                size = androidx.compose.ui.geometry.Size(right - left, size.height)
+                            )
+                            drawLine(highlight.copy(alpha = 0.8f), Offset(left, 0f), Offset(left, size.height), 2f)
+                            drawLine(highlight.copy(alpha = 0.8f), Offset(right, 0f), Offset(right, size.height), 2f)
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(formatDateTime(bounds.first), style = MaterialTheme.typography.labelSmall)
+                    Text(formatDateTime(bounds.last), style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ChartCard(
     sensors: List<Sensor>,
     sampleMap: Map<Long, List<SamplePoint>>,
@@ -953,7 +1114,8 @@ private fun ChartCard(
     onSelectTimestamp: (Long) -> Unit,
     onAnnotationClick: (AnnotationItem) -> Unit,
     onAnnotationDoubleClick: (AnnotationItem) -> Unit,
-    onRequestAnnotation: (Long) -> Unit
+    onRequestAnnotation: (Long) -> Unit,
+    onRequestZoom: (Long) -> Unit
 ) {
     var resetKey by remember { mutableIntStateOf(0) }
 
@@ -994,7 +1156,8 @@ private fun ChartCard(
                     onSelectTimestamp = onSelectTimestamp,
                     onAnnotationClick = onAnnotationClick,
                     onAnnotationDoubleClick = onAnnotationDoubleClick,
-                    onRequestAnnotation = onRequestAnnotation
+                    onRequestAnnotation = onRequestAnnotation,
+                    onRequestZoom = onRequestZoom
                 )
             }
         }
@@ -1017,7 +1180,8 @@ private fun InteractiveChart(
     onSelectTimestamp: (Long) -> Unit,
     onAnnotationClick: (AnnotationItem) -> Unit,
     onAnnotationDoubleClick: (AnnotationItem) -> Unit,
-    onRequestAnnotation: (Long) -> Unit
+    onRequestAnnotation: (Long) -> Unit,
+    onRequestZoom: (Long) -> Unit
 ) {
     var zoom by remember(resetKey, from, to) { mutableFloatStateOf(1f) }
     var center by remember(resetKey, from, to) { mutableFloatStateOf(0.5f) }
@@ -1060,7 +1224,7 @@ private fun InteractiveChart(
                             val window = visibleWindow()
                             val span = (window.last - window.first).coerceAtLeast(1L)
                             val frac = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
-                            onRequestAnnotation(window.first + (span * frac).toLong())
+                            onRequestZoom(window.first + (span * frac).toLong())
                         }
                     },
                     onDoubleTap = { p ->
@@ -1081,9 +1245,9 @@ private fun InteractiveChart(
                             }
                         if (hit != null) {
                             onAnnotationDoubleClick(hit)
-                        } else {
-                            zoom = 1f
-                            center = 0.5f
+                        } else if (p.x in left..right) {
+                            val frac = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
+                            onRequestAnnotation(window.first + (span * frac).toLong())
                         }
                     },
                     onTap = { p ->

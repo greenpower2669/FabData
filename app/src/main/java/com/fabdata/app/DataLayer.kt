@@ -363,6 +363,26 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         return out
     }
 
+    /** Toutes les annotations réellement stockées, indépendamment du zoom courant. */
+    fun annotationsAll(): List<AnnotationItem> {
+        val out = mutableListOf<AnnotationItem>()
+        readableDatabase.rawQuery(
+            "SELECT id, timestamp, title, note, sensor_id, room_name, type, updated_at FROM annotations ORDER BY timestamp",
+            null
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += AnnotationItem(
+                    id = c.getLong(0), timestamp = c.getLong(1), title = c.getString(2), note = c.getString(3),
+                    sensorId = if (c.isNull(4)) null else c.getLong(4),
+                    roomName = if (c.isNull(5)) null else c.getString(5),
+                    type = if (c.isNull(6)) null else c.getString(6),
+                    updatedAt = if (c.isNull(7)) 0L else c.getLong(7)
+                )
+            }
+        }
+        return out
+    }
+
     fun deleteAnnotation(id: Long) {
         writableDatabase.delete("annotations", "id = ?", arrayOf(id.toString()))
     }
@@ -449,32 +469,25 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
 
                 val rows = reader.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() }.toList()
                 if (exactKnownFormat && rows.isNotEmpty()) {
-                    val firstFields = splitCsv(rows.first(), delimiter)
-                    val anchor = parseExactThermoTime(firstFields.getOrNull(0).orEmpty())
-                    val secondAnchor = rows.getOrNull(1)?.let { parseExactThermoTime(splitCsv(it, delimiter).getOrNull(0).orEmpty()) }
-                    if (anchor != null) {
-                        val stepMs = when {
-                            secondAnchor == null -> -60_000L
-                            secondAnchor < anchor -> -60_000L
-                            secondAnchor > anchor -> 60_000L
-                            else -> -60_000L
-                        }
-                        rows.forEachIndexed { index, line ->
-                            try {
-                                val fields = splitCsv(line, delimiter)
-                                val temp = parseNumber(fields.getOrNull(1).orEmpty())
-                                val hum = parseNumber(fields.getOrNull(2).orEmpty())
-                                if (temp == null || hum == null || temp !in -100.0..150.0 || hum !in 0.0..100.0) {
-                                    invalid++
-                                } else {
-                                    parsed += ParsedPoint(anchor + index.toLong() * stepMs, temp, hum)
-                                }
-                            } catch (_: Exception) {
+                    // Respecte le timestamp REEL de chaque ligne.
+                    // Ne reconstruit plus artificiellement la série à pas fixe de 60 s :
+                    // les trous, coupures et blocs discontinus restent à leur vraie place.
+                    rows.forEach { line ->
+                        try {
+                            val fields = splitCsv(line, delimiter)
+                            val ts = parseExactThermoTime(fields.getOrNull(0).orEmpty())
+                            val temp = parseNumber(fields.getOrNull(1).orEmpty())
+                            val hum = parseNumber(fields.getOrNull(2).orEmpty())
+                            if (ts == null || temp == null || hum == null ||
+                                temp !in -100.0..150.0 || hum !in 0.0..100.0
+                            ) {
                                 invalid++
+                            } else {
+                                parsed += ParsedPoint(ts, temp, hum)
                             }
+                        } catch (_: Exception) {
+                            invalid++
                         }
-                    } else {
-                        invalid += parseGenericRows(rows, delimiter, headers, parsed)
                     }
                 } else {
                     invalid += parseGenericRows(rows, delimiter, headers, parsed)
