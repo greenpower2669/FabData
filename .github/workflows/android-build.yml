@@ -47,7 +47,11 @@ jobs:
           fi
           python3 scripts/apply-v091-compile-fix.py
           python3 scripts/apply-v092-meteofrance-route-fix.py
-          python3 scripts/apply-v093-lyon-reconstructed-toggle.py
+          if grep -q 'val chartSensors = sensors.filterNot' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo "v0.9.1 reconstructed selector already generated; preserving newer Lyon UI"
+          else
+            python3 scripts/apply-v093-lyon-reconstructed-toggle.py
+          fi
           python3 scripts/apply-v094-lyon-system-hybrid.py
           python3 scripts/apply-v095-lyon-hybrid-cleanup.py
 
