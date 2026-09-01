@@ -759,8 +759,15 @@ fun CurvePersonalizationCard(
             )
             sensors.forEach { sensor ->
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(sensor.room, Modifier.weight(1f))
-                    TextButton(onClick = { onEdit("sensor:${sensor.stableKey}", sensor.room) }) { Text("Personnaliser") }
+                    val isRecon = sensor.stableKey == "lyon-reconstructed"
+                    val label = when {
+                        isRecon -> "Lyon reconstruit"
+                        sensor.stableKey == LyonWeatherSync.STABLE_KEY -> "Lyon officiel · 6 min"
+                        else -> sensor.room
+                    }
+                    val key = if (isRecon) "lyon:reconstructed" else "sensor:${sensor.stableKey}"
+                    Text(label, Modifier.weight(1f))
+                    TextButton(onClick = { onEdit(key, label) }) { Text("Personnaliser") }
                 }
             }
         }

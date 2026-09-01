@@ -133,6 +133,8 @@ private enum class PreviewPreset(val label: String, val spanMs: Long) {
 
 private const val LYON_DETAIL_GAP_MS = 90L * 60L * 1000L
 private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
+private const val LYON_RECONSTRUCTED_SENSOR_ID = -6902900103L
+private const val LYON_RECONSTRUCTED_STABLE_KEY = "lyon-reconstructed"
 
 private data class ChartPrefs(
     val showGrid: Boolean,
@@ -186,7 +188,8 @@ private data class LoadedData(
     val overviewSamples: Map<Long, List<SamplePoint>>,
     val stats: Map<Long, SensorStats>,
     val annotations: List<AnnotationItem>,
-    val allAnnotations: List<AnnotationItem>
+    val allAnnotations: List<AnnotationItem>,
+    val lyonReconstructedSamples: List<SamplePoint>
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -209,6 +212,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
     var sensors by remember { mutableStateOf<List<Sensor>>(emptyList()) }
     var sampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
+    var lyonReconstructedSamples by remember { mutableStateOf<List<SamplePoint>>(emptyList()) }
     var statsMap by remember { mutableStateOf<Map<Long, SensorStats>>(emptyMap()) }
     var annotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
     var allAnnotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
@@ -239,7 +243,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var initialHandled by remember { mutableStateOf(false) }
 
     val activeCurveStyles = remember(sensors, styleVersion) {
-        sensors.associate { sensor -> sensor.id to curveStyleStore.load("sensor:${sensor.stableKey}") }
+        buildMap {
+            sensors.forEach { sensor -> put(sensor.id, curveStyleStore.load("sensor:${sensor.stableKey}")) }
+            put(LYON_RECONSTRUCTED_SENSOR_ID, curveStyleStore.load("lyon:reconstructed"))
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -319,18 +326,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    // Synchronise silencieusement les observations mesurées du jour à Lyon-Bron.
-    // Une absence de réseau ne bloque jamais l'ouverture ni les imports CSV.
-    LaunchedEffect(Unit) {
-        val result = withContext(Dispatchers.IO) { runCatching { meteoOfficial.syncSixMinute24h() } }
-        // Reload even on failure: Lyon has already been created and must remain
-        // visible so the user can distinguish "no data" from "no sensor".
-        reloadToken++
-        result.exceptionOrNull()?.let { error ->
-            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "réseau ou source indisponible"}")
-        }
-    }
-
     LaunchedEffect(initialImport, initialHandled) {
         if (!initialHandled && initialImport != null) {
             initialHandled = true
@@ -386,21 +381,26 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
             val allNotes = db.annotationsAll()
             if (chosen == null || all == null) {
-                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes)
+                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList())
             } else {
                 val samples = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
-                        val reconstructed = lyonLab.reconstruct(chosen.first, chosen.last).points.map {
+                        // La ligne Lyon reste la donnée officielle brute 6 min.
+                        val officialSix = lyonLab.queryOfficial(LyonSeriesKind.SIX_MIN, chosen.first, chosen.last).map {
                             SamplePoint(sensor.id, it.timestamp, it.temperature, it.humidity)
                         }
-                        // Tant que la clé officielle n'est pas configurée, l'ancien Lyon reste
-                        // visible comme secours, sans être réécrit ni mélangé aux tables officielles.
-                        reconstructed.ifEmpty { db.querySamples(sensor.id, chosen.first, chosen.last) }
+                        // Secours lecture seule pour les anciennes bases avant l'API officielle.
+                        officialSix.ifEmpty { db.querySamples(sensor.id, chosen.first, chosen.last) }
                     } else {
                         db.querySamples(sensor.id, chosen.first, chosen.last)
                     }
                     sensor.id to value
                 }
+                val lyonReconstructed = if (s.any { it.stableKey == LyonWeatherSync.STABLE_KEY }) {
+                    lyonLab.reconstruct(chosen.first, chosen.last).points.map {
+                        SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity)
+                    }
+                } else emptyList()
                 val overview = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         val hourly = lyonLab.queryOfficial(LyonSeriesKind.HOURLY, all.first, all.last)
@@ -421,7 +421,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }.toMap()
                 LoadedData(
                     s, all, chosen, samples, overview, stat,
-                    db.annotations(chosen.first, chosen.last), allNotes
+                    db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed
                 )
             }
         }
@@ -429,6 +429,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         globalBounds = loaded.globalBounds
         viewBounds = loaded.viewBounds
         sampleMap = loaded.samples
+        lyonReconstructedSamples = loaded.lyonReconstructedSamples
         overviewSampleMap = loaded.overviewSamples
         statsMap = loaded.stats
         annotations = loaded.annotations
@@ -442,11 +443,38 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
 
         sensors.forEach { sensor ->
-            if (!showTemp.containsKey(sensor.id)) showTemp[sensor.id] = true
+            if (!showTemp.containsKey(sensor.id)) {
+                showTemp[sensor.id] = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
+                    loaded.lyonReconstructedSamples.isEmpty()
+                } else true
+            }
             if (!showHumidity.containsKey(sensor.id)) showHumidity[sensor.id] = false
+        }
+        if (sensors.any { it.stableKey == LyonWeatherSync.STABLE_KEY }) {
+            if (!showTemp.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
+                showTemp[LYON_RECONSTRUCTED_SENSOR_ID] = loaded.lyonReconstructedSamples.isNotEmpty()
+            }
+            if (!showHumidity.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
+                showHumidity[LYON_RECONSTRUCTED_SENSOR_ID] = false
+            }
         }
         busy = false
     }
+
+    val lyonReconstructedSensor = Sensor(
+        id = LYON_RECONSTRUCTED_SENSOR_ID,
+        stableKey = LYON_RECONSTRUCTED_STABLE_KEY,
+        name = "Lyon reconstruit",
+        room = "Lyon reconstruit",
+        colorIndex = 3,
+        latestTimestamp = lyonReconstructedSamples.lastOrNull()?.timestamp
+    )
+    val chartSensors = if (sensors.any { it.stableKey == LyonWeatherSync.STABLE_KEY }) {
+        sensors + lyonReconstructedSensor
+    } else sensors
+    val chartSampleMap = if (chartSensors.any { it.id == LYON_RECONSTRUCTED_SENSOR_ID }) {
+        sampleMap + (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples)
+    } else sampleMap
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
@@ -596,16 +624,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item {
                     SeriesSelector(
-                        sensors = sensors,
+                        sensors = chartSensors,
                         showTemp = showTemp,
                         showHumidity = showHumidity,
-                        onEdit = { editSensor = it }
+                        onEdit = { if (it.id != LYON_RECONSTRUCTED_SENSOR_ID) editSensor = it }
                     )
                 }
 
                 item {
                     CurvePersonalizationCard(
-                        sensors = sensors,
+                        sensors = chartSensors,
                         onEdit = { key, label -> styleEditKey = key to label }
                     )
                 }
@@ -635,8 +663,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item {
                     ChartCard(
-                        sensors = sensors,
-                        sampleMap = sampleMap,
+                        sensors = chartSensors,
+                        sampleMap = chartSampleMap,
                         showTemp = showTemp,
                         showHumidity = showHumidity,
                         annotations = annotations,
@@ -686,7 +714,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 selectedTimestamp?.let { ts ->
                     item {
                         if (viewBounds?.let { ts in it } == true) {
-                            InspectorCard(ts, sensors, sampleMap, showTemp, showHumidity)
+                            InspectorCard(ts, chartSensors, chartSampleMap, showTemp, showHumidity)
                         } else {
                             Card(shape = RoundedCornerShape(18.dp)) {
                                 Column(
@@ -1116,8 +1144,13 @@ private fun SeriesSelector(
                     )
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(sensor.room, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (sensor.name != sensor.room) {
+                        val displayRoom = when {
+                            sensor.id == LYON_RECONSTRUCTED_SENSOR_ID -> "Lyon reconstruit"
+                            sensor.stableKey == LyonWeatherSync.STABLE_KEY -> "Lyon officiel · 6 min"
+                            else -> sensor.room
+                        }
+                        Text(displayRoom, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (sensor.name != sensor.room && sensor.id != LYON_RECONSTRUCTED_SENSOR_ID) {
                             Text(
                                 sensor.name,
                                 style = MaterialTheme.typography.labelSmall,
@@ -1135,8 +1168,12 @@ private fun SeriesSelector(
                         checked = showHumidity[sensor.id] == true,
                         onCheckedChange = { showHumidity[sensor.id] = it }
                     )
-                    IconButton(onClick = { onEdit(sensor) }) {
-                        Icon(Icons.Default.Edit, contentDescription = "Modifier la pièce")
+                    if (sensor.id != LYON_RECONSTRUCTED_SENSOR_ID) {
+                        IconButton(onClick = { onEdit(sensor) }) {
+                            Icon(Icons.Default.Edit, contentDescription = "Modifier la pièce")
+                        }
+                    } else {
+                        Spacer(Modifier.size(48.dp))
                     }
                 }
             }
@@ -1303,7 +1340,7 @@ private fun HistoryOverviewCard(
                                         .toFloat() * size.width
                                     val y = size.height - (((point.temperature - minTemp) / tempRange)
                                         .toFloat() * size.height)
-                                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                                    val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
                                         previous?.let { point.timestamp - it.timestamp > previewGapLimit } == true
                                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                                     previous = point
@@ -1657,7 +1694,7 @@ private fun InteractiveChart(
                 points.forEach { p ->
                     val x = mapX(p.timestamp)
                     val y = mapTemp(p.temperature)
-                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                    val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
                         previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                     previous = p
@@ -1679,7 +1716,7 @@ private fun InteractiveChart(
                 points.forEach { p ->
                     val x = mapX(p.timestamp)
                     val y = mapHum(p.humidity)
-                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                    val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
                         previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                     previous = p
