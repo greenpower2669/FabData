@@ -512,8 +512,9 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
 
                 val rows = reader.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() }.toList()
                 if (exactKnownFormat && rows.isNotEmpty()) {
-                    // Les capteurs physiques conservent strictement leurs timestamps réels.
-                    // Lyon pourra ensuite être densifié à l'heure sans modifier les ancres importées.
+                    // Respecte le timestamp REEL de chaque ligne.
+                    // Ne reconstruit plus artificiellement la série à pas fixe de 60 s :
+                    // les trous, coupures et blocs discontinus restent à leur vraie place.
                     rows.forEach { line ->
                         try {
                             val fields = splitCsv(line, delimiter)
