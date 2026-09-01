@@ -408,7 +408,7 @@ class MeteoFranceOfficialClient(
 ) {
     companion object {
         const val STATION_ID = "69029001"
-        private const val OBS_PACKAGE = "https://public-api.meteofrance.fr/public/DPPaquetObs/v1/paquet/infrahoraire-6m"
+        private const val OBS_PACKAGE = "https://public-api.meteofrance.fr/public/DPPaquetObs/paquet/infra-horaire-6m"
         private const val OBS_TARGET = "https://public-api.meteofrance.fr/public/DPObs/v2/station/infrahoraire-6m"
         private const val CLIM_ORDER = "https://public-api.meteofrance.fr/public/DPClim/v1/commande-station/horaire"
         private const val CLIM_FILE = "https://public-api.meteofrance.fr/public/DPClim/v1/commande/fichier"
