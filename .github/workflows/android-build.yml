@@ -40,6 +40,7 @@ jobs:
           python3 scripts/apply-v085-preview-doubletap.py
           python3 scripts/apply-v086-lyon-preview.py
           python3 scripts/apply-v087-lyon-continuity.py
+          python3 scripts/apply-v090-lyon-lab.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
@@ -51,11 +52,12 @@ jobs:
             app/src/main/java/com/fabdata/app/BackupLayer.kt \
             app/src/main/java/com/fabdata/app/DataLayer.kt \
             app/src/main/java/com/fabdata/app/LyonWeatherSync.kt \
+            app/src/main/java/com/fabdata/app/LyonLabLayer.kt \
             app/src/main/java/com/fabdata/app/RemoteSensorLayer.kt
           if git diff --cached --quiet; then
             echo "Source patches already committed"
           else
-            git commit -m "Apply FabData source patches"
+            git commit -m "Apply FabData v0.9.0 source patches"
             git push
           fi
 
@@ -107,18 +109,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.8.7-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.8.7-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.8.7-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.9.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.9.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.9.0-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.8.7-release
+          name: FabData-v0.9.0-release
           path: |
-            artifacts/FabData-v0.8.7-release.apk
-            artifacts/FabData-v0.8.7-release.aab
-            artifacts/FabData-v0.8.7-signing-mode.txt
+            artifacts/FabData-v0.9.0-release.apk
+            artifacts/FabData-v0.9.0-release.aab
+            artifacts/FabData-v0.9.0-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -126,11 +128,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.8.7-release.apk artifacts/FabData-v0.8.7-release.aab artifacts/FabData-v0.8.7-signing-mode.txt
+          git add artifacts/FabData-v0.9.0-release.apk artifacts/FabData-v0.9.0-release.aab artifacts/FabData-v0.9.0-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.8.7 APK + AAB"
+            git commit -m "Build FabData v0.9.0 APK + AAB"
             git push
           fi
 
@@ -138,16 +140,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.8.7
+          TAG: v0.9.0
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$GITHUB_SHA" \
-              --title "FabData v0.8.7" \
-              --notes "FabData v0.8.7 — Lyon sans données synthétiques : fusion archive + temps réel de la même station Lyon-Bron, archive prioritaire, trous conservés si aucune observation, courbe détaillée interrompue sur les lacunes et inspecteur affichant — plutôt qu'une mesure distante."
+              --title "FabData v0.9.0" \
+              --notes "FabData v0.9.0 — Lyon officiel multi-source : 6 min Météo-France, archive horaire, courbe reconstruite tangentielle, journal AUTO/MANUEL, corrections par double-tap et personnalisation Style A/B + Aura A/B + opacité par courbe. Migration SQLite additive uniquement ; données brutes historiques préservées."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.8.7-release.apk \
-            artifacts/FabData-v0.8.7-release.aab \
-            artifacts/FabData-v0.8.7-signing-mode.txt \
+            artifacts/FabData-v0.9.0-release.apk \
+            artifacts/FabData-v0.9.0-release.aab \
+            artifacts/FabData-v0.9.0-signing-mode.txt \
             --clobber
