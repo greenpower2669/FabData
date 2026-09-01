@@ -64,7 +64,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
 
     init {
         // Historique de secours embarqué : juillet + août 2026, 1 point/heure.
-        // L'insertion est non destructive : une observation déjà présente gagne toujours.
+        // Ces heures restent marquées comme reconstruites jusqu'à confirmation réelle.
         runCatching { LyonEmbeddedHistory.seed(db) }
     }
 
@@ -90,11 +90,13 @@ class LyonWeatherSync(private val db: FabDataDb) {
                         sensor.id, point.timestamp, point.temperature, point.humidity
                     )
                 ) {
-                    // Les doublons météo peuvent être corrigés après revalidation.
                     corrected++
                 } else {
                     duplicates++
                 }
+                // Même si la valeur observée est identique à la reconstruction,
+                // elle cesse d'être provisoire dès qu'une vraie observation la confirme.
+                LyonEmbeddedHistory.markObserved(db, point.timestamp)
             }
         }
 
@@ -103,7 +105,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
 
     /**
      * Complète Lyon sur exactement la période couverte par les thermomètres
-     * physiques/importés. Les valeurs déjà présentes ne sont jamais écrasées.
+     * physiques/importés. Les valeurs reconstruite restent candidates à revalidation.
      */
     fun completePhysicalPeriod(): LyonWeatherCompleteResult {
         val bounds = db.physicalSensorBounds()
@@ -120,9 +122,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
         var corrected = 0
         var duplicates = 0
 
-        // Les 31 derniers jours de la période physique sont toujours revalidés
-        // lors d'un « Compléter ». Au-delà, on ne retélécharge que les journées
-        // incomplètes ou manifestement suspectes afin d'éviter des milliers de GET.
+        // Les 31 derniers jours de la période physique sont toujours revalidés.
         val recentRepairCutoff = toDate.minusDays(31)
 
         while (!date.isAfter(toDate)) {
@@ -134,7 +134,8 @@ class LyonWeatherSync(private val db: FabDataDb) {
             val expected = (0..23).map { hour ->
                 date.atTime(hour, 0).atZone(LYON_ZONE).toInstant().toEpochMilli()
             }.toSet()
-            val complete = expected.all { it in existingTimestamps }
+            val hasReconstructed = LyonEmbeddedHistory.hasProvisional(db, start, end)
+            val complete = expected.all { it in existingTimestamps } && !hasReconstructed
             val suspicious = isSuspiciousDay(existingPoints)
             val revalidateRecent = !date.isBefore(recentRepairCutoff)
 
@@ -144,8 +145,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
                 continue
             }
 
-            // Fusionne uniquement des observations réelles Lyon-Bron :
-            // archive datée + temps réel pour aujourd'hui/hier. Aucun remplissage artificiel.
+            // Les observations réelles remplacent les points reconstruits au même timestamp.
             val points = mergedObservedDay(date)
             downloaded++
 
@@ -161,6 +161,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
                     } else {
                         duplicates++
                     }
+                    LyonEmbeddedHistory.markObserved(db, point.timestamp)
                 }
             }
 
@@ -184,7 +185,8 @@ class LyonWeatherSync(private val db: FabDataDb) {
      * Fusionne les méthodes d'acquisition sans mélanger des modèles météo :
      * - temps réel Lyon-Bron pour combler les dernières heures disponibles ;
      * - archive Lyon-Bron, prioritaire au même timestamp.
-     * Si aucune observation réelle n'existe, aucun point n'est inventé.
+     * Si aucune observation réelle n'existe, aucun point n'est inventé ici :
+     * l'historique embarqué reste seulement le filet de sécurité séparé/provisoire.
      */
     private fun mergedObservedDay(date: LocalDate): LinkedHashMap<Long, WeatherPoint> {
         val now = ZonedDateTime.now(LYON_ZONE)
@@ -296,7 +298,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
             connectTimeout = 15_000
             readTimeout = 15_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.8.7")
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.9.3")
             setRequestProperty("Accept-Language", "fr-FR,fr;q=0.9")
         }
         return try {
