@@ -63,15 +63,9 @@ class LyonWeatherSync(private val db: FabDataDb) {
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
     fun syncToday(): LyonWeatherSyncResult {
-        // Crée la sonde même si la source distante est indisponible.
         val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
         val date = ZonedDateTime.now(LYON_ZONE).toLocalDate()
-
-        // Préfère l'URL datée : on ne devine plus la date d'une ligne à partir
-        // de l'heure courante. Le temps-réel reste un repli pour la journée en cours.
-        val html = runCatching { downloadHtml(archiveUrl(date)) }
-            .getOrElse { downloadHtml() }
-        val points = parseArchiveDay(html, date)
+        val points = mergedObservedDay(date)
 
         var added = 0
         var corrected = 0
@@ -84,7 +78,6 @@ class LyonWeatherSync(private val db: FabDataDb) {
                         sensor.id, point.timestamp, point.temperature, point.humidity
                     )
                 ) {
-                    // Les doublons météo peuvent être corrigés après revalidation.
                     corrected++
                 } else {
                     duplicates++
@@ -138,11 +131,10 @@ class LyonWeatherSync(private val db: FabDataDb) {
                 continue
             }
 
-            val html = runCatching { downloadHtml(archiveUrl(date)) }.getOrElse { firstError ->
-                if (date == LocalDate.now(LYON_ZONE)) downloadHtml() else throw firstError
-            }
+            // Fusionne uniquement des observations réelles Lyon-Bron :
+            // archive datée + temps réel pour aujourd'hui/hier. Aucun remplissage artificiel.
+            val points = mergedObservedDay(date)
             downloaded++
-            val points = parseArchiveDay(html, date)
 
             db.inTransaction {
                 points.values.sortedBy { it.timestamp }.forEach { point ->
@@ -173,6 +165,70 @@ class LyonWeatherSync(private val db: FabDataDb) {
             corrected = corrected,
             duplicates = duplicates
         )
+    }
+
+    /**
+     * Fusionne les méthodes d'acquisition sans mélanger des modèles météo :
+     * - temps réel Lyon-Bron pour combler les dernières heures disponibles ;
+     * - archive Lyon-Bron, prioritaire au même timestamp.
+     * Si aucune observation réelle n'existe, aucun point n'est inventé.
+     */
+    private fun mergedObservedDay(date: LocalDate): LinkedHashMap<Long, WeatherPoint> {
+        val now = ZonedDateTime.now(LYON_ZONE)
+        val merged = linkedMapOf<Long, WeatherPoint>()
+
+        // La page temps réel est utile pour aujourd'hui et parfois la veille.
+        if (!date.isBefore(now.toLocalDate().minusDays(1))) {
+            runCatching { downloadHtml() }.getOrNull()?.let { html ->
+                parseRealtimeWindow(html, now).values
+                    .filter { point ->
+                        Instant.ofEpochMilli(point.timestamp).atZone(LYON_ZONE).toLocalDate() == date
+                    }
+                    .forEach { point -> merged[point.timestamp] = point }
+            }
+        }
+
+        // L'archive est la référence finale quand elle possède le même horaire.
+        runCatching { downloadHtml(archiveUrl(date)) }.getOrNull()?.let { html ->
+            runCatching { parseArchiveDay(html, date) }.getOrNull()?.values?.forEach { point ->
+                merged[point.timestamp] = point
+            }
+        }
+
+        if (merged.isEmpty()) error("Aucune observation réelle Lyon-Bron exploitable pour $date")
+        return merged
+    }
+
+    /** Parse la fenêtre roulante temps réel sans fabriquer les heures absentes. */
+    private fun parseRealtimeWindow(
+        html: String,
+        now: ZonedDateTime
+    ): LinkedHashMap<Long, WeatherPoint> {
+        val points = linkedMapOf<Long, WeatherPoint>()
+        rowRegex.findAll(html).forEach { match ->
+            val text = Html.fromHtml(match.groupValues[1], Html.FROM_HTML_MODE_LEGACY)
+                .toString()
+                .replace('\u00A0', ' ')
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            val hour = hourRegex.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: return@forEach
+            val temperature = temperatureRegex.find(text)?.groupValues?.getOrNull(1)
+                ?.replace(',', '.')?.toDoubleOrNull()
+                ?: return@forEach
+            val humidity = humidityRegex.find(text)?.groupValues?.getOrNull(1)
+                ?.replace(',', '.')?.toDoubleOrNull()
+                ?: return@forEach
+            if (temperature !in -100.0..150.0 || humidity !in 0.0..100.0) return@forEach
+
+            val observationDate = if (hour > now.hour) now.toLocalDate().minusDays(1) else now.toLocalDate()
+            val timestamp = observationDate.atTime(hour, 0)
+                .atZone(LYON_ZONE)
+                .toInstant()
+                .toEpochMilli()
+            points[timestamp] = WeatherPoint(timestamp, temperature, humidity)
+        }
+        return points
     }
 
     /**
@@ -227,7 +283,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
             connectTimeout = 15_000
             readTimeout = 15_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.8.6")
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.8.7")
             setRequestProperty("Accept-Language", "fr-FR,fr;q=0.9")
         }
         return try {

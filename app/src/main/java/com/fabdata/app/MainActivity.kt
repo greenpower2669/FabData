@@ -130,6 +130,9 @@ private enum class PreviewPreset(val label: String, val spanMs: Long) {
     M48("48 mois", 1464L * 24L * 60L * 60L * 1000L)
 }
 
+private const val LYON_DETAIL_GAP_MS = 90L * 60L * 1000L
+private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
+
 private data class ChartPrefs(
     val showGrid: Boolean,
     val showPoints: Boolean,
@@ -1193,12 +1196,22 @@ private fun HistoryOverviewCard(
                                 .sortedBy { it.timestamp }
                             if (points.size >= 2) {
                                 val path = Path()
-                                points.forEachIndexed { index, point ->
+                                var previous: SamplePoint? = null
+                                // La prévisu est sous-échantillonnée ; son seuil de coupure
+                                // s'adapte à sa largeur temporelle pour ne pas casser chaque bucket.
+                                val previewGapLimit = maxOf(
+                                    6L * 60L * 60L * 1000L,
+                                    previewSpan / 150L
+                                )
+                                points.forEach { point ->
                                     val x = ((point.timestamp - previewFrom).toDouble() / previewSpan.toDouble())
                                         .toFloat() * size.width
                                     val y = size.height - (((point.temperature - minTemp) / tempRange)
                                         .toFloat() * size.height)
-                                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                                        previous?.let { point.timestamp - it.timestamp > previewGapLimit } == true
+                                    if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                                    previous = point
                                 }
                                 drawPath(
                                     path,
@@ -1536,10 +1549,14 @@ private fun InteractiveChart(
 
             if (showTemp[sensor.id] == true && points.size >= 2) {
                 val path = Path()
-                points.forEachIndexed { index, p ->
+                var previous: SamplePoint? = null
+                points.forEach { p ->
                     val x = mapX(p.timestamp)
                     val y = mapTemp(p.temperature)
-                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                        previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
+                    if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                    previous = p
                 }
                 drawPath(path, color, style = Stroke(width = prefs.lineWidth.dp.toPx()))
                 if (prefs.showPoints || zoom > 18f) {
@@ -1551,10 +1568,14 @@ private fun InteractiveChart(
 
             if (showHumidity[sensor.id] == true && points.size >= 2) {
                 val path = Path()
-                points.forEachIndexed { index, p ->
+                var previous: SamplePoint? = null
+                points.forEach { p ->
                     val x = mapX(p.timestamp)
                     val y = mapHum(p.humidity)
-                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                        previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
+                    if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                    previous = p
                 }
                 drawPath(
                     path,
@@ -1575,7 +1596,7 @@ private fun InteractiveChart(
         annotations.filter { it.timestamp in visibleFrom..visibleTo }.forEach { note ->
             val x = mapX(note.timestamp)
             val sensor = note.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
-            val point = sensor?.let { nearest(sampleMap[it.id].orEmpty(), note.timestamp) }
+            val point = sensor?.let { nearestForSensor(it, sampleMap[it.id].orEmpty(), note.timestamp) }
 
             val markerY = when {
                 sensor != null && point != null && showTemp[sensor.id] == true -> mapTemp(point.temperature)
@@ -1628,7 +1649,7 @@ private fun AnnotationPreviewCard(
     onClose: () -> Unit
 ) {
     val sensor = annotation.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
-    val point = sensor?.let { nearest(sampleMap[it.id].orEmpty(), annotation.timestamp) }
+    val point = sensor?.let { nearestForSensor(it, sampleMap[it.id].orEmpty(), annotation.timestamp) }
 
     Card(
         shape = RoundedCornerShape(18.dp),
@@ -1674,15 +1695,20 @@ private fun InspectorCard(
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Text("Curseur · ${formatDateTime(timestamp)}", fontWeight = FontWeight.Bold)
             sensors.filter { showTemp[it.id] == true || showHumidity[it.id] == true }.forEach { sensor ->
-                nearest(sampleMap[sensor.id].orEmpty(), timestamp)?.let { point ->
-                    Row(Modifier.fillMaxWidth()) {
-                        Text(sensor.room, Modifier.weight(1f), fontWeight = FontWeight.Medium)
-                        if (showTemp[sensor.id] == true) {
-                            Text(String.format(Locale.FRANCE, "%.1f °C", point.temperature), Modifier.width(78.dp))
-                        }
-                        if (showHumidity[sensor.id] == true) {
-                            Text(String.format(Locale.FRANCE, "%.1f %%", point.humidity), Modifier.width(72.dp))
-                        }
+                val point = nearestForSensor(sensor, sampleMap[sensor.id].orEmpty(), timestamp)
+                Row(Modifier.fillMaxWidth()) {
+                    Text(sensor.room, Modifier.weight(1f), fontWeight = FontWeight.Medium)
+                    if (showTemp[sensor.id] == true) {
+                        Text(
+                            point?.let { String.format(Locale.FRANCE, "%.1f °C", it.temperature) } ?: "—",
+                            Modifier.width(78.dp)
+                        )
+                    }
+                    if (showHumidity[sensor.id] == true) {
+                        Text(
+                            point?.let { String.format(Locale.FRANCE, "%.1f %%", it.humidity) } ?: "—",
+                            Modifier.width(72.dp)
+                        )
                     }
                 }
             }
@@ -1850,7 +1876,7 @@ private fun AnnotationDetailSheet(
     onDelete: () -> Unit
 ) {
     val sensor = annotation.sensorId?.let { id -> sensors.firstOrNull { it.id == id } }
-    val point = sensor?.let { nearest(sampleMap[it.id].orEmpty(), annotation.timestamp) }
+    val point = sensor?.let { nearestForSensor(it, sampleMap[it.id].orEmpty(), annotation.timestamp) }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -2193,6 +2219,18 @@ private fun AnnotationDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
     )
+}
+
+private fun nearestForSensor(
+    sensor: Sensor,
+    points: List<SamplePoint>,
+    timestamp: Long
+): SamplePoint? {
+    val point = nearest(points, timestamp) ?: return null
+    if (sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+        abs(point.timestamp - timestamp) > LYON_NEAREST_TOLERANCE_MS
+    ) return null
+    return point
 }
 
 private fun nearest(points: List<SamplePoint>, timestamp: Long): SamplePoint? {
