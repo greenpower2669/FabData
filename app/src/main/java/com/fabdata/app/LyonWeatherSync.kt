@@ -62,6 +62,12 @@ class LyonWeatherSync(private val db: FabDataDb) {
     private val temperatureRegex = Regex("(-?\\d+(?:[.,]\\d+)?)\\s*°C", RegexOption.IGNORE_CASE)
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
+    init {
+        // Historique de secours embarqué : juillet + août 2026, 1 point/heure.
+        // L'insertion est non destructive : une observation déjà présente gagne toujours.
+        runCatching { LyonEmbeddedHistory.seed(db) }
+    }
+
     fun syncToday(): LyonWeatherSyncResult {
         // Crée la sonde même si la source distante est indisponible.
         val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
