@@ -393,18 +393,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    // Synchronise silencieusement les observations mesurées du jour à Lyon-Bron.
-    // Une absence de réseau ne bloque jamais l'ouverture ni les imports CSV.
-    LaunchedEffect(Unit) {
-        val result = withContext(Dispatchers.IO) { runCatching { lyonWeather.syncToday() } }
-        // Reload even on failure: Lyon has already been created and must remain
-        // visible so the user can distinguish "no data" from "no sensor".
-        reloadToken++
-        result.exceptionOrNull()?.let { error ->
-            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "réseau ou source indisponible"}")
-        }
-    }
-
     LaunchedEffect(initialImport, initialHandled) {
         if (!initialHandled && initialImport != null) {
             initialHandled = true
@@ -1400,7 +1388,7 @@ private fun HistoryOverviewCard(
                                         .toFloat() * size.width
                                     val y = size.height - (((point.temperature - minTemp) / tempRange)
                                         .toFloat() * size.height)
-                                    val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
+                                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
                                         previous?.let { point.timestamp - it.timestamp > previewGapLimit } == true
                                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                                     previous = point
