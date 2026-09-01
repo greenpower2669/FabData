@@ -122,6 +122,14 @@ private enum class TimePreset(val label: String, val spanMs: Long) {
     MONTH("1 mois", 31L * 24L * 60L * 60L * 1000L)
 }
 
+private enum class PreviewPreset(val label: String, val spanMs: Long) {
+    M6("6 mois", 183L * 24L * 60L * 60L * 1000L),
+    M12("12 mois", 366L * 24L * 60L * 60L * 1000L),
+    M24("24 mois", 732L * 24L * 60L * 60L * 1000L),
+    M36("36 mois", 1098L * 24L * 60L * 60L * 1000L),
+    M48("48 mois", 1464L * 24L * 60L * 60L * 1000L)
+}
+
 private data class ChartPrefs(
     val showGrid: Boolean,
     val showPoints: Boolean,
@@ -417,7 +425,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             snackbar.showSnackbar(
                                 result.fold(
                                     onSuccess = {
-                                        "Lyon : ${it.added} nouvelle(s) mesure(s) · ${it.duplicates} déjà présente(s)"
+                                        "Lyon : ${it.added} ajoutée(s) · ${it.corrected} corrigée(s) · ${it.duplicates} inchangée(s)"
                                     },
                                     onFailure = {
                                         "Lyon non actualisé : ${it.message ?: "réseau ou source indisponible"}"
@@ -479,7 +487,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 reloadToken++
                                 snackbar.showSnackbar(
                                     result.fold(
-                                        onSuccess = { "Lyon : ${it.added} nouvelle(s) mesure(s)" },
+                                        onSuccess = { "Lyon : ${it.added} ajoutée(s) · ${it.corrected} corrigée(s)" },
                                         onFailure = { "Lyon : ${it.message ?: "source indisponible"}" }
                                     )
                                 )
@@ -496,7 +504,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 snackbar.showSnackbar(
                                     result.fold(
                                         onSuccess = {
-                                            "Lyon complété : ${it.added} mesure(s) · ${it.daysDownloaded} jour(s) téléchargé(s) · ${it.daysAlreadyComplete} déjà complet(s)"
+                                            "Lyon : ${it.added} ajoutée(s) · ${it.corrected} corrigée(s) · ${it.daysDownloaded} jour(s) vérifié(s)"
                                         },
                                         onFailure = { "Compléter Lyon : ${it.message ?: "archives indisponibles"}" }
                                     )
@@ -607,7 +615,23 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 selectedTimestamp?.let { ts ->
                     item {
-                        InspectorCard(ts, sensors, sampleMap, showTemp, showHumidity)
+                        if (viewBounds?.let { ts in it } == true) {
+                            InspectorCard(ts, sensors, sampleMap, showTemp, showHumidity)
+                        } else {
+                            Card(shape = RoundedCornerShape(18.dp)) {
+                                Column(
+                                    Modifier.fillMaxWidth().padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text("Sélection prévisu · ${formatDateTime(ts)}", fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "Hors de la fenêtre détaillée · double-tape sur le bandeau pour ouvrir cette période.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1035,24 +1059,79 @@ private fun HistoryOverviewCard(
     Card(shape = RoundedCornerShape(18.dp)) {
         Column(
             Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(7.dp)
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Tap = sélectionner · double tap = recentrer le graphe avec le zoom courant",
+                "Tap = sélectionner · double tap = ouvrir · glisse = déplacer la prévisu · pince = élargir/rétrécir",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             val bounds = historyBounds
-            val allPoints = sensors.flatMap { sensor -> sampleMap[sensor.id].orEmpty() }
-            if (bounds == null || allPoints.isEmpty()) {
+            if (bounds == null) {
                 Text("Historique global indisponible", style = MaterialTheme.typography.bodySmall)
             } else {
-                val minTemp = allPoints.minOf { it.temperature }
-                val maxTemp = allPoints.maxOf { it.temperature }
-                val range = (maxTemp - minTemp).takeIf { it > 0.01 } ?: 1.0
-                val span = (bounds.last - bounds.first).coerceAtLeast(1L)
+                var previewPreset by rememberSaveable { mutableStateOf(PreviewPreset.M6) }
+                var previewZoom by rememberSaveable { mutableFloatStateOf(1f) }
+                var previewCenter by remember(bounds.first, bounds.last) {
+                    mutableStateOf(
+                        viewBounds?.let { it.first + (it.last - it.first) / 2L }
+                            ?: (bounds.first + (bounds.last - bounds.first) / 2L)
+                    )
+                }
+
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    PreviewPreset.entries.forEach { item ->
+                        Surface(
+                            onClick = {
+                                previewPreset = item
+                                previewZoom = 1f
+                                previewCenter = (selectedTimestamp
+                                    ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
+                                    ?: previewCenter).coerceIn(bounds.first, bounds.last)
+                            },
+                            color = if (item == previewPreset) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Text(
+                                item.label,
+                                Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                fontWeight = if (item == previewPreset) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+
+                val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
+                val maxSpan = minOf(previewPreset.spanMs, fullSpan).coerceAtLeast(1L)
+                val mainSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
+                    ?: (24L * 60L * 60L * 1000L)
+                val minSpan = minOf(maxSpan, maxOf(24L * 60L * 60L * 1000L, mainSpan))
+                val maxZoom = (maxSpan.toDouble() / minSpan.toDouble()).toFloat().coerceAtLeast(1f)
+                val effectiveZoom = previewZoom.coerceIn(1f, maxZoom)
+                val previewSpan = (maxSpan.toDouble() / effectiveZoom.toDouble()).toLong()
+                    .coerceIn(minSpan, maxSpan)
+
+                fun clampCenter(value: Long, span: Long): Long {
+                    if (span >= fullSpan) return bounds.first + fullSpan / 2L
+                    val half = span / 2L
+                    return value.coerceIn(bounds.first + half, bounds.last - (span - half))
+                }
+
+                val effectiveCenter = clampCenter(previewCenter, previewSpan)
+                val previewFrom = if (previewSpan >= fullSpan) bounds.first else effectiveCenter - previewSpan / 2L
+                val previewTo = if (previewSpan >= fullSpan) bounds.last else previewFrom + previewSpan
+                val previewWindow = previewFrom..previewTo
+                val visiblePoints = sensors.flatMap { sensor ->
+                    sampleMap[sensor.id].orEmpty().filter { it.timestamp in previewWindow }
+                }
+                val minTemp = visiblePoints.minOfOrNull { it.temperature } ?: 0.0
+                val maxTemp = visiblePoints.maxOfOrNull { it.temperature } ?: 1.0
+                val tempRange = (maxTemp - minTemp).takeIf { it > 0.01 } ?: 1.0
                 val highlight = MaterialTheme.colorScheme.primary
                 val selectionColor = MaterialTheme.colorScheme.tertiary
                 val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
@@ -1060,59 +1139,97 @@ private fun HistoryOverviewCard(
                 Canvas(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(86.dp)
+                        .height(92.dp)
                         .background(surface, RoundedCornerShape(12.dp))
-                        .pointerInput(bounds, viewBounds) {
+                        .pointerInput(bounds, previewPreset) {
+                            detectTransformGestures { centroid, pan, zoomChange, _ ->
+                                val oldMaxSpan = minOf(previewPreset.spanMs, fullSpan).coerceAtLeast(1L)
+                                val oldMainSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
+                                    ?: (24L * 60L * 60L * 1000L)
+                                val oldMinSpan = minOf(
+                                    oldMaxSpan,
+                                    maxOf(24L * 60L * 60L * 1000L, oldMainSpan)
+                                )
+                                val oldMaxZoom = (oldMaxSpan.toDouble() / oldMinSpan.toDouble())
+                                    .toFloat().coerceAtLeast(1f)
+                                val oldZoom = previewZoom.coerceIn(1f, oldMaxZoom)
+                                val oldSpan = (oldMaxSpan.toDouble() / oldZoom.toDouble()).toLong()
+                                    .coerceIn(oldMinSpan, oldMaxSpan)
+                                val oldCenter = clampCenter(previewCenter, oldSpan)
+                                val oldFrom = if (oldSpan >= fullSpan) bounds.first else oldCenter - oldSpan / 2L
+                                val width = size.width.toFloat().coerceAtLeast(1f)
+                                val fraction = (centroid.x / width).coerceIn(0f, 1f)
+                                val anchorTs = oldFrom + (oldSpan * fraction).toLong()
+
+                                val newZoom = (oldZoom * zoomChange).coerceIn(1f, oldMaxZoom)
+                                val newSpan = (oldMaxSpan.toDouble() / newZoom.toDouble()).toLong()
+                                    .coerceIn(oldMinSpan, oldMaxSpan)
+                                val zoomAnchoredCenter = anchorTs - (newSpan * fraction).toLong() + newSpan / 2L
+                                val panShift = (-(pan.x / width) * newSpan.toDouble()).toLong()
+
+                                previewZoom = newZoom
+                                previewCenter = clampCenter(zoomAnchoredCenter + panShift, newSpan)
+                            }
+                        }
+                        .pointerInput(previewFrom, previewTo) {
                             detectTapGestures(
                                 onDoubleTap = { p ->
-                                    val frac = (p.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                    val ts = bounds.first + (span * frac).toLong()
+                                    val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val ts = previewFrom + (previewSpan * frac).toLong()
                                     onSelectTimestamp(ts)
                                     onNavigate(ts)
                                 },
                                 onTap = { p ->
-                                    val frac = (p.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                    val ts = bounds.first + (span * frac).toLong()
-                                    onSelectTimestamp(ts)
+                                    val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    onSelectTimestamp(previewFrom + (previewSpan * frac).toLong())
                                 }
                             )
                         }
                 ) {
-                    sensors.forEach { sensor ->
-                        val points = sampleMap[sensor.id].orEmpty()
-                            .filter { it.timestamp in bounds }
-                            .sortedBy { it.timestamp }
-                        if (points.size >= 2) {
-                            val path = Path()
-                            points.forEachIndexed { index, point ->
-                                val x = ((point.timestamp - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width
-                                val y = size.height - (((point.temperature - minTemp) / range).toFloat() * size.height)
-                                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    if (visiblePoints.isNotEmpty()) {
+                        sensors.forEach { sensor ->
+                            val points = sampleMap[sensor.id].orEmpty()
+                                .filter { it.timestamp in previewWindow }
+                                .sortedBy { it.timestamp }
+                            if (points.size >= 2) {
+                                val path = Path()
+                                points.forEachIndexed { index, point ->
+                                    val x = ((point.timestamp - previewFrom).toDouble() / previewSpan.toDouble())
+                                        .toFloat() * size.width
+                                    val y = size.height - (((point.temperature - minTemp) / tempRange)
+                                        .toFloat() * size.height)
+                                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                                }
+                                drawPath(
+                                    path,
+                                    palette[sensor.colorIndex % palette.size].copy(alpha = 0.72f),
+                                    style = Stroke(width = 1.5.dp.toPx())
+                                )
                             }
-                            drawPath(
-                                path,
-                                palette[sensor.colorIndex % palette.size].copy(alpha = 0.72f),
-                                style = Stroke(width = 1.5.dp.toPx())
-                            )
                         }
                     }
+
+                    // Fenêtre détaillée actuelle : fond grisé + deux limites.
                     viewBounds?.let { visible ->
-                        val left = (((visible.first - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width)
-                            .coerceIn(0f, size.width)
-                        val right = (((visible.last - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width)
-                            .coerceIn(0f, size.width)
-                        if (right > left) {
+                        val clippedStart = maxOf(visible.first, previewFrom)
+                        val clippedEnd = minOf(visible.last, previewTo)
+                        if (clippedEnd > clippedStart) {
+                            val left = (((clippedStart - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
+                                .coerceIn(0f, size.width)
+                            val right = (((clippedEnd - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
+                                .coerceIn(0f, size.width)
                             drawRect(
-                                highlight.copy(alpha = 0.14f),
+                                highlight.copy(alpha = 0.16f),
                                 topLeft = Offset(left, 0f),
                                 size = androidx.compose.ui.geometry.Size(right - left, size.height)
                             )
-                            drawLine(highlight.copy(alpha = 0.8f), Offset(left, 0f), Offset(left, size.height), 2f)
-                            drawLine(highlight.copy(alpha = 0.8f), Offset(right, 0f), Offset(right, size.height), 2f)
+                            drawLine(highlight.copy(alpha = 0.85f), Offset(left, 0f), Offset(left, size.height), 2f)
+                            drawLine(highlight.copy(alpha = 0.85f), Offset(right, 0f), Offset(right, size.height), 2f)
                         }
                     }
-                    selectedTimestamp?.takeIf { it in bounds }?.let { selected ->
-                        val x = (((selected - bounds.first).toDouble() / span.toDouble()).toFloat() * size.width)
+
+                    selectedTimestamp?.takeIf { it in previewWindow }?.let { selected ->
+                        val x = (((selected - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
                             .coerceIn(0f, size.width)
                         drawLine(
                             selectionColor.copy(alpha = 0.95f),
@@ -1120,16 +1237,18 @@ private fun HistoryOverviewCard(
                             Offset(x, size.height),
                             2.dp.toPx()
                         )
-                        drawCircle(
-                            selectionColor,
-                            radius = 4.dp.toPx(),
-                            center = Offset(x, size.height / 2f)
-                        )
+                        drawCircle(selectionColor, 4.dp.toPx(), Offset(x, size.height / 2f))
                     }
                 }
+
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(formatDateTime(bounds.first), style = MaterialTheme.typography.labelSmall)
-                    Text(formatDateTime(bounds.last), style = MaterialTheme.typography.labelSmall)
+                    Text(formatDateTime(previewFrom), style = MaterialTheme.typography.labelSmall)
+                    Text(
+                        "max ${previewPreset.label}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(formatDateTime(previewTo), style = MaterialTheme.typography.labelSmall)
                 }
             }
         }

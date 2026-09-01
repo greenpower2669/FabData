@@ -177,6 +177,39 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         ) != -1L
     }
 
+    /**
+     * Corrige uniquement une mesure déjà présente au même timestamp.
+     * Utilisé par les sources météo revalidées ; ne crée aucune nouvelle ligne.
+     */
+    fun updateSampleIfDifferent(
+        sensorId: Long,
+        timestamp: Long,
+        temperature: Double,
+        humidity: Double
+    ): Boolean {
+        val current = readableDatabase.rawQuery(
+            "SELECT temperature, humidity FROM samples WHERE sensor_id = ? AND timestamp = ? LIMIT 1",
+            arrayOf(sensorId.toString(), timestamp.toString())
+        ).use { c ->
+            if (!c.moveToFirst()) null else c.getDouble(0) to c.getDouble(1)
+        } ?: return false
+
+        if (kotlin.math.abs(current.first - temperature) < 0.001 &&
+            kotlin.math.abs(current.second - humidity) < 0.001
+        ) return false
+
+        val values = ContentValues().apply {
+            put("temperature", temperature)
+            put("humidity", humidity)
+        }
+        return writableDatabase.update(
+            "samples",
+            values,
+            "sensor_id = ? AND timestamp = ?",
+            arrayOf(sensorId.toString(), timestamp.toString())
+        ) > 0
+    }
+
     fun inTransaction(block: () -> Unit) {
         val db = writableDatabase
         db.beginTransaction()

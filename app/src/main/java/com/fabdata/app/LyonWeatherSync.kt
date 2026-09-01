@@ -8,11 +8,13 @@ import java.time.LocalDate
 import java.time.ZonedDateTime
 import java.time.ZoneId
 import java.util.Locale
+import kotlin.math.abs
 
 /** Résultat d'une synchronisation de la sonde météo virtuelle Lyon. */
 data class LyonWeatherSyncResult(
     val parsed: Int,
     val added: Int,
+    val corrected: Int,
     val duplicates: Int,
     val date: LocalDate
 )
@@ -24,6 +26,7 @@ data class LyonWeatherCompleteResult(
     val daysDownloaded: Int,
     val daysAlreadyComplete: Int,
     val added: Int,
+    val corrected: Int,
     val duplicates: Int
 )
 
@@ -60,56 +63,36 @@ class LyonWeatherSync(private val db: FabDataDb) {
     private val humidityRegex = Regex("(?:^|\\s)(\\d{1,3}(?:[.,]\\d+)?)\\s*%")
 
     fun syncToday(): LyonWeatherSyncResult {
-        // Create the virtual sensor first so FabData can show it even if the
-        // remote weather source is temporarily unavailable.
+        // Crée la sonde même si la source distante est indisponible.
         val sensor = db.getOrCreateSensor(STABLE_KEY, DISPLAY_NAME)
-        val now = ZonedDateTime.now(LYON_ZONE)
-        val date = now.toLocalDate()
-        val html = downloadHtml()
-        val points = linkedMapOf<Long, WeatherPoint>()
+        val date = ZonedDateTime.now(LYON_ZONE).toLocalDate()
 
-        rowRegex.findAll(html).forEach { match ->
-            val text = Html.fromHtml(match.groupValues[1], Html.FROM_HTML_MODE_LEGACY)
-                .toString()
-                .replace('\u00A0', ' ')
-                .replace(Regex("\\s+"), " ")
-                .trim()
-
-            val hour = hourRegex.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: return@forEach
-            val temperature = temperatureRegex.find(text)?.groupValues?.getOrNull(1)
-                ?.replace(',', '.')?.toDoubleOrNull()
-                ?: return@forEach
-            val humidity = humidityRegex.find(text)?.groupValues?.getOrNull(1)
-                ?.replace(',', '.')?.toDoubleOrNull()
-                ?: return@forEach
-
-            if (temperature !in -100.0..150.0 || humidity !in 0.0..100.0) return@forEach
-
-            val observationDate = if (hour > now.hour) date.minusDays(1) else date
-            val timestamp = observationDate.atTime(hour, 0)
-                .atZone(LYON_ZONE)
-                .toInstant()
-                .toEpochMilli()
-
-            points[timestamp] = WeatherPoint(timestamp, temperature, humidity)
-        }
-
-        if (points.isEmpty()) error("Aucune observation Lyon-Bron exploitable reçue")
+        // Préfère l'URL datée : on ne devine plus la date d'une ligne à partir
+        // de l'heure courante. Le temps-réel reste un repli pour la journée en cours.
+        val html = runCatching { downloadHtml(archiveUrl(date)) }
+            .getOrElse { downloadHtml() }
+        val points = parseArchiveDay(html, date)
 
         var added = 0
+        var corrected = 0
         var duplicates = 0
         db.inTransaction {
             points.values.sortedBy { it.timestamp }.forEach { point ->
                 if (db.insertSample(sensor.id, point.timestamp, point.temperature, point.humidity)) {
                     added++
+                } else if (db.updateSampleIfDifferent(
+                        sensor.id, point.timestamp, point.temperature, point.humidity
+                    )
+                ) {
+                    // Les doublons météo peuvent être corrigés après revalidation.
+                    corrected++
                 } else {
                     duplicates++
                 }
             }
         }
 
-        return LyonWeatherSyncResult(points.size, added, duplicates, date)
+        return LyonWeatherSyncResult(points.size, added, corrected, duplicates, date)
     }
 
     /**
@@ -128,18 +111,28 @@ class LyonWeatherSync(private val db: FabDataDb) {
         var downloaded = 0
         var alreadyComplete = 0
         var added = 0
+        var corrected = 0
         var duplicates = 0
+
+        // Les 31 derniers jours de la période physique sont toujours revalidés
+        // lors d'un « Compléter ». Au-delà, on ne retélécharge que les journées
+        // incomplètes ou manifestement suspectes afin d'éviter des milliers de GET.
+        val recentRepairCutoff = toDate.minusDays(31)
 
         while (!date.isAfter(toDate)) {
             requested++
             val start = date.atStartOfDay(LYON_ZONE).toInstant().toEpochMilli()
             val end = date.plusDays(1).atStartOfDay(LYON_ZONE).toInstant().toEpochMilli() - 1
-            val existing = db.existingSampleTimestamps(sensor.id, start, end)
+            val existingPoints = db.querySamples(sensor.id, start, end, maxPoints = 72)
+            val existingTimestamps = existingPoints.map { it.timestamp }.toSet()
             val expected = (0..23).map { hour ->
                 date.atTime(hour, 0).atZone(LYON_ZONE).toInstant().toEpochMilli()
             }.toSet()
+            val complete = expected.all { it in existingTimestamps }
+            val suspicious = isSuspiciousDay(existingPoints)
+            val revalidateRecent = !date.isBefore(recentRepairCutoff)
 
-            if (expected.all { it in existing }) {
+            if (complete && !suspicious && !revalidateRecent) {
                 alreadyComplete++
                 date = date.plusDays(1)
                 continue
@@ -155,13 +148,17 @@ class LyonWeatherSync(private val db: FabDataDb) {
                 points.values.sortedBy { it.timestamp }.forEach { point ->
                     if (db.insertSample(sensor.id, point.timestamp, point.temperature, point.humidity)) {
                         added++
+                    } else if (db.updateSampleIfDifferent(
+                            sensor.id, point.timestamp, point.temperature, point.humidity
+                        )
+                    ) {
+                        corrected++
                     } else {
                         duplicates++
                     }
                 }
             }
 
-            // Reste poli avec la source si plusieurs jours sont nécessaires.
             if (date != toDate) Thread.sleep(80)
             date = date.plusDays(1)
         }
@@ -173,8 +170,22 @@ class LyonWeatherSync(private val db: FabDataDb) {
             daysDownloaded = downloaded,
             daysAlreadyComplete = alreadyComplete,
             added = added,
+            corrected = corrected,
             duplicates = duplicates
         )
+    }
+
+    /**
+     * Détecte les anomalies grossières avant de décider qu'une journée météo
+     * existante est « complète ». Un saut > 8 °C en <= 2 h mérite revalidation.
+     */
+    private fun isSuspiciousDay(points: List<SamplePoint>): Boolean {
+        if (points.any { it.temperature !in -35.0..50.0 || it.humidity !in 0.0..100.0 }) return true
+        val sorted = points.sortedBy { it.timestamp }
+        return sorted.zipWithNext().any { (a, b) ->
+            val dt = b.timestamp - a.timestamp
+            dt in 1..(2L * 60L * 60L * 1000L) && abs(b.temperature - a.temperature) > 8.0
+        }
     }
 
     private fun archiveUrl(date: LocalDate): String {
@@ -216,7 +227,7 @@ class LyonWeatherSync(private val db: FabDataDb) {
             connectTimeout = 15_000
             readTimeout = 15_000
             instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.8")
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/139.0 Mobile Safari/537.36 FabData/0.8.6")
             setRequestProperty("Accept-Language", "fr-FR,fr;q=0.9")
         }
         return try {
