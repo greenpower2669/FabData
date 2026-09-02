@@ -38,7 +38,7 @@ data class PointProvenance(
 enum class PriorityWriteResult { INSERTED, REPLACED, UNCHANGED, REJECTED }
 
 object PointSourceStore {
-    const val MODEL_VERSION = "thermal-rc-1"
+    const val MODEL_VERSION = "thermal-rc-mass-2"
 
     fun ensure(db: SQLiteDatabase) {
         db.execSQL(

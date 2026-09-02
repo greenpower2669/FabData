@@ -8,14 +8,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -29,6 +32,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -47,6 +51,8 @@ fun ThermalReferenceCard(
     val prefs = remember { WeatherReferencePrefs(context) }
     val manager = remember { WeatherReferenceManager(context, db, lyonLab, credentials) }
     val engine = remember { ThermalEngine(db, manager.store()) }
+    val profileStore = remember { ThermalProfileStore(context) }
+    var profile by remember { mutableStateOf(profileStore.load()) }
     val scope = rememberCoroutineScope()
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
@@ -61,6 +67,7 @@ fun ThermalReferenceCard(
     var historyDays by remember { mutableIntStateOf(30) }
     var suppressNextAuto by remember { mutableStateOf(false) }
     var selectedSensorId by remember { mutableStateOf<Long?>(null) }
+    var profileDialog by remember { mutableStateOf(false) }
 
     suspend fun refresh(allHistory: Boolean, triggerChartReload: Boolean) {
         busy = true
@@ -72,9 +79,9 @@ fun ThermalReferenceCard(
                 val to = maxOf(bounds.last, System.currentTimeMillis() + 7L * 60L * 60L * 1000L)
                 val sync = if (allHistory) manager.refreshSelected(reference, from, to)
                     else manager.ensureLocalCache(reference, from, to)
-                val thermalStatus = engine.status(reference, selectedSensorId)
+                val thermalStatus = engine.status(reference, selectedSensorId, profile)
                 val forecast = if (thermalStatus.sensors.any { it.model?.acceptable == true }) {
-                    engine.refreshForecasts(reference, selectedSensorId ?: thermalStatus.preferred?.sensor?.id)
+                    engine.refreshForecasts(reference, selectedSensorId ?: thermalStatus.preferred?.sensor?.id, profile)
                 } else ThermalWriteSummary(0, 0, 0)
                 Triple(sync, thermalStatus, forecast)
             }
@@ -100,7 +107,7 @@ fun ThermalReferenceCard(
     }
 
     // Prévision H+6 automatique après changement de données/référence.
-    LaunchedEffect(dataVersion, selectedKey, selectedSensorId) {
+    LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile) {
         if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
@@ -200,6 +207,7 @@ fun ThermalReferenceCard(
                     ) {
                         AssistChip(onClick = {}, label = { Text("MAE ${fmt(model.metrics.mae)} °C") })
                         AssistChip(onClick = {}, label = { Text("RMSE ${fmt(model.metrics.rmse)} °C") })
+                        AssistChip(onClick = {}, label = { Text("Dérive libre ${fmt(model.longHorizonRmse)} °C") })
                         AssistChip(onClick = {}, label = { Text("Biais ${fmt(model.metrics.bias)} °C") })
                         AssistChip(onClick = {}, label = { Text("Retard ${model.lagHours} h") })
                         AssistChip(onClick = {}, label = { Text("τ ${fmt(model.tauHours)} h") })
@@ -207,6 +215,21 @@ fun ThermalReferenceCard(
                     }
                 }
                 Text(s.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+
+            Card(shape = RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Profil thermique du bâtiment", fontWeight = FontWeight.SemiBold)
+                    Text(profile.summary(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "L'état initial Auto part de la météo autour de J-30 puis applique la tendance chaude/froide. Les mesures réelles restent toujours prioritaires.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedButton(onClick = { profileDialog = true }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                        Text("Ajuster le profil")
+                    }
+                }
             }
 
             OutlinedButton(
@@ -234,6 +257,22 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+
+    if (profileDialog) {
+        ThermalProfileDialog(
+            profile = profile,
+            onDismiss = { profileDialog = false },
+            onSave = { updated ->
+                profile = updated.normalized()
+                profileStore.save(profile)
+                profileDialog = false
+            },
+            onReset = {
+                profile = profileStore.reset()
+                profileDialog = false
+            }
+        )
     }
 
     if (weatherHistoryDialog) {
@@ -310,9 +349,9 @@ fun ThermalReferenceCard(
                                 if (!prepared.coverage.ready) {
                                     error("${reference.city} incomplet : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
                                 }
-                                val checked = engine.status(reference, selectedSensorId)
+                                val checked = engine.status(reference, selectedSensorId, profile)
                                 if (!checked.canReconstruct) error(checked.message)
-                                engine.reconstructHistory(reference, historyDays, selectedSensorId ?: checked.preferred?.sensor?.id)
+                                engine.reconstructHistory(reference, historyDays, selectedSensorId ?: checked.preferred?.sensor?.id, profile)
                             }
                         }
                         busy = false
@@ -333,6 +372,120 @@ fun ThermalReferenceCard(
             dismissButton = { TextButton(onClick = { historyDialog = false }) { Text("Annuler") } }
         )
     }
+}
+
+@Composable
+private fun ThermalProfileDialog(
+    profile: ThermalBuildingProfile,
+    onDismiss: () -> Unit,
+    onSave: (ThermalBuildingProfile) -> Unit,
+    onReset: () -> Unit
+) {
+    var surface by remember(profile) { mutableStateOf(profile.surfaceM2.toString()) }
+    var floor by remember(profile) { mutableStateOf(profile.floor.toString()) }
+    var insulation by remember(profile) { mutableStateOf(profile.insulation) }
+    var inertia by remember(profile) { mutableStateOf(profile.inertia) }
+    var exposure by remember(profile) { mutableStateOf(profile.exposure) }
+    var initialOverride by remember(profile) { mutableStateOf(profile.initialMassOverrideC?.toString().orEmpty()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Profil thermique du bâtiment") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = surface,
+                    onValueChange = { surface = it },
+                    label = { Text("Surface (m²)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = floor,
+                    onValueChange = { floor = it },
+                    label = { Text("Étage") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Text("Isolation thermique", style = MaterialTheme.typography.labelMedium)
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    listOf("A", "B", "C", "D", "E", "F", "G").forEach { rating ->
+                        FilterChip(
+                            selected = insulation == rating,
+                            onClick = { insulation = rating },
+                            label = { Text(rating) }
+                        )
+                    }
+                }
+
+                Text("Inertie du bâtiment", style = MaterialTheme.typography.labelMedium)
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    ThermalInertia.entries.forEach { value ->
+                        FilterChip(
+                            selected = inertia == value,
+                            onClick = { inertia = value },
+                            label = { Text(value.label) }
+                        )
+                    }
+                }
+
+                Text("Exposition / accumulation solaire", style = MaterialTheme.typography.labelMedium)
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    ThermalExposure.entries.forEach { value ->
+                        FilterChip(
+                            selected = exposure == value,
+                            onClick = { exposure = value },
+                            label = { Text(value.label) }
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = initialOverride,
+                    onValueChange = { initialOverride = it },
+                    label = { Text("État thermique initial °C (vide = Auto)") },
+                    supportingText = { Text("Auto : météo J-30 + tendance saisonnière chaude/froide") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    "Valeurs par défaut : 70 m² · 4e étage · isolation D · inertie moyenne · exposition moyenne.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val s = surface.replace(',', '.').toDoubleOrNull() ?: profile.surfaceM2
+                val f = floor.toIntOrNull() ?: profile.floor
+                val initial = initialOverride.trim().replace(',', '.').toDoubleOrNull()
+                onSave(
+                    ThermalBuildingProfile(
+                        surfaceM2 = s,
+                        floor = f,
+                        insulation = insulation,
+                        inertia = inertia,
+                        exposure = exposure,
+                        initialMassOverrideC = initial
+                    )
+                )
+            }) { Text("Enregistrer") }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = onReset) { Text("Défaut") }
+                TextButton(onClick = onDismiss) { Text("Annuler") }
+            }
+        }
+    )
 }
 
 private fun fmt(v: Double): String = String.format(Locale.FRANCE, "%.2f", v)
