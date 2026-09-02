@@ -3,14 +3,12 @@ from pathlib import Path
 DATA = Path('app/src/main/java/com/fabdata/app/DataLayer.kt')
 UI = Path('app/src/main/java/com/fabdata/app/ThermalUi.kt')
 
-# ThermalUi: RowScope/ColumnScope weight extension import.
+# Compose 2026 exposes weight as a RowScope/ColumnScope member extension.
+# Importing androidx.compose.foundation.layout.weight resolves to an internal symbol.
 text = UI.read_text(encoding='utf-8')
-if 'import androidx.compose.foundation.layout.weight\n' not in text:
-    anchor = 'import androidx.compose.foundation.layout.padding\n'
-    if anchor not in text:
-        raise SystemExit('v0.10.1: ThermalUi import anchor missing')
-    text = text.replace(anchor, anchor + 'import androidx.compose.foundation.layout.weight\n', 1)
-    UI.write_text(text, encoding='utf-8')
+clean = text.replace('import androidx.compose.foundation.layout.weight\n', '')
+if clean != text:
+    UI.write_text(clean, encoding='utf-8')
 
 # Any legacy/live caller of insertSample() represents a REAL measurement.
 # If an exact timestamp was previously reconstructed/forecast, promote/replace it.
@@ -50,4 +48,4 @@ if new not in text:
     text = text.replace(old, new, 1)
     DATA.write_text(text, encoding='utf-8')
 
-print('FabData v0.10.1 priority/live-measure hardening applied')
+print('FabData v0.10.1 priority/live-measure + Compose hardening applied')
