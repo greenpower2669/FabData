@@ -8,7 +8,13 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-/** Export de données : measured uniquement par défaut. La sauvegarde complète reste séparée. */
+/**
+ * Export de données : measured uniquement par défaut.
+ *
+ * Il utilise l'enveloppe CSV FabData v2 afin qu'un fichier multi-sondes reste
+ * directement réimportable par le bouton Import sans perdre l'identité des sondes.
+ * La sauvegarde complète (capteurs + événements + toutes les données) reste séparée.
+ */
 class FabDataSourceExporter(private val context: Context, private val db: FabDataDb) {
     data class Result(val rows: Int, val reconstructed: Int, val forecast: Int)
 
@@ -16,15 +22,19 @@ class FabDataSourceExporter(private val context: Context, private val db: FabDat
         PointSourceStore.ensure(db.readableDatabase)
         val output = context.contentResolver.openOutputStream(uri, "wt")
             ?: error("Impossible de créer le fichier d'export")
-        val formatter = DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss", Locale.ROOT)
+        val formatter = DateTimeFormatter.ofPattern("uuuu/MM/dd HH:mm:ss", Locale.ROOT)
         var count = 0
         var reconstructed = 0
         var forecast = 0
+
         OutputStreamWriter(output, Charsets.UTF_8).buffered().use { writer ->
-            writer.write("Capteur_ID,Capteur,Piece,Temps,Temperature_Celsius,Humidite_relative_Pourcentage,source,confidence,Reference_Station_ID,Reference_Ville,Calibration_Debut_ms,Calibration_Fin_ms,Model_Version\n")
+            writer.write(FabDataBackup.HEADER)
+            writer.write("\n")
+
             db.readableDatabase.rawQuery(
                 """
-                SELECT s.stable_key, s.name, s.room, p.timestamp, p.temperature, p.humidity,
+                SELECT s.stable_key, s.name, s.room, s.color_index,
+                       p.timestamp, p.temperature, p.humidity,
                        ps.source, ps.confidence, ps.reference_station_id, ps.reference_city,
                        ps.calibration_from, ps.calibration_to, ps.model_version
                 FROM samples p
@@ -38,20 +48,29 @@ class FabDataSourceExporter(private val context: Context, private val db: FabDat
                 arrayOf(if (includeReconstructed) "1" else "0", if (includeForecast) "1" else "0")
             ).use { c ->
                 while (c.moveToNext()) {
-                    val source = PointSource.fromDb(if (c.isNull(6)) null else c.getString(6))
+                    val source = PointSource.fromDb(if (c.isNull(7)) null else c.getString(7))
                     if (source == PointSource.RECONSTRUCTED) reconstructed++
                     if (source == PointSource.FORECAST) forecast++
-                    val ts = c.getLong(3)
+                    val ts = c.getLong(4)
                     val row = listOf(
-                        c.getString(0), c.getString(1), c.getString(2),
+                        "SAMPLE",
+                        FabDataBackup.FORMAT_VERSION,
+                        c.getString(0),
+                        c.getString(1),
+                        c.getString(2),
+                        c.getInt(3).toString(),
+                        ts.toString(),
                         Instant.ofEpochMilli(ts).atZone(ZoneId.systemDefault()).format(formatter),
-                        c.getDouble(4).toString(), c.getDouble(5).toString(), source.dbValue,
-                        if (c.isNull(7)) "" else c.getDouble(7).toString(),
-                        if (c.isNull(8)) "" else c.getString(8),
+                        c.getDouble(5).toString(),
+                        c.getDouble(6).toString(),
+                        "", "", "", "",
+                        source.dbValue,
+                        if (c.isNull(8)) "" else c.getDouble(8).toString(),
                         if (c.isNull(9)) "" else c.getString(9),
-                        if (c.isNull(10)) "" else c.getLong(10).toString(),
+                        if (c.isNull(10)) "" else c.getString(10),
                         if (c.isNull(11)) "" else c.getLong(11).toString(),
-                        if (c.isNull(12)) "" else c.getString(12)
+                        if (c.isNull(12)) "" else c.getLong(12).toString(),
+                        if (c.isNull(13)) "" else c.getString(13)
                     ).joinToString(",") { csvEscape(it) }
                     writer.write(row)
                     writer.write("\n")
