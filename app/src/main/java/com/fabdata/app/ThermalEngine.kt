@@ -384,7 +384,11 @@ class ThermalEngine(
                 val previousTs = hourBucket(left.timestamp) + (step - 1) * THERMAL_HOUR_MS
                 val ts = previousTs + THERMAL_HOUR_MS
                 val extTs = previousTs - model.lagHours * THERMAL_HOUR_MS
-                val tout = outsideAt(outMap, extTs) ?: run { completed = false; break }
+                val tout = outsideAt(outMap, extTs)
+                if (tout == null) {
+                    completed = false
+                    break
+                }
                 val avg6 = outsideAverage(outMap, extTs, 6) ?: tout
                 val hour = Instant.ofEpochMilli(previousTs).atZone(zone).hour
                 val predicted = current + predictDelta(model.coefficients, current, tout, avg6, hour)
