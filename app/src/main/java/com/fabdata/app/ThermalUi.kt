@@ -68,6 +68,7 @@ fun ThermalReferenceCard(
     var suppressNextAuto by remember { mutableStateOf(false) }
     var selectedSensorId by remember { mutableStateOf<Long?>(null) }
     var profileDialog by remember { mutableStateOf(false) }
+    var profileDialog by remember { mutableStateOf(false) }
 
     suspend fun refresh(allHistory: Boolean, triggerChartReload: Boolean) {
         busy = true
