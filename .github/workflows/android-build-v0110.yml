@@ -1,0 +1,137 @@
+name: Android APK + AAB v0.11.0
+
+on:
+  push:
+    branches:
+      - 'agent/**'
+    paths-ignore:
+      - 'artifacts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0110-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply v0.11.0 thermal profile patch
+        run: python3 scripts/apply-v110-building-thermal-profile.py
+
+      - name: Commit generated source
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/ThermalProfile.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/ThermalUi.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          if git diff --cached --quiet; then
+            echo "v0.11.0 source already generated"
+          else
+            git commit -m "Apply FabData v0.11.0 building thermal profile"
+            git push
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Restore Google Play upload key when configured
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK and Android App Bundle
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify generated packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage named APK and AAB
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.11.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.11.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.11.0-signing-mode.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.11.0-release
+          path: |
+            artifacts/FabData-v0.11.0-release.apk
+            artifacts/FabData-v0.11.0-release.aab
+            artifacts/FabData-v0.11.0-signing-mode.txt
+          if-no-files-found: error
+
+      - name: Publish APK and AAB on branch
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add artifacts/FabData-v0.11.0-release.apk artifacts/FabData-v0.11.0-release.aab artifacts/FabData-v0.11.0-signing-mode.txt
+          if git diff --cached --quiet; then
+            echo "Packages unchanged"
+          else
+            git commit -m "Build FabData v0.11.0 APK + AAB"
+            git push
+          fi
+
+      - name: Publish GitHub Release with APK and AAB
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.11.0
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "FabData v0.11.0" \
+              --notes "FabData v0.11.0 — ajoute un profil thermique bâtiment éditable (surface, étage, isolation A-G, inertie, exposition, état thermique initial Auto/manuel), une mémoire thermique lente air+masse au-dessus du RC appris, une initialisation saisonnière basée sur la météo autour de J-30, et une validation de propagation libre pour refuser les modèles qui dérivent sur plusieurs jours. Les mesures réelles restent prioritaires et la référence météo sélectionnée reste l’entrée unique."
+          fi
+          gh release upload "$TAG" \
+            artifacts/FabData-v0.11.0-release.apk \
+            artifacts/FabData-v0.11.0-release.aab \
+            artifacts/FabData-v0.11.0-signing-mode.txt \
+            --clobber
