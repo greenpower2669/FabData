@@ -64,6 +64,7 @@ jobs:
           fi
           python3 scripts/apply-v101-thermal-hardening.py
           python3 scripts/apply-v102-forward-reconstruction.py
+          python3 scripts/apply-v103-forward-compile-fix.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
