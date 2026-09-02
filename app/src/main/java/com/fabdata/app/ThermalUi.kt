@@ -269,7 +269,11 @@ fun ThermalReferenceCard(
                         busy = false
                         result.fold(
                             onSuccess = {
-                                info = "Historique : ${it.reconstructed} point(s) · ${it.raccords} raccord(s) · dérive max ${fmt(it.maxRaccordDrift)} °C · ${it.skippedSensors} refus"
+                                // v0.10.2 : préserver le diagnostic de reconstruction pendant
+                                // le rechargement du graphique au lieu de le remplacer aussitôt.
+                                val detail = it.diagnostic?.let { d -> " · $d" }.orEmpty()
+                                info = "Historique : ${it.reconstructed} point(s) · ${it.raccords} raccord(s) · dérive max ${fmt(it.maxRaccordDrift)} °C · ${it.skippedSensors} refus$detail"
+                                suppressNextAuto = true
                                 onDataChanged()
                             },
                             onFailure = { info = it.message ?: "Reconstruction refusée" }

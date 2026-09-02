@@ -76,13 +76,15 @@ data class ThermalWriteSummary(
     val forecast: Int,
     val skippedSensors: Int,
     val raccords: Int = 0,
-    val maxRaccordDrift: Double = 0.0
+    val maxRaccordDrift: Double = 0.0,
+    val diagnostic: String? = null
 )
 
 private data class ForwardFillSummary(
     val created: Int = 0,
     val raccords: Int = 0,
-    val maxDrift: Double = 0.0
+    val maxDrift: Double = 0.0,
+    val diagnostic: String? = null
 )
 
 private data class HourPoint(
@@ -217,20 +219,35 @@ class ThermalEngine(
         var skipped = 0
         var raccords = 0
         var maxDrift = 0.0
+        var diagnostic: String? = null
         val targets = physicalSensors().filter { sensorId == null || it.id == sensorId }
         targets.forEach { sensor ->
             val model = runCatching { calibrate(sensor, reference) }.getOrNull()
             if (model == null || !model.acceptable) {
                 skipped++
+                if (diagnostic == null) diagnostic = "Modèle de ${sensor.room} non validé pour la reconstruction."
                 return@forEach
             }
             val measured = measuredHourly(sensor.id)
-            if (measured.isEmpty()) { skipped++; return@forEach }
+            if (measured.isEmpty()) {
+                skipped++
+                if (diagnostic == null) diagnostic = "Aucune vraie mesure intérieure disponible."
+                return@forEach
+            }
             val first = measured.first()
-            val refBounds = referenceStore.bounds(reference.key) ?: run { skipped++; return@forEach }
+            val refBounds = referenceStore.bounds(reference.key)
+            if (refBounds == null) {
+                skipped++
+                if (diagnostic == null) diagnostic = "Référence ${reference.city} absente : actualiser/reconstruire la référence d'abord."
+                return@forEach
+            }
             val requestedStart = first.timestamp - days.toLong() * THERMAL_DAY_MS
             val startAt = max(requestedStart, refBounds.first)
-            if (startAt >= first.timestamp) { skipped++; return@forEach }
+            if (startAt >= first.timestamp) {
+                skipped++
+                if (diagnostic == null) diagnostic = "${reference.city} ne remonte pas avant la première mesure intérieure."
+                return@forEach
+            }
 
             val outside = referenceHourly(
                 reference.key,
@@ -238,8 +255,14 @@ class ThermalEngine(
                 measured.last().timestamp,
                 includeForecast = false
             )
-            if (outside.size < 24 || !referenceCoverageReady(outside, startAt, first.timestamp)) {
+            if (outside.size < 24) {
                 skipped++
+                if (diagnostic == null) diagnostic = "Référence ${reference.city} insuffisante sur la période demandée."
+                return@forEach
+            }
+            if (!referenceCoverageReady(outside, startAt, first.timestamp)) {
+                skipped++
+                if (diagnostic == null) diagnostic = "Référence ${reference.city} encore trop trouée avant la première mesure intérieure."
                 return@forEach
             }
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
@@ -248,13 +271,18 @@ class ThermalEngine(
             total += before.created
             raccords += before.raccords
             maxDrift = max(maxDrift, before.maxDrift)
+            if (diagnostic == null && before.diagnostic != null) diagnostic = before.diagnostic
 
             val gaps = fillInteriorGapsForward(sensor, model, reference)
             total += gaps.created
             raccords += gaps.raccords
             maxDrift = max(maxDrift, gaps.maxDrift)
+            if (diagnostic == null && gaps.diagnostic != null) diagnostic = gaps.diagnostic
         }
-        return ThermalWriteSummary(total, 0, skipped, raccords, maxDrift)
+        if (diagnostic == null && total == 0) {
+            diagnostic = "Aucun trou reconstruisible détecté sur la période choisie."
+        }
+        return ThermalWriteSummary(total, 0, skipped, raccords, maxDrift, diagnostic)
     }
 
     /** Prévision courte automatique H+6, toujours recalculée depuis la dernière vraie mesure. */
@@ -317,14 +345,17 @@ class ThermalEngine(
     ): ForwardFillSummary {
         val start = hourBucket(startAt)
         val firstHour = hourBucket(first.timestamp)
-        val extStart = start - model.lagHours * THERMAL_HOUR_MS
-        val tout = outsideAt(outside, extStart) ?: return ForwardFillSummary()
-        val avg6 = outsideAverage(outside, extStart, 6) ?: tout
-        val hour = Instant.ofEpochMilli(start).atZone(zone).hour
-        var current = equilibriumTemperature(model.coefficients, tout, avg6, hour)
-            ?: return ForwardFillSummary()
-        if (!plausibleIndoor(current)) return ForwardFillSummary()
-        var currentH = outside[hourBucket(start)]?.humidity ?: first.humidity
+        if (start >= firstHour) return ForwardFillSummary(diagnostic = "Période historique vide.")
+
+        // v0.10.2 : on ne change PAS le modèle RC. On cherche seulement l'état intérieur
+        // initial plausible qui, en faisant tourner CE MÊME modèle vers l'avant avec Lyon,
+        // rejoint au mieux la première vraie mesure. Cela remplace l'équilibre algébrique
+        // fragile qui pouvait refuser silencieusement toute reconstruction.
+        val initial = estimateInitialStateForward(model, first, start, firstHour, outside)
+            ?: return ForwardFillSummary(diagnostic = "Impossible d'initialiser un état thermique plausible avec ${reference.city}.")
+
+        var current = initial.first
+        var currentH = initial.second
         var created = 0
         var ts = start
 
@@ -338,21 +369,72 @@ class ThermalEngine(
             if (write == PriorityWriteResult.INSERTED || write == PriorityWriteResult.REPLACED) created++
 
             val extTs = ts - model.lagHours * THERMAL_HOUR_MS
-            val ext = outsideAt(outside, extTs) ?: break
+            val ext = outsideAt(outside, extTs)
+                ?: return ForwardFillSummary(created, 0, 0.0, "Propagation arrêtée : météo extérieure absente vers ${Instant.ofEpochMilli(ts).atZone(zone).toLocalDateTime()}.")
             val extAvg6 = outsideAverage(outside, extTs, 6) ?: ext
             val stepHour = Instant.ofEpochMilli(ts).atZone(zone).hour
             val next = current + predictDelta(model.coefficients, current, ext, extAvg6, stepHour)
-            if (!plausibleIndoor(next)) break
+            if (!plausibleIndoor(next)) {
+                return ForwardFillSummary(created, 0, 0.0, "Propagation arrêtée avant dérive physique abusive (${round2(next)} °C).")
+            }
             val outHum = outside[hourBucket(ts)]?.humidity ?: currentH
             currentH += 0.08 * (outHum - currentH)
             current = next
             ts += THERMAL_HOUR_MS
         }
 
-        // On ne corrige PAS la trajectoire pour rejoindre la mesure : l'écart est le diagnostic.
-        val reached = ts >= firstHour
-        val drift = if (reached) abs(current - first.temperature) else 0.0
-        return ForwardFillSummary(created, if (reached) 1 else 0, drift)
+        // Aucun raccord caché : l'écart à la première vraie mesure reste un diagnostic.
+        val drift = abs(current - first.temperature)
+        return ForwardFillSummary(created, 1, drift)
+    }
+
+    private fun estimateInitialStateForward(
+        model: ThermalModel,
+        first: HourPoint,
+        start: Long,
+        firstHour: Long,
+        outside: Map<Long, HourPoint>
+    ): Pair<Double, Double>? {
+        val low = (first.temperature - 14.0).coerceAtLeast(5.0)
+        val high = (first.temperature + 14.0).coerceAtMost(45.0)
+        var candidate = low
+        var bestStart: Double? = null
+        var bestError = Double.POSITIVE_INFINITY
+
+        while (candidate <= high + 1e-9) {
+            var current = candidate
+            var ts = start
+            var valid = true
+            while (ts < firstHour) {
+                val extTs = ts - model.lagHours * THERMAL_HOUR_MS
+                val ext = outsideAt(outside, extTs)
+                if (ext == null) {
+                    valid = false
+                    break
+                }
+                val avg6 = outsideAverage(outside, extTs, 6) ?: ext
+                val hour = Instant.ofEpochMilli(ts).atZone(zone).hour
+                val next = current + predictDelta(model.coefficients, current, ext, avg6, hour)
+                if (!plausibleIndoor(next)) {
+                    valid = false
+                    break
+                }
+                current = next
+                ts += THERMAL_HOUR_MS
+            }
+            if (valid && ts >= firstHour) {
+                val error = abs(current - first.temperature)
+                if (error < bestError) {
+                    bestError = error
+                    bestStart = candidate
+                }
+            }
+            candidate += 0.25
+        }
+
+        val startTemp = bestStart ?: return null
+        val startHumidity = outside[hourBucket(start)]?.humidity ?: first.humidity
+        return startTemp to startHumidity
     }
 
     private fun fillInteriorGapsForward(

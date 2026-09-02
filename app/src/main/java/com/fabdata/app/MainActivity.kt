@@ -541,11 +541,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         colorIndex = 3,
         latestTimestamp = lyonReconstructedSamples.lastOrNull()?.timestamp
     )
-    // v0.10 : measured / reconstructed / forecast restent sur la même sonde.
-    // Le capteur virtuel Lyon reconstruit est conservé en mémoire pour compatibilité
-    // du détail historique, mais n'est plus présenté comme une seconde sonde.
-    val chartSensors = sensors
-    val chartSampleMap = sampleMap
+    // v0.10.2 : Lyon reconstruit redevient une couche visuelle comparative.
+    // Il ne crée PAS une deuxième référence météo ni une deuxième série persistée :
+    // le pseudo-capteur n'existe que pour Superposition / graphique / inspecteur.
+    val chartSensors = sensors + lyonReconstructedSensor
+    val chartSampleMap = sampleMap + (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples)
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
