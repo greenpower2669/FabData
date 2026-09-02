@@ -58,6 +58,7 @@ fun ThermalReferenceCard(
     var historyDialog by remember { mutableStateOf(false) }
     var historyDays by remember { mutableIntStateOf(30) }
     var suppressNextAuto by remember { mutableStateOf(false) }
+    var selectedSensorId by remember { mutableStateOf<Long?>(null) }
 
     suspend fun refresh(allHistory: Boolean, triggerChartReload: Boolean) {
         busy = true
@@ -69,9 +70,9 @@ fun ThermalReferenceCard(
                 val to = maxOf(bounds.last, System.currentTimeMillis() + 7L * 60L * 60L * 1000L)
                 val sync = if (allHistory) manager.refreshSelected(reference, from, to)
                     else manager.ensureLocalCache(reference, from, to)
-                val thermalStatus = engine.status(reference)
+                val thermalStatus = engine.status(reference, selectedSensorId)
                 val forecast = if (thermalStatus.sensors.any { it.model?.acceptable == true }) {
-                    engine.refreshForecasts(reference)
+                    engine.refreshForecasts(reference, selectedSensorId ?: thermalStatus.preferred?.sensor?.id)
                 } else ThermalWriteSummary(0, 0, 0)
                 Triple(sync, thermalStatus, forecast)
             }
@@ -79,6 +80,9 @@ fun ThermalReferenceCard(
         result.fold(
             onSuccess = { (sync, thermalStatus, forecast) ->
                 status = thermalStatus
+                if (selectedSensorId == null || thermalStatus.sensors.none { it.sensor.id == selectedSensorId }) {
+                    selectedSensorId = thermalStatus.preferred?.sensor?.id
+                }
                 info = "${sync.label} · ${sync.measured} réel(s) · ${sync.reconstructed} reconstruit(s) · H+6 ${forecast.forecast} point(s)"
                 if (triggerChartReload && forecast.forecast > 0) {
                     suppressNextAuto = true
@@ -86,7 +90,7 @@ fun ThermalReferenceCard(
                 }
             },
             onFailure = { error ->
-                status = runCatching { engine.status(reference) }.getOrNull()
+                status = runCatching { engine.status(reference, selectedSensorId) }.getOrNull()
                 info = error.message ?: "Référence météo indisponible"
             }
         )
@@ -94,7 +98,7 @@ fun ThermalReferenceCard(
     }
 
     // Prévision H+6 automatique après changement de données/référence.
-    LaunchedEffect(dataVersion, selectedKey) {
+    LaunchedEffect(dataVersion, selectedKey, selectedSensorId) {
         if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
@@ -143,10 +147,43 @@ fun ThermalReferenceCard(
             if (s != null) {
                 val preferred = s.preferred
                 if (preferred != null) {
-                    Text(
-                        "Calibration prioritaire : ${preferred.sensor.room} · ${preferred.realDays} jour(s) réels",
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    val selectable = s.sensors.filter { it.realDays >= 16 }.ifEmpty { s.sensors }
+                    val index = selectable.indexOfFirst { it.sensor.id == preferred.sensor.id }.coerceAtLeast(0)
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                if (selectable.isNotEmpty()) {
+                                    val next = (index - 1 + selectable.size) % selectable.size
+                                    selectedSensorId = selectable[next].sensor.id
+                                }
+                            },
+                            enabled = !busy && selectable.size > 1
+                        ) { Text("◀") }
+                        Column(Modifier.weight(1f)) {
+                            Text("Sonde du modèle", style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                "${preferred.sensor.room} · ${preferred.realDays} jour(s) réels",
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                "Conservé ${(preferred.retainedRatio * 100).toInt()} % · ignoré ${preferred.ignoredHours} h",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                if (selectable.isNotEmpty()) {
+                                    val next = (index + 1) % selectable.size
+                                    selectedSensorId = selectable[next].sensor.id
+                                }
+                            },
+                            enabled = !busy && selectable.size > 1
+                        ) { Text("▶") }
+                    }
                 }
                 val model = preferred?.model
                 if (model != null) {
@@ -184,7 +221,7 @@ fun ThermalReferenceCard(
             }
 
             Text(
-                "Garde-fou : moins de 15 jours réels = aucune reconstruction historique. La prévision H+6 reste distincte et diminue en confiance avec l'horizon.",
+                "Garde-fou : moins de 16 jours réels = aucune reconstruction historique. Au-delà, toutes les données réelles propres disponibles sont utilisées.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -216,12 +253,23 @@ fun ThermalReferenceCard(
                     scope.launch {
                         busy = true
                         val result = withContext(Dispatchers.IO) {
-                            runCatching { engine.reconstructHistory(reference, historyDays) }
+                            runCatching {
+                                // Ordre strict : construire d'abord la référence extérieure complète,
+                                // puis seulement lancer le modèle intérieur dans le sens du temps.
+                                val bounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
+                                    ?: error("Aucune donnée intérieure")
+                                val from = bounds.first - historyDays.toLong() * 24L * 60L * 60L * 1000L - 18L * 60L * 60L * 1000L
+                                val to = maxOf(bounds.last, System.currentTimeMillis() + 7L * 60L * 60L * 1000L)
+                                manager.refreshSelected(reference, from, to)
+                                val checked = engine.status(reference, selectedSensorId)
+                                if (!checked.canReconstruct) error(checked.message)
+                                engine.reconstructHistory(reference, historyDays, selectedSensorId ?: checked.preferred?.sensor?.id)
+                            }
                         }
                         busy = false
                         result.fold(
                             onSuccess = {
-                                info = "Historique : ${it.reconstructed} point(s) reconstruits · ${it.skippedSensors} sonde(s) refusée(s) par les garde-fous"
+                                info = "Historique : ${it.reconstructed} point(s) · ${it.raccords} raccord(s) · dérive max ${fmt(it.maxRaccordDrift)} °C · ${it.skippedSensors} refus"
                                 onDataChanged()
                             },
                             onFailure = { info = it.message ?: "Reconstruction refusée" }

@@ -14,7 +14,7 @@ import kotlin.math.sqrt
 
 private const val THERMAL_HOUR_MS = 60L * 60L * 1000L
 private const val THERMAL_DAY_MS = 24L * THERMAL_HOUR_MS
-private const val MIN_REAL_DAYS = 15
+private const val MIN_REAL_DAYS = 16
 private const val MAX_HISTORY_DAYS = 90
 
 data class ThermalMetrics(
@@ -49,8 +49,16 @@ data class ThermalModel(
 data class ThermalSensorStatus(
     val sensor: Sensor,
     val realDays: Int,
-    val model: ThermalModel?
-)
+    val model: ThermalModel?,
+    val measuredHours: Int = 0,
+    val ignoredHours: Int = 0
+) {
+    val retainedRatio: Double
+        get() {
+            val transitions = (measuredHours - 1).coerceAtLeast(1)
+            return ((transitions - ignoredHours).coerceAtLeast(0)).toDouble() / transitions.toDouble()
+        }
+}
 
 data class ThermalStatus(
     val reference: WeatherReference,
@@ -58,13 +66,23 @@ data class ThermalStatus(
     val preferred: ThermalSensorStatus?,
     val message: String
 ) {
-    val canReconstruct: Boolean get() = sensors.any { it.model?.acceptable == true }
+    // Le tourniquet pilote réellement la sonde active : si elle ne passe pas les garde-fous,
+    // la reconstruction reste désactivée même si une autre sonde serait acceptable.
+    val canReconstruct: Boolean get() = preferred?.model?.acceptable == true
 }
 
 data class ThermalWriteSummary(
     val reconstructed: Int,
     val forecast: Int,
-    val skippedSensors: Int
+    val skippedSensors: Int,
+    val raccords: Int = 0,
+    val maxRaccordDrift: Double = 0.0
+)
+
+private data class ForwardFillSummary(
+    val created: Int = 0,
+    val raccords: Int = 0,
+    val maxDrift: Double = 0.0
 )
 
 private data class HourPoint(
@@ -101,24 +119,43 @@ class ThermalEngine(
 ) {
     private val zone = ZoneId.of("Europe/Paris")
 
-    fun status(reference: WeatherReference): ThermalStatus {
+    fun status(reference: WeatherReference, selectedSensorId: Long? = null): ThermalStatus {
         val candidates = physicalSensors().map { sensor ->
             val real = measuredHourly(sensor.id)
             val days = distinctDays(real)
             val model = if (days >= MIN_REAL_DAYS) runCatching { calibrate(sensor, reference) }.getOrNull() else null
-            ThermalSensorStatus(sensor, days, model)
+            val transitions = (real.size - 1).coerceAtLeast(0)
+            val usable = model?.usablePoints?.coerceAtMost(transitions) ?: 0
+            ThermalSensorStatus(
+                sensor = sensor,
+                realDays = days,
+                model = model,
+                measuredHours = real.size,
+                ignoredHours = (transitions - usable).coerceAtLeast(0)
+            )
         }
-        val preferred = candidates.sortedWith(
-            compareBy<ThermalSensorStatus> { preferenceRank(it.sensor.room) }
-                .thenByDescending { it.realDays }
-        ).firstOrNull()
+        // Par défaut : la courbe qui garde le plus de données après filtrage des perturbations.
+        // Salle de bain / chambre sud-est ne servent plus que de départage en cas d'égalité.
+        val automatic = candidates
+            .filter { it.model?.acceptable == true }
+            .sortedWith(
+                compareByDescending<ThermalSensorStatus> { it.retainedRatio }
+                    .thenByDescending { it.realDays }
+                    .thenBy { preferenceRank(it.sensor.room) }
+            )
+            .firstOrNull()
+            ?: candidates.sortedWith(
+                compareByDescending<ThermalSensorStatus> { it.realDays }
+                    .thenBy { preferenceRank(it.sensor.room) }
+            ).firstOrNull()
+        val preferred = candidates.firstOrNull { it.sensor.id == selectedSensorId } ?: automatic
         val enough = candidates.any { it.realDays >= MIN_REAL_DAYS }
         val message = if (!enough) {
-            "FabData ne dispose pas encore de suffisamment de mesures pour apprendre correctement l'inertie thermique du bâtiment. Il est préférable d'attendre davantage de données plutôt que de produire une reconstruction incertaine."
+            "FabData ne dispose pas encore d'au moins 16 jours de mesures réelles exploitables. Il est préférable d'attendre davantage de données plutôt que de produire une reconstruction incertaine."
         } else if (candidates.none { it.model?.acceptable == true }) {
             "Les données sont assez longues, mais la validation rétrospective n'est pas encore assez bonne pour autoriser une reconstruction fiable."
         } else {
-            "Modèle thermique RC validé. Les périodes perturbées sont écartées autant que possible avant calibration."
+            "Modèle thermique RC validé. FabData utilise toutes les données réelles propres disponibles au-delà du minimum de 16 jours."
         }
         return ThermalStatus(reference, candidates, preferred, message)
     }
@@ -126,13 +163,16 @@ class ThermalEngine(
     fun calibrate(sensor: Sensor, reference: WeatherReference): ThermalModel {
         val measured = measuredHourly(sensor.id)
         val realDays = distinctDays(measured)
-        require(realDays >= MIN_REAL_DAYS) { "Moins de 15 jours réels exploitables" }
+        require(realDays >= MIN_REAL_DAYS) { "Moins de 16 jours réels exploitables" }
         require(measured.size >= 180) { "Pas assez de points horaires réels" }
 
         val from = measured.first().timestamp - 18L * THERMAL_HOUR_MS
         val to = measured.last().timestamp
         val outside = referenceHourly(reference.key, from, to, includeForecast = false)
         require(outside.size >= 120) { "Référence météo extérieure insuffisante" }
+        require(referenceCoverageReady(outside, from, to)) {
+            "Référence météo extérieure incomplète : reconstruire/compléter ${reference.city} avant de calibrer le bâtiment"
+        }
         val outMap = outside.associateBy { hourBucket(it.timestamp) }
         val medianDeltas = buildingMedianDeltaByHour(measured.first().timestamp, measured.last().timestamp)
 
@@ -162,12 +202,23 @@ class ThermalEngine(
         return best ?: error("Aucun modèle RC stable n'a passé la calibration")
     }
 
-    /** Reconstruction consentie : jusqu'à 90 jours avant la première mesure réelle + petits trous internes. */
-    fun reconstructHistory(reference: WeatherReference, requestedDays: Int): ThermalWriteSummary {
+    /**
+     * Reconstruction consentie, FORWARD depuis le point le plus ancien.
+     * Le modèle RC n'est pas inversé. Lyon (réel + reconstruit) pilote la propagation,
+     * puis chaque vraie mesure intérieure sert de raccord observable et non de correction cachée.
+     */
+    fun reconstructHistory(
+        reference: WeatherReference,
+        requestedDays: Int,
+        sensorId: Long? = null
+    ): ThermalWriteSummary {
         val days = requestedDays.coerceIn(1, MAX_HISTORY_DAYS)
         var total = 0
         var skipped = 0
-        physicalSensors().forEach { sensor ->
+        var raccords = 0
+        var maxDrift = 0.0
+        val targets = physicalSensors().filter { sensorId == null || it.id == sensorId }
+        targets.forEach { sensor ->
             val model = runCatching { calibrate(sensor, reference) }.getOrNull()
             if (model == null || !model.acceptable) {
                 skipped++
@@ -178,44 +229,39 @@ class ThermalEngine(
             val first = measured.first()
             val refBounds = referenceStore.bounds(reference.key) ?: run { skipped++; return@forEach }
             val requestedStart = first.timestamp - days.toLong() * THERMAL_DAY_MS
-            val start = max(requestedStart, refBounds.first)
-            if (start >= first.timestamp) { skipped++; return@forEach }
-            val outside = referenceHourly(reference.key, start - 18L * THERMAL_HOUR_MS, first.timestamp, includeForecast = false)
-            if (outside.size < 24) { skipped++; return@forEach }
+            val startAt = max(requestedStart, refBounds.first)
+            if (startAt >= first.timestamp) { skipped++; return@forEach }
+
+            val outside = referenceHourly(
+                reference.key,
+                startAt - 18L * THERMAL_HOUR_MS,
+                measured.last().timestamp,
+                includeForecast = false
+            )
+            if (outside.size < 24 || !referenceCoverageReady(outside, startAt, first.timestamp)) {
+                skipped++
+                return@forEach
+            }
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
 
-            var knownNext = first.temperature
-            var ts = hourBucket(first.timestamp) - THERMAL_HOUR_MS
-            while (ts >= hourBucket(start)) {
-                val tout = outsideAt(outMap, ts - model.lagHours * THERMAL_HOUR_MS) ?: break
-                val avg6 = outsideAverage(outMap, ts - model.lagHours * THERMAL_HOUR_MS, 6) ?: tout
-                val hour = Instant.ofEpochMilli(ts).atZone(zone).hour
-                val c = model.coefficients
-                val seasonal = c[2] * sin(2.0 * PI * hour / 24.0) + c[3] * cos(2.0 * PI * hour / 24.0) + c[4]
-                val denom = 1.0 - c[0] - c[1]
-                if (abs(denom) < 0.25) break
-                val rawPrev = (knownNext - c[0] * tout - c[1] * avg6 - seasonal) / denom
-                val prev = rawPrev.coerceIn(knownNext - 1.5, knownNext + 1.5)
-                val horizonDays = (first.timestamp - ts).toDouble() / THERMAL_DAY_MS.toDouble()
-                val confidence = (model.confidence * (1.0 - 0.0065 * horizonDays)).coerceIn(0.25, model.confidence)
-                val provenance = provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
-                val result = PointSourceStore.upsertByPriority(
-                    db, sensor.id, ts, prev, first.humidity, provenance
-                )
-                if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) total++
-                knownNext = prev
-                ts -= THERMAL_HOUR_MS
-            }
-            total += fillInteriorGaps(sensor, model, reference)
+            val before = reconstructBeforeFirst(sensor, model, reference, first, startAt, outMap)
+            total += before.created
+            raccords += before.raccords
+            maxDrift = max(maxDrift, before.maxDrift)
+
+            val gaps = fillInteriorGapsForward(sensor, model, reference)
+            total += gaps.created
+            raccords += gaps.raccords
+            maxDrift = max(maxDrift, gaps.maxDrift)
         }
-        return ThermalWriteSummary(total, 0, skipped)
+        return ThermalWriteSummary(total, 0, skipped, raccords, maxDrift)
     }
 
     /** Prévision courte automatique H+6, toujours recalculée depuis la dernière vraie mesure. */
-    fun refreshForecasts(reference: WeatherReference): ThermalWriteSummary {
+    fun refreshForecasts(reference: WeatherReference, sensorId: Long? = null): ThermalWriteSummary {
         var total = 0
         var skipped = 0
-        physicalSensors().forEach { sensor ->
+        physicalSensors().filter { sensorId == null || it.id == sensorId }.forEach { sensor ->
             val model = runCatching { calibrate(sensor, reference) }.getOrNull()
             if (model == null || !model.acceptable) { skipped++; return@forEach }
             val measured = measuredHourly(sensor.id)
@@ -261,36 +307,147 @@ class ThermalEngine(
         return ThermalWriteSummary(0, total, skipped)
     }
 
-    private fun fillInteriorGaps(sensor: Sensor, model: ThermalModel, reference: WeatherReference): Int {
+    private fun reconstructBeforeFirst(
+        sensor: Sensor,
+        model: ThermalModel,
+        reference: WeatherReference,
+        first: HourPoint,
+        startAt: Long,
+        outside: Map<Long, HourPoint>
+    ): ForwardFillSummary {
+        val start = hourBucket(startAt)
+        val firstHour = hourBucket(first.timestamp)
+        val extStart = start - model.lagHours * THERMAL_HOUR_MS
+        val tout = outsideAt(outside, extStart) ?: return ForwardFillSummary()
+        val avg6 = outsideAverage(outside, extStart, 6) ?: tout
+        val hour = Instant.ofEpochMilli(start).atZone(zone).hour
+        var current = equilibriumTemperature(model.coefficients, tout, avg6, hour)
+            ?: return ForwardFillSummary()
+        if (!plausibleIndoor(current)) return ForwardFillSummary()
+        var currentH = outside[hourBucket(start)]?.humidity ?: first.humidity
+        var created = 0
+        var ts = start
+
+        while (ts < firstHour) {
+            val horizonDays = (first.timestamp - ts).toDouble() / THERMAL_DAY_MS.toDouble()
+            val confidence = (model.confidence * (1.0 - 0.0065 * horizonDays)).coerceIn(0.20, model.confidence)
+            val write = PointSourceStore.upsertByPriority(
+                db, sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
+                provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
+            )
+            if (write == PriorityWriteResult.INSERTED || write == PriorityWriteResult.REPLACED) created++
+
+            val extTs = ts - model.lagHours * THERMAL_HOUR_MS
+            val ext = outsideAt(outside, extTs) ?: break
+            val extAvg6 = outsideAverage(outside, extTs, 6) ?: ext
+            val stepHour = Instant.ofEpochMilli(ts).atZone(zone).hour
+            val next = current + predictDelta(model.coefficients, current, ext, extAvg6, stepHour)
+            if (!plausibleIndoor(next)) break
+            val outHum = outside[hourBucket(ts)]?.humidity ?: currentH
+            currentH += 0.08 * (outHum - currentH)
+            current = next
+            ts += THERMAL_HOUR_MS
+        }
+
+        // On ne corrige PAS la trajectoire pour rejoindre la mesure : l'écart est le diagnostic.
+        val reached = ts >= firstHour
+        val drift = if (reached) abs(current - first.temperature) else 0.0
+        return ForwardFillSummary(created, if (reached) 1 else 0, drift)
+    }
+
+    private fun fillInteriorGapsForward(
+        sensor: Sensor,
+        model: ThermalModel,
+        reference: WeatherReference
+    ): ForwardFillSummary {
         val measured = measuredHourly(sensor.id)
-        if (measured.size < 2) return 0
-        val out = referenceHourly(reference.key, measured.first().timestamp - 18L * THERMAL_HOUR_MS, measured.last().timestamp, false)
+        if (measured.size < 2) return ForwardFillSummary()
+        val out = referenceHourly(
+            reference.key,
+            measured.first().timestamp - 18L * THERMAL_HOUR_MS,
+            measured.last().timestamp,
+            false
+        )
         val outMap = out.associateBy { hourBucket(it.timestamp) }
         var created = 0
+        var raccords = 0
+        var maxDrift = 0.0
+
         measured.zipWithNext().forEach { (left, right) ->
             val gapHours = ((right.timestamp - left.timestamp) / THERMAL_HOUR_MS).toInt()
-            if (gapHours !in 2..24) return@forEach
+            if (gapHours !in 2..(14 * 24)) return@forEach
             var current = left.temperature
+            var currentH = left.humidity
+            var completed = true
+
             for (step in 1 until gapHours) {
-                val ts = hourBucket(left.timestamp) + step * THERMAL_HOUR_MS
-                val extTs = ts - model.lagHours * THERMAL_HOUR_MS
-                val tout = outsideAt(outMap, extTs) ?: break
+                val previousTs = hourBucket(left.timestamp) + (step - 1) * THERMAL_HOUR_MS
+                val ts = previousTs + THERMAL_HOUR_MS
+                val extTs = previousTs - model.lagHours * THERMAL_HOUR_MS
+                val tout = outsideAt(outMap, extTs) ?: run { completed = false; break }
                 val avg6 = outsideAverage(outMap, extTs, 6) ?: tout
-                val hour = Instant.ofEpochMilli(ts - THERMAL_HOUR_MS).atZone(zone).hour
+                val hour = Instant.ofEpochMilli(previousTs).atZone(zone).hour
                 val predicted = current + predictDelta(model.coefficients, current, tout, avg6, hour)
-                // Ancrage progressif sur la vraie mesure de droite pour éviter une dérive libre.
-                val remaining = gapHours - step
-                val correction = (right.temperature - predicted) / (remaining + 1).toDouble()
-                current = (predicted + correction).coerceIn(min(left.temperature, right.temperature) - 3.0, max(left.temperature, right.temperature) + 3.0)
-                val confidence = (model.confidence * 0.82).coerceIn(0.25, 0.85)
+                if (!plausibleIndoor(predicted)) { completed = false; break }
+                current = predicted
+                val outHum = outMap[hourBucket(ts)]?.humidity ?: currentH
+                currentH += 0.08 * (outHum - currentH)
+                val confidence = (model.confidence * 0.82).coerceIn(0.20, 0.85)
                 val result = PointSourceStore.upsertByPriority(
-                    db, sensor.id, ts, round2(current), (left.humidity + (right.humidity - left.humidity) * step / gapHours.toDouble()).coerceIn(0.0, 100.0),
+                    db, sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
                     provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
                 )
                 if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) created++
             }
+
+            if (completed) {
+                // Projection d'une heure supplémentaire jusqu'au vrai point de droite,
+                // uniquement pour mesurer la dérive avant le raccord réel.
+                val previousTs = hourBucket(right.timestamp) - THERMAL_HOUR_MS
+                val extTs = previousTs - model.lagHours * THERMAL_HOUR_MS
+                val tout = outsideAt(outMap, extTs)
+                val avg6 = if (tout != null) outsideAverage(outMap, extTs, 6) ?: tout else null
+                if (tout != null && avg6 != null) {
+                    val hour = Instant.ofEpochMilli(previousTs).atZone(zone).hour
+                    val projectedAtRight = current + predictDelta(model.coefficients, current, tout, avg6, hour)
+                    if (plausibleIndoor(projectedAtRight)) {
+                        raccords++
+                        maxDrift = max(maxDrift, abs(projectedAtRight - right.temperature))
+                    }
+                }
+            }
         }
-        return created
+        return ForwardFillSummary(created, raccords, maxDrift)
+    }
+
+    private fun equilibriumTemperature(coeff: DoubleArray, tout: Double, avg6: Double, hour: Int): Double? {
+        val exchange = coeff[0] + coeff[1]
+        if (!exchange.isFinite() || abs(exchange) < 0.002) return null
+        val seasonal = coeff[2] * sin(2.0 * PI * hour / 24.0) +
+            coeff[3] * cos(2.0 * PI * hour / 24.0) + coeff[4]
+        val value = (coeff[0] * tout + coeff[1] * avg6 + seasonal) / exchange
+        return value.takeIf { it.isFinite() }
+    }
+
+    private fun plausibleIndoor(value: Double): Boolean = value.isFinite() && value in -5.0..50.0
+
+    private fun referenceCoverageReady(points: List<HourPoint>, from: Long, to: Long): Boolean {
+        if (to <= from) return false
+        val start = hourBucket(from)
+        val end = hourBucket(to)
+        val expected = (((end - start) / THERMAL_HOUR_MS) + 1L).coerceAtLeast(1L)
+        val buckets = points.asSequence()
+            .map { hourBucket(it.timestamp) }
+            .filter { it in start..end }
+            .distinct()
+            .sorted()
+            .toList()
+        if (buckets.isEmpty()) return false
+        val coverage = buckets.size.toDouble() / expected.toDouble()
+        val maxGapHours = buckets.zipWithNext().maxOfOrNull { (a, b) ->
+            ((b - a) / THERMAL_HOUR_MS).toInt()
+        } ?: 1
+        return coverage >= 0.90 && maxGapHours <= 3
     }
 
     private fun provenance(model: ThermalModel, reference: WeatherReference, source: PointSource, confidence: Double) = PointProvenance(

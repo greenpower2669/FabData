@@ -234,13 +234,38 @@ class WeatherReferenceManager(
         val existing = store.query(reference.key, from, to)
         val measured = existing.count { it.source == PointSource.MEASURED }
         val reconstructed = existing.count { it.source == PointSource.RECONSTRUCTED }
-        val needsHistory = existing.size < 24 || store.bounds(reference.key)?.let { it.first > from || it.last < minOf(to, System.currentTimeMillis()) } != false
+        val historyEnd = minOf(to, System.currentTimeMillis())
+        val needsHistory = existing.size < 24 ||
+            store.bounds(reference.key)?.let { it.first > from || it.last < historyEnd } != false ||
+            hasMaterialHourlyGaps(existing, from, historyEnd)
         return if (needsHistory) {
             refreshSelected(reference, from, to)
         } else {
             val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
             WeatherReferenceSyncResult(measured, reconstructed, forecast, reference.label)
         }
+    }
+
+    private fun hasMaterialHourlyGaps(
+        points: List<WeatherReferencePoint>,
+        from: Long,
+        to: Long
+    ): Boolean {
+        if (to <= from) return true
+        val start = roundHour(from)
+        val end = roundHour(to)
+        val buckets = points.asSequence()
+            .filter { it.source != PointSource.FORECAST }
+            .map { roundHour(it.timestamp) }
+            .filter { it in start..end }
+            .distinct()
+            .sorted()
+            .toList()
+        if (buckets.isEmpty()) return true
+        val expected = (((end - start) / hourMs) + 1L).coerceAtLeast(1L)
+        val coverage = buckets.size.toDouble() / expected.toDouble()
+        val maxGap = buckets.zipWithNext().maxOfOrNull { (a, b) -> ((b - a) / hourMs).toInt() } ?: 1
+        return coverage < 0.90 || maxGap > 3
     }
 
     private fun reconstructShortGaps(referenceKey: String, from: Long, to: Long): Int {
