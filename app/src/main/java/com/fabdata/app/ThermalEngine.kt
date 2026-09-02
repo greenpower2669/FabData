@@ -43,9 +43,27 @@ data class ThermalModel(
     val confidence: Double,
     val tauHours: Double
 ) {
-    val acceptable: Boolean
-        get() = realDays >= MIN_REAL_DAYS && usablePoints >= 120 && metrics.rmse <= 2.0 && metrics.mae <= 1.5 &&
-            longHorizonRmse <= 2.5 && confidence >= 0.35
+    /**
+     * Confiance historique compatible v0.11 : la dérive libre ne doit jamais
+     * empêcher de reconstruire le passé lorsqu'un modèle court terme était valide.
+     */
+    val historyConfidence: Double
+        get() {
+            val dataFactor = min(1.0, realDays / 35.0) * min(1.0, usablePoints / 500.0)
+            val errorFactor = (1.0 - metrics.rmse / 2.8).coerceIn(0.0, 1.0)
+            val biasFactor = (1.0 - abs(metrics.bias) / 1.3).coerceIn(0.0, 1.0)
+            return (0.15 + 0.50 * errorFactor + 0.20 * biasFactor + 0.15 * dataFactor).coerceIn(0.0, 1.0)
+        }
+
+    val acceptableForHistory: Boolean
+        get() = realDays >= MIN_REAL_DAYS && usablePoints >= 120 &&
+            metrics.rmse <= 2.0 && metrics.mae <= 1.5 && historyConfidence >= 0.35
+
+    val acceptableForForecast: Boolean
+        get() = acceptableForHistory && longHorizonRmse <= 2.5 && confidence >= 0.35
+
+    // Compatibilité interne : tout ancien appel restant doit être prudent et viser le futur.
+    val acceptable: Boolean get() = acceptableForForecast
 }
 
 data class ThermalSensorStatus(
@@ -70,7 +88,8 @@ data class ThermalStatus(
 ) {
     // Le tourniquet pilote réellement la sonde active : si elle ne passe pas les garde-fous,
     // la reconstruction reste désactivée même si une autre sonde serait acceptable.
-    val canReconstruct: Boolean get() = preferred?.model?.acceptable == true
+    val canReconstruct: Boolean get() = preferred?.model?.acceptableForHistory == true
+    val canForecast: Boolean get() = preferred?.model?.acceptableForForecast == true
 }
 
 data class ThermalWriteSummary(
@@ -150,7 +169,7 @@ class ThermalEngine(
         // Par défaut : la courbe qui garde le plus de données après filtrage des perturbations.
         // Salle de bain / chambre sud-est ne servent plus que de départage en cas d'égalité.
         val automatic = candidates
-            .filter { it.model?.acceptable == true }
+            .filter { it.model?.acceptableForHistory == true }
             .sortedWith(
                 compareByDescending<ThermalSensorStatus> { it.retainedRatio }
                     .thenByDescending { it.realDays }
@@ -165,7 +184,7 @@ class ThermalEngine(
         val enough = candidates.any { it.realDays >= MIN_REAL_DAYS }
         val message = if (!enough) {
             "FabData ne dispose pas encore d'au moins 16 jours de mesures réelles exploitables. Il est préférable d'attendre davantage de données plutôt que de produire une reconstruction incertaine."
-        } else if (candidates.none { it.model?.acceptable == true }) {
+        } else if (candidates.none { it.model?.acceptableForHistory == true }) {
             "Les données sont assez longues, mais la validation rétrospective n'est pas encore assez bonne pour autoriser une reconstruction fiable."
         } else {
             "Modèle thermique RC validé. FabData utilise toutes les données réelles propres disponibles au-delà du minimum de 16 jours."
@@ -173,7 +192,12 @@ class ThermalEngine(
         return ThermalStatus(reference, candidates, preferred, message)
     }
 
-    fun calibrate(sensor: Sensor, reference: WeatherReference, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalModel {
+    fun calibrate(
+        sensor: Sensor,
+        reference: WeatherReference,
+        profile: ThermalBuildingProfile = ThermalBuildingProfile(),
+        preferLongHorizon: Boolean = false
+    ): ThermalModel {
         val measured = measuredHourly(sensor.id)
         val realDays = distinctDays(measured)
         require(realDays >= MIN_REAL_DAYS) { "Moins de 16 jours réels exploitables" }
@@ -212,8 +236,16 @@ class ThermalEngine(
                 lag, coeff, train.first().timestamp, train.last().timestamp, rows.size, realDays,
                 metrics, driftRmse, confidence, tau
             )
-            if (best == null || (model.metrics.rmse + 0.35 * model.longHorizonRmse) <
-                (best!!.metrics.rmse + 0.35 * best!!.longHorizonRmse)) best = model
+            val better = if (best == null) {
+                true
+            } else if (preferLongHorizon) {
+                (model.metrics.rmse + 0.35 * model.longHorizonRmse) <
+                    (best!!.metrics.rmse + 0.35 * best!!.longHorizonRmse)
+            } else {
+                // Historique : comportement v0.11, meilleur RMSE court terme.
+                model.metrics.rmse < best!!.metrics.rmse
+            }
+            if (better) best = model
         }
         return best ?: error("Aucun modèle RC stable n'a passé la calibration")
     }
@@ -238,7 +270,7 @@ class ThermalEngine(
         val targets = physicalSensors().filter { sensorId == null || it.id == sensorId }
         targets.forEach { sensor ->
             val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
-            if (model == null || !model.acceptable) {
+            if (model == null || !model.acceptableForHistory) {
                 skipped++
                 if (diagnostic == null) diagnostic = "Modèle de ${sensor.room} non validé pour la reconstruction."
                 return@forEach
@@ -333,7 +365,7 @@ class ThermalEngine(
                 if (diagnostic == null && r.diagnostic != null) diagnostic = r.diagnostic
             } else {
                 val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
-                if (model == null || !model.acceptable) { skipped++; return@forEach }
+                if (model == null || !model.acceptableForHistory) { skipped++; return@forEach }
                 val r = fillInteriorGapsForward(sensor, model, reference, profile)
                 total += r.created
                 raccords += r.raccords
@@ -363,8 +395,8 @@ class ThermalEngine(
         var bestAnalogCount = 0
 
         physicalSensors().filter { sensorId == null || it.id == sensorId }.forEach { sensor ->
-            val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
-            if (model == null || !model.acceptable) { skipped++; return@forEach }
+            val model = runCatching { calibrate(sensor, reference, profile, preferLongHorizon = true) }.getOrNull()
+            if (model == null || !model.acceptableForForecast) { skipped++; return@forEach }
             val measured = measuredHourly(sensor.id)
             val latest = measured.lastOrNull() ?: run { skipped++; return@forEach }
             val recent = measured.takeLast(5)

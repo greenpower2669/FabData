@@ -69,8 +69,13 @@ fun ThermalReferenceCard(
     var suppressNextAuto by remember { mutableStateOf(false) }
     var selectedSensorId by remember { mutableStateOf<Long?>(null) }
     var profileDialog by remember { mutableStateOf(false) }
+    var measuredRevision by remember { mutableStateOf<String?>(null) }
 
-    suspend fun refresh(allHistory: Boolean, triggerChartReload: Boolean) {
+    suspend fun refresh(
+        allHistory: Boolean,
+        triggerChartReload: Boolean,
+        rebuildHistoryFromNewMeasured: Boolean = false
+    ) {
         busy = true
         val result = withContext(Dispatchers.IO) {
             runCatching {
@@ -82,12 +87,12 @@ fun ThermalReferenceCard(
                     else manager.ensureLocalCache(reference, from, to)
                 val thermalStatus = engine.status(reference, selectedSensorId, profile)
                 val activeSensor = selectedSensorId ?: thermalStatus.preferred?.sensor?.id
-                if (thermalStatus.sensors.any { it.model?.acceptable == true }) {
-                    // Si un historique calculé existait déjà, une nouvelle mesure réelle
-                    // l'enrichit automatiquement sans jamais modifier les points MEASURED.
+                if (rebuildHistoryFromNewMeasured && thermalStatus.sensors.any { it.model?.acceptableForHistory == true }) {
+                    // v0.12.1 : recalcul du passé uniquement après une vraie variation
+                    // du jeu de mesures MEASURED, jamais sur un simple changement d'UI.
                     engine.refreshExistingReconstructions(reference, profile, activeSensor)
                 }
-                val forecast = if (thermalStatus.sensors.any { it.model?.acceptable == true }) {
+                val forecast = if (thermalStatus.sensors.any { it.model?.acceptableForForecast == true }) {
                     engine.refreshForecasts(reference, activeSensor, profile, forecastMode)
                 } else ThermalWriteSummary(0, 0, 0)
                 Triple(sync, thermalStatus, forecast)
@@ -116,13 +121,20 @@ fun ThermalReferenceCard(
         busy = false
     }
 
-    // Toute nouvelle vraie donnée invalide d'abord l'ancien futur, puis ce cycle
-    // recalcule historique calculé existant + nouvelle prévision depuis l'état réel.
+    // v0.12.1 : dataVersion peut aussi changer pour des écritures calculées ou l'UI.
+    // On ne recalcule le passé que si COUNT/MIN/MAX des vraies mesures a réellement changé.
     LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile, forecastMode) {
+        val currentMeasuredRevision = withContext(Dispatchers.IO) { db.physicalMeasuredRevision() }
+        val measuredChanged = measuredRevision != null && currentMeasuredRevision != measuredRevision
+        measuredRevision = currentMeasuredRevision
         if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
-            refresh(allHistory = false, triggerChartReload = true)
+            refresh(
+                allHistory = false,
+                triggerChartReload = true,
+                rebuildHistoryFromNewMeasured = measuredChanged
+            )
         }
     }
 

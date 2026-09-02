@@ -333,6 +333,29 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         }
     }
 
+    /**
+     * Révision compacte des seules vraies mesures intérieures.
+     * Utilisée par le moteur thermique pour distinguer une vraie arrivée de données
+     * d'un simple changement d'UI, de profil ou de mode de prévision.
+     */
+    fun physicalMeasuredRevision(): String? {
+        PointSourceStore.ensure(readableDatabase)
+        readableDatabase.rawQuery(
+            """
+            SELECT COUNT(*), MIN(p.timestamp), MAX(p.timestamp)
+            FROM samples p
+            JOIN sensors s ON s.id = p.sensor_id
+            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+            WHERE s.stable_key NOT LIKE 'meteo-%'
+              AND s.stable_key NOT LIKE 'http-get-%'
+              AND (ps.source IS NULL OR ps.source='measured')
+            """.trimIndent(), null
+        ).use { c ->
+            if (!c.moveToFirst() || c.getLong(0) <= 0L || c.isNull(1) || c.isNull(2)) return null
+            return "${c.getLong(0)}:${c.getLong(1)}:${c.getLong(2)}"
+        }
+    }
+
     fun existingSampleTimestamps(sensorId: Long, from: Long, to: Long): Set<Long> {
         val out = linkedSetOf<Long>()
         readableDatabase.rawQuery(
