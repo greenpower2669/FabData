@@ -65,6 +65,7 @@ jobs:
           python3 scripts/apply-v101-thermal-hardening.py
           python3 scripts/apply-v102-forward-reconstruction.py
           python3 scripts/apply-v103-forward-compile-fix.py
+          python3 scripts/apply-v104-regression-fix.py
 
       - name: Commit generated source patches
         if: github.event_name == 'push'
@@ -72,6 +73,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
           git add \
+            app/build.gradle.kts \
             app/src/main/java/com/fabdata/app/MainActivity.kt \
             app/src/main/java/com/fabdata/app/BackupLayer.kt \
             app/src/main/java/com/fabdata/app/DataLayer.kt \
@@ -88,7 +90,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Source patches already committed"
           else
-            git commit -m "Apply FabData v0.10.1 forward thermal reconstruction"
+            git commit -m "Apply FabData v0.10.2 regression fixes"
             git push
           fi
 
@@ -140,18 +142,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.10.1-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.10.1-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.10.1-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.10.2-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.10.2-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.10.2-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.10.1-release
+          name: FabData-v0.10.2-release
           path: |
-            artifacts/FabData-v0.10.1-release.apk
-            artifacts/FabData-v0.10.1-release.aab
-            artifacts/FabData-v0.10.1-signing-mode.txt
+            artifacts/FabData-v0.10.2-release.apk
+            artifacts/FabData-v0.10.2-release.aab
+            artifacts/FabData-v0.10.2-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -159,11 +161,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.10.1-release.apk artifacts/FabData-v0.10.1-release.aab artifacts/FabData-v0.10.1-signing-mode.txt
+          git add artifacts/FabData-v0.10.2-release.apk artifacts/FabData-v0.10.2-release.aab artifacts/FabData-v0.10.2-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.10.1 APK + AAB"
+            git commit -m "Build FabData v0.10.2 APK + AAB"
             git push
           fi
 
@@ -171,16 +173,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.10.1
+          TAG: v0.10.2
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$GITHUB_SHA" \
-              --title "FabData v0.10.1" \
-              --notes "FabData v0.10.1 — Lyon/référence extérieure obligatoirement préparée avant calibration, seuil 16 jours réels minimum sans plafond d'apprentissage, sélection de la sonde modèle par meilleur taux de données conservées avec tourniquet manuel, reconstruction historique RC effectuée du plus ancien vers le plus récent sans inversion du modèle ni correction cachée vers le futur, raccords aux vraies mesures avec diagnostic de dérive, garde-fou anti-divergence physique, H+6 conservé et priorité measured > reconstructed > forecast inchangée."
+              --title "FabData v0.10.2" \
+              --notes "FabData v0.10.2 — rétablit Lyon reconstruit comme couche visuelle comparative sans dupliquer la référence météo interne; conserve le résultat et la cause d'un refus de reconstruction à l'écran; remplace l'initialisation d'équilibre fragile par une recherche d'état initial plausible utilisant le même modèle RC uniquement vers l'avant. Modèle RC, priorité measured > reconstructed > forecast, seuil 16 jours et H+6 inchangés."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.10.1-release.apk \
-            artifacts/FabData-v0.10.1-release.aab \
-            artifacts/FabData-v0.10.1-signing-mode.txt \
+            artifacts/FabData-v0.10.2-release.apk \
+            artifacts/FabData-v0.10.2-release.aab \
+            artifacts/FabData-v0.10.2-signing-mode.txt \
             --clobber
