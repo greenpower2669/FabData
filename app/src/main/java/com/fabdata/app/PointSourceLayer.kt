@@ -32,13 +32,15 @@ data class PointProvenance(
     val referenceCity: String? = null,
     val calibrationFrom: Long? = null,
     val calibrationTo: Long? = null,
-    val modelVersion: String? = null
+    val modelVersion: String? = null,
+    val sigmaC: Double? = null,
+    val analogCount: Int? = null
 )
 
 enum class PriorityWriteResult { INSERTED, REPLACED, UNCHANGED, REJECTED }
 
 object PointSourceStore {
-    const val MODEL_VERSION = "thermal-rc-mass-2"
+    const val MODEL_VERSION = "thermal-rc-mass-3"
 
     fun ensure(db: SQLiteDatabase) {
         db.execSQL(
@@ -48,6 +50,8 @@ object PointSourceStore {
                 timestamp INTEGER NOT NULL,
                 source TEXT NOT NULL,
                 confidence REAL,
+                sigma_c REAL,
+                analog_count INTEGER,
                 reference_key TEXT,
                 reference_station_id TEXT,
                 reference_city TEXT,
@@ -61,6 +65,19 @@ object PointSourceStore {
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_point_sources_time ON point_sources(sensor_id, timestamp)")
+        ensureColumn(db, "sigma_c", "REAL")
+        ensureColumn(db, "analog_count", "INTEGER")
+    }
+
+    private fun ensureColumn(db: SQLiteDatabase, name: String, type: String) {
+        val exists = db.rawQuery("PRAGMA table_info(point_sources)", null).use { c ->
+            var found = false
+            while (c.moveToNext()) {
+                if (c.getString(c.getColumnIndexOrThrow("name")) == name) { found = true; break }
+            }
+            found
+        }
+        if (!exists) db.execSQL("ALTER TABLE point_sources ADD COLUMN $name $type")
     }
 
     fun sourceFor(db: FabDataDb, sensorId: Long, timestamp: Long): PointSource {
@@ -78,7 +95,7 @@ object PointSourceStore {
         db.readableDatabase.rawQuery(
             """
             SELECT source, confidence, reference_key, reference_station_id, reference_city,
-                   calibration_from, calibration_to, model_version
+                   calibration_from, calibration_to, model_version, sigma_c, analog_count
             FROM point_sources
             WHERE sensor_id=? AND timestamp=? LIMIT 1
             """.trimIndent(),
@@ -93,7 +110,9 @@ object PointSourceStore {
                 referenceCity = if (c.isNull(4)) null else c.getString(4),
                 calibrationFrom = if (c.isNull(5)) null else c.getLong(5),
                 calibrationTo = if (c.isNull(6)) null else c.getLong(6),
-                modelVersion = if (c.isNull(7)) null else c.getString(7)
+                modelVersion = if (c.isNull(7)) null else c.getString(7),
+                sigmaC = if (c.isNull(8)) null else c.getDouble(8),
+                analogCount = if (c.isNull(9)) null else c.getInt(9)
             )
         }
     }
@@ -109,6 +128,22 @@ object PointSourceStore {
             "sensor_id=? AND timestamp=?",
             arrayOf(sensorId.toString(), timestamp.toString())
         )
+        // Une vraie mesure change l'état connu : tout forecast situé après elle
+        // appartient désormais à un ancien état du monde et doit disparaître.
+        invalidateForecastsAfterMeasured(db, sensorId, timestamp)
+    }
+
+    private fun invalidateForecastsAfterMeasured(db: FabDataDb, sensorId: Long, timestamp: Long) {
+        ensure(db.writableDatabase)
+        val future = mutableListOf<Long>()
+        db.readableDatabase.rawQuery(
+            "SELECT timestamp FROM point_sources WHERE sensor_id=? AND source='forecast' AND timestamp>?",
+            arrayOf(sensorId.toString(), timestamp.toString())
+        ).use { c -> while (c.moveToNext()) future += c.getLong(0) }
+        future.forEach { ts ->
+            db.writableDatabase.delete("samples", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
+            db.writableDatabase.delete("point_sources", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
+        }
     }
 
     fun setProvenance(
@@ -127,6 +162,8 @@ object PointSourceStore {
             put("timestamp", timestamp)
             put("source", provenance.source.dbValue)
             provenance.confidence?.let { put("confidence", it.coerceIn(0.0, 1.0)) }
+            provenance.sigmaC?.let { put("sigma_c", it.coerceIn(0.0, 20.0)) }
+            provenance.analogCount?.let { put("analog_count", it.coerceAtLeast(0)) }
             provenance.referenceKey?.let { put("reference_key", it) }
             provenance.referenceStationId?.let { put("reference_station_id", it) }
             provenance.referenceCity?.let { put("reference_city", it) }
@@ -226,6 +263,17 @@ object PointSourceStore {
                     arrayOf(sensorId.toString(), ts.toString())
                 )
             }
+        }
+    }
+
+    fun reconstructedBounds(db: FabDataDb, sensorId: Long): LongRange? {
+        ensure(db.readableDatabase)
+        db.readableDatabase.rawQuery(
+            "SELECT MIN(timestamp), MAX(timestamp) FROM point_sources WHERE sensor_id=? AND source='reconstructed'",
+            arrayOf(sensorId.toString())
+        ).use { c ->
+            if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
+            return c.getLong(0)..c.getLong(1)
         }
     }
 

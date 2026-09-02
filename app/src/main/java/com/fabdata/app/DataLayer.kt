@@ -35,7 +35,9 @@ data class SamplePoint(
     val temperature: Double,
     val humidity: Double,
     val source: PointSource = PointSource.MEASURED,
-    val confidence: Double? = null
+    val confidence: Double? = null,
+    val uncertaintyC: Double? = null,
+    val analogCount: Int? = null
 )
 
 data class AnnotationItem(
@@ -354,7 +356,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         PointSourceStore.ensure(readableDatabase)
         readableDatabase.rawQuery(
             """
-            SELECT p.timestamp, p.temperature, p.humidity, ps.source, ps.confidence
+            SELECT p.timestamp, p.temperature, p.humidity, ps.source, ps.confidence, ps.sigma_c, ps.analog_count
             FROM samples p
             LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
             WHERE p.sensor_id = ? AND p.timestamp BETWEEN ? AND ?
@@ -366,7 +368,9 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
                 all += SamplePoint(
                     sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2),
                     PointSource.fromDb(if (c.isNull(3)) null else c.getString(3)),
-                    if (c.isNull(4)) null else c.getDouble(4)
+                    if (c.isNull(4)) null else c.getDouble(4),
+                    if (c.isNull(5)) null else c.getDouble(5),
+                    if (c.isNull(6)) null else c.getInt(6)
                 )
             }
         }

@@ -1691,7 +1691,11 @@ private fun InteractiveChart(
             .filter { showTemp[it.id] == true }
             .flatMap { sampleMap[it.id].orEmpty() }
             .filter { it.timestamp in visibleFrom..visibleTo }
-            .map { it.temperature }
+            .flatMap { p ->
+                if (p.source == PointSource.FORECAST && p.uncertaintyC != null) {
+                    listOf(p.temperature, p.temperature + p.uncertaintyC, p.temperature - p.uncertaintyC)
+                } else listOf(p.temperature)
+            }
 
         val humidityValues = sensors
             .filter { showHumidity[it.id] == true }
@@ -1814,6 +1818,28 @@ private fun InteractiveChart(
                     points.forEach { p ->
                         val alpha = when (p.source) { PointSource.MEASURED -> 1f; PointSource.RECONSTRUCTED -> 0.78f; PointSource.FORECAST -> 0.60f }
                         drawCircle(color.copy(alpha = color.alpha * alpha), 2.2.dp.toPx(), Offset(mapX(p.timestamp), mapTemp(p.temperature)))
+                    }
+                }
+
+                // Nuage d'incertitude : +σ, -σ, +σ... Les marqueurs deviennent
+                // volontairement plus rares quand l'horizon s'éloigne.
+                val forecastCloud = points.filter { it.source == PointSource.FORECAST && it.uncertaintyC != null }
+                forecastCloud.forEachIndexed { index, p ->
+                    val horizon = index + 1
+                    val stride = when {
+                        horizon <= 6 -> 1
+                        horizon <= 12 -> 2
+                        else -> 3
+                    }
+                    if ((horizon - 1) % stride == 0) {
+                        val sigma = p.uncertaintyC!!.coerceIn(0.0, 8.0)
+                        val cloudValue = p.temperature + if (index % 2 == 0) sigma else -sigma
+                        val confidenceAlpha = ((p.confidence ?: 0.35) * 0.72).toFloat().coerceIn(0.16f, 0.58f)
+                        drawCircle(
+                            color.copy(alpha = color.alpha * confidenceAlpha),
+                            (2.1f + min(1.8, sigma).toFloat()).dp.toPx(),
+                            Offset(mapX(p.timestamp), mapTemp(cloudValue))
+                        )
                     }
                 }
             }
@@ -1968,6 +1994,16 @@ private fun InspectorCard(
                             Modifier.width(72.dp)
                         )
                     }
+                }
+                if (point?.source == PointSource.FORECAST) {
+                    val sigmaText = point.uncertaintyC?.let { "σ ${String.format(Locale.FRANCE, "%.2f", it)} °C" } ?: "σ —"
+                    val confidenceText = point.confidence?.let { "confiance ${(it * 100).toInt()} %" } ?: "confiance —"
+                    val analogText = point.analogCount?.let { "$it analogues historiques" } ?: "analogues insuffisants"
+                    Text(
+                        "Prévision · $sigmaText · $confidenceText · $analogText",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
         }

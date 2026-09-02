@@ -15,6 +15,12 @@ enum class ThermalExposure(val label: String) {
     HIGH("Forte")
 }
 
+enum class ForecastHorizonMode(val label: String, val maxHours: Int) {
+    H3("3 h", 3),
+    H6("6 h", 6),
+    AUTO("Auto", 24)
+}
+
 data class ThermalBuildingProfile(
     val surfaceM2: Double = 70.0,
     val floor: Int = 4,
@@ -137,6 +143,14 @@ class ThermalProfileStore(context: Context) {
                 }
             }
             .apply()
+    }
+
+    fun forecastMode(): ForecastHorizonMode = runCatching {
+        ForecastHorizonMode.valueOf(prefs.getString("forecast_mode", ForecastHorizonMode.AUTO.name)!!)
+    }.getOrDefault(ForecastHorizonMode.AUTO)
+
+    fun saveForecastMode(mode: ForecastHorizonMode) {
+        prefs.edit().putString("forecast_mode", mode.name).apply()
     }
 
     fun reset(): ThermalBuildingProfile = ThermalBuildingProfile().also(::save)

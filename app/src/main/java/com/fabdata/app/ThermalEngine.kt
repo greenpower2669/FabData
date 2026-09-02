@@ -79,7 +79,10 @@ data class ThermalWriteSummary(
     val skippedSensors: Int,
     val raccords: Int = 0,
     val maxRaccordDrift: Double = 0.0,
-    val diagnostic: String? = null
+    val diagnostic: String? = null,
+    val forecastHorizonHours: Int = 0,
+    val maxForecastSigma: Double = 0.0,
+    val analogCount: Int = 0
 )
 
 private data class ForwardFillSummary(
@@ -106,6 +109,12 @@ private data class TrainingRow(
     val hourOfDay: Int,
     val features: DoubleArray,
     val delta: Double
+)
+
+private data class ForecastAnalogStats(
+    val meanDelta: Double? = null,
+    val sigma: Double? = null,
+    val count: Int = 0
 )
 
 /**
@@ -294,23 +303,78 @@ class ThermalEngine(
         return ThermalWriteSummary(total, 0, skipped, raccords, maxDrift, diagnostic)
     }
 
-    /** Prévision courte automatique H+6, toujours recalculée depuis la dernière vraie mesure. */
-    fun refreshForecasts(reference: WeatherReference, sensorId: Long? = null, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalWriteSummary {
+    /**
+     * Une nouvelle vraie mesure invalide déjà les forecasts via PointSourceStore.
+     * Si la sonde possédait un historique reconstruit consentie auparavant, on le
+     * recalcule avec le modèle enrichi sans toucher aux points MEASURED.
+     */
+    fun refreshExistingReconstructions(
+        reference: WeatherReference,
+        profile: ThermalBuildingProfile = ThermalBuildingProfile(),
+        sensorId: Long? = null
+    ): ThermalWriteSummary {
         var total = 0
         var skipped = 0
+        var raccords = 0
+        var maxDrift = 0.0
+        var diagnostic: String? = null
+        physicalSensors().filter { sensorId == null || it.id == sensorId }.forEach { sensor ->
+            val existing = PointSourceStore.reconstructedBounds(db, sensor.id) ?: return@forEach
+            val measured = measuredHourly(sensor.id)
+            val first = measured.firstOrNull() ?: return@forEach
+            if (existing.first < first.timestamp) {
+                val span = (first.timestamp - existing.first).coerceAtLeast(THERMAL_DAY_MS)
+                val days = ((span + THERMAL_DAY_MS - 1L) / THERMAL_DAY_MS).toInt().coerceIn(1, MAX_HISTORY_DAYS)
+                val r = reconstructHistory(reference, days, sensor.id, profile)
+                total += r.reconstructed
+                skipped += r.skippedSensors
+                raccords += r.raccords
+                maxDrift = max(maxDrift, r.maxRaccordDrift)
+                if (diagnostic == null && r.diagnostic != null) diagnostic = r.diagnostic
+            } else {
+                val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
+                if (model == null || !model.acceptable) { skipped++; return@forEach }
+                val r = fillInteriorGapsForward(sensor, model, reference, profile)
+                total += r.created
+                raccords += r.raccords
+                maxDrift = max(maxDrift, r.maxDrift)
+                if (diagnostic == null && r.diagnostic != null) diagnostic = r.diagnostic
+            }
+        }
+        return ThermalWriteSummary(total, 0, skipped, raccords, maxDrift, diagnostic)
+    }
+
+    /**
+     * Prévision adaptative. La courbe centrale reste RC + masse thermique.
+     * L'incertitude combine validation du modèle, météo et dispersion de situations
+     * historiques analogues. En Auto, on peut aller jusqu'à H+24 mais on s'arrête
+     * dès que sigma dépasse 1,5 °C après les trois premières heures.
+     */
+    fun refreshForecasts(
+        reference: WeatherReference,
+        sensorId: Long? = null,
+        profile: ThermalBuildingProfile = ThermalBuildingProfile(),
+        mode: ForecastHorizonMode = ForecastHorizonMode.AUTO
+    ): ThermalWriteSummary {
+        var total = 0
+        var skipped = 0
+        var furthest = 0
+        var maxSigma = 0.0
+        var bestAnalogCount = 0
+
         physicalSensors().filter { sensorId == null || it.id == sensorId }.forEach { sensor ->
             val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
             if (model == null || !model.acceptable) { skipped++; return@forEach }
             val measured = measuredHourly(sensor.id)
             val latest = measured.lastOrNull() ?: run { skipped++; return@forEach }
-            val recent = measured.takeLast(4)
+            val recent = measured.takeLast(5)
             PointSourceStore.deleteForecastsAtOrAfter(db, sensor.id, latest.timestamp + 1L)
 
             val from = latest.timestamp - 18L * THERMAL_HOUR_MS
-            val to = latest.timestamp + 7L * THERMAL_HOUR_MS
+            val to = latest.timestamp + (mode.maxHours + 1L) * THERMAL_HOUR_MS
             val outside = referenceHourly(reference.key, from, to, includeForecast = true)
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
-            if (outside.none { it.source == PointSource.FORECAST }) { skipped++; return@forEach }
+            if (outside.none { it.timestamp > latest.timestamp }) { skipped++; return@forEach }
 
             val slopes = recent.zipWithNext().mapNotNull { (a, b) ->
                 val dt = (b.timestamp - a.timestamp).toDouble() / THERMAL_HOUR_MS.toDouble()
@@ -322,29 +386,107 @@ class ThermalEngine(
             var currentT = latest.temperature
             var currentH = latest.humidity
             var currentMass = estimateCurrentMass(profile, measured, outMap)
-            for (horizon in 1..6) {
+
+            for (horizon in 1..mode.maxHours) {
                 val ts = hourBucket(latest.timestamp) + horizon * THERMAL_HOUR_MS
                 val extTs = ts - model.lagHours * THERMAL_HOUR_MS
-                val tout = outsideAt(outMap, extTs) ?: continue
-                val outHum = outMap[hourBucket(ts)]?.humidity ?: currentH
+                val tout = outsideAt(outMap, extTs) ?: break
+                val weatherPoint = outMap[hourBucket(ts)]
+                val outHum = weatherPoint?.humidity ?: currentH
                 val avg6 = outsideAverage(outMap, extTs, 6) ?: tout
                 val hour = Instant.ofEpochMilli(ts - THERMAL_HOUR_MS).atZone(zone).hour
+
                 val modelDelta = massAwareDelta(model.coefficients, currentT, currentMass, tout, avg6, hour, profile)
                 val momentum = (recentSlope + 0.45 * curvature) * exp(-(horizon - 1).toDouble() / 1.7)
-                val delta = (modelDelta + 0.30 * momentum).coerceIn(-1.2, 1.2)
+                val rawNext = currentT + (modelDelta + 0.30 * momentum).coerceIn(-1.2, 1.2)
+
+                val analog = forecastAnalogs(measured, latest, horizon, recentSlope)
+                val analogueReliability = (analog.count / 12.0).coerceIn(0.0, 1.0)
+                val analogueCoherence = analog.sigma?.let { (1.0 - it / 1.5).coerceIn(0.0, 1.0) } ?: 0.0
+                val analogueWeight = 0.28 * analogueReliability * analogueCoherence
+                val cumulativeRaw = rawNext - latest.temperature
+                val analogueTarget = analog.meanDelta
+                val adjustedNext = if (analogueTarget != null) {
+                    rawNext + analogueWeight * (analogueTarget - cumulativeRaw)
+                } else rawNext
+                val delta = (adjustedNext - currentT).coerceIn(-1.2, 1.2)
+
+                val validationSigma =
+                    model.metrics.rmse * 0.45 * sqrt(horizon.toDouble()) +
+                    model.longHorizonRmse * 0.10 * (horizon.toDouble() / 6.0)
+                val historicalSigma = analog.sigma ?: (validationSigma * 1.25)
+                val mixedSigma = validationSigma * (1.0 - 0.55 * analogueReliability) +
+                    historicalSigma * (0.55 * analogueReliability)
+                val weatherConfidence = weatherPoint?.confidence?.coerceIn(0.20, 1.0) ?: 0.65
+                val weatherSigma = (1.0 - weatherConfidence) * (0.35 + 0.055 * horizon)
+                val sigma = sqrt(mixedSigma * mixedSigma + weatherSigma * weatherSigma).coerceIn(0.08, 3.0)
+
+                // Trois heures minimum pour un modèle validé ; ensuite arrêt honnête si l'incertitude explose.
+                if (horizon > 3 && sigma > 1.50) break
+
                 val nextMass = advanceMass(profile, currentT, currentMass, avg6)
                 currentT += delta
                 currentMass = nextMass
                 currentH += 0.08 * (outHum - currentH)
-                val confidence = (model.confidence * (1.0 - 0.085 * horizon)).coerceIn(0.20, model.confidence)
+                val confidence = (
+                    model.confidence * exp(-sigma / 1.45) * (0.72 + 0.28 * weatherConfidence)
+                ).coerceIn(0.08, model.confidence)
+
                 val result = PointSourceStore.upsertByPriority(
                     db, sensor.id, ts, round2(currentT), round2(currentH.coerceIn(0.0, 100.0)),
-                    provenance(model, reference, PointSource.FORECAST, confidence)
+                    provenance(model, reference, PointSource.FORECAST, confidence, sigma, analog.count)
                 )
                 if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) total++
+                furthest = max(furthest, horizon)
+                maxSigma = max(maxSigma, sigma)
+                bestAnalogCount = max(bestAnalogCount, analog.count)
             }
         }
-        return ThermalWriteSummary(0, total, skipped)
+        return ThermalWriteSummary(
+            reconstructed = 0,
+            forecast = total,
+            skippedSensors = skipped,
+            forecastHorizonHours = furthest,
+            maxForecastSigma = maxSigma,
+            analogCount = bestAnalogCount
+        )
+    }
+
+    private fun forecastAnalogs(
+        measured: List<HourPoint>,
+        latest: HourPoint,
+        horizon: Int,
+        currentSlope: Double
+    ): ForecastAnalogStats {
+        if (measured.size < 24) return ForecastAnalogStats()
+        val byHour = measured.associateBy { hourBucket(it.timestamp) }
+        val latestBucket = hourBucket(latest.timestamp)
+        val latestHour = Instant.ofEpochMilli(latest.timestamp).atZone(zone).hour
+        val candidates = mutableListOf<Pair<Double, Double>>()
+
+        measured.forEach { candidate ->
+            val ts = hourBucket(candidate.timestamp)
+            // Garde une vraie séparation entre l'état actuel et les analogues d'apprentissage.
+            if (ts >= latestBucket - (horizon + 12L) * THERMAL_HOUR_MS) return@forEach
+            val previous = byHour[ts - THERMAL_HOUR_MS] ?: return@forEach
+            val future = byHour[ts + horizon * THERMAL_HOUR_MS] ?: return@forEach
+            val candidateSlope = candidate.temperature - previous.temperature
+            val candidateHour = Instant.ofEpochMilli(candidate.timestamp).atZone(zone).hour
+            val rawHourDiff = abs(candidateHour - latestHour)
+            val hourDiff = min(rawHourDiff, 24 - rawHourDiff)
+
+            val score =
+                abs(candidate.temperature - latest.temperature) / 1.20 +
+                abs(candidateSlope - currentSlope) / 0.45 +
+                hourDiff / 6.0
+            if (score <= 3.2) candidates += score to (future.temperature - candidate.temperature)
+        }
+
+        val chosen = candidates.sortedBy { it.first }.take(16).map { it.second }
+        if (chosen.size < 3) return ForecastAnalogStats(count = chosen.size)
+        val mean = chosen.average()
+        val variance = chosen.sumOf { (it - mean) * (it - mean) } / chosen.size.toDouble()
+        return ForecastAnalogStats(mean, sqrt(variance).coerceAtLeast(0.03), chosen.size)
     }
 
     private fun reconstructBeforeFirst(
@@ -687,7 +829,14 @@ class ThermalEngine(
         return coverage >= 0.90 && maxGapHours <= 3
     }
 
-    private fun provenance(model: ThermalModel, reference: WeatherReference, source: PointSource, confidence: Double) = PointProvenance(
+    private fun provenance(
+        model: ThermalModel,
+        reference: WeatherReference,
+        source: PointSource,
+        confidence: Double,
+        sigmaC: Double? = null,
+        analogCount: Int? = null
+    ) = PointProvenance(
         source = source,
         confidence = confidence,
         referenceKey = reference.key,
@@ -695,7 +844,9 @@ class ThermalEngine(
         referenceCity = reference.city,
         calibrationFrom = model.calibrationFrom,
         calibrationTo = model.calibrationTo,
-        modelVersion = PointSourceStore.MODEL_VERSION
+        modelVersion = PointSourceStore.MODEL_VERSION,
+        sigmaC = sigmaC,
+        analogCount = analogCount
     )
 
     private fun buildTrainingRows(

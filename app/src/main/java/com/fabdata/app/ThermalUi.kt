@@ -53,6 +53,7 @@ fun ThermalReferenceCard(
     val engine = remember { ThermalEngine(db, manager.store()) }
     val profileStore = remember { ThermalProfileStore(context) }
     var profile by remember { mutableStateOf(profileStore.load()) }
+    var forecastMode by remember { mutableStateOf(profileStore.forecastMode()) }
     val scope = rememberCoroutineScope()
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
@@ -77,12 +78,18 @@ fun ThermalReferenceCard(
                 val bounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
                     ?: error("Aucune donnée intérieure")
                 val from = if (allHistory) bounds.first - 90L * 24L * 60L * 60L * 1000L else bounds.first - 18L * 60L * 60L * 1000L
-                val to = maxOf(bounds.last, System.currentTimeMillis() + 7L * 60L * 60L * 1000L)
+                val to = maxOf(bounds.last, System.currentTimeMillis() + (forecastMode.maxHours + 2L) * 60L * 60L * 1000L)
                 val sync = if (allHistory) manager.refreshSelected(reference, from, to)
                     else manager.ensureLocalCache(reference, from, to)
                 val thermalStatus = engine.status(reference, selectedSensorId, profile)
+                val activeSensor = selectedSensorId ?: thermalStatus.preferred?.sensor?.id
+                if (thermalStatus.sensors.any { it.model?.acceptable == true }) {
+                    // Si un historique calculé existait déjà, une nouvelle mesure réelle
+                    // l'enrichit automatiquement sans jamais modifier les points MEASURED.
+                    engine.refreshExistingReconstructions(reference, profile, activeSensor)
+                }
                 val forecast = if (thermalStatus.sensors.any { it.model?.acceptable == true }) {
-                    engine.refreshForecasts(reference, selectedSensorId ?: thermalStatus.preferred?.sensor?.id, profile)
+                    engine.refreshForecasts(reference, activeSensor, profile, forecastMode)
                 } else ThermalWriteSummary(0, 0, 0)
                 Triple(sync, thermalStatus, forecast)
             }
@@ -93,22 +100,26 @@ fun ThermalReferenceCard(
                 if (selectedSensorId == null || thermalStatus.sensors.none { it.sensor.id == selectedSensorId }) {
                     selectedSensorId = thermalStatus.preferred?.sensor?.id
                 }
-                info = "${sync.label} · ${sync.measured} réel(s) · ${sync.reconstructed} reconstruit(s) · H+6 ${forecast.forecast} point(s)"
+                val horizon = forecast.forecastHorizonHours.takeIf { it > 0 }?.let { "H+$it" } ?: "—"
+                val sigma = forecast.maxForecastSigma.takeIf { it > 0.0 }?.let { " · σ max ${fmt(it)} °C" }.orEmpty()
+                val analogues = forecast.analogCount.takeIf { it > 0 }?.let { " · $it analogues" }.orEmpty()
+                info = "${sync.label} · ${sync.measured} réel(s) · ${sync.reconstructed} reconstruit(s) · prévision $horizon ${forecast.forecast} point(s)$sigma$analogues"
                 if (triggerChartReload) {
                     suppressNextAuto = true
                     onDataChanged()
                 }
             },
             onFailure = { error ->
-                status = runCatching { engine.status(reference, selectedSensorId) }.getOrNull()
+                status = runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull()
                 info = error.message ?: "Référence météo indisponible"
             }
         )
         busy = false
     }
 
-    // Prévision H+6 automatique après changement de données/référence.
-    LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile) {
+    // Toute nouvelle vraie donnée invalide d'abord l'ancien futur, puis ce cycle
+    // recalcule historique calculé existant + nouvelle prévision depuis l'état réel.
+    LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile, forecastMode) {
         if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
@@ -230,6 +241,29 @@ fun ThermalReferenceCard(
                     OutlinedButton(onClick = { profileDialog = true }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
                         Text("Ajuster le profil")
                     }
+                }
+            }
+
+            Card(shape = RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                    Text("Prévision adaptative", fontWeight = FontWeight.SemiBold)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        ForecastHorizonMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = forecastMode == mode,
+                                onClick = {
+                                    forecastMode = mode
+                                    profileStore.saveForecastMode(mode)
+                                },
+                                label = { Text(mode.label) }
+                            )
+                        }
+                    }
+                    Text(
+                        "Auto peut prolonger jusqu'à H+24. Les points d'incertitude s'espacent avec l'horizon et la prévision s'arrête après H+3 si σ dépasse 1,5 °C. Une nouvelle mesure réelle efface immédiatement l'ancien futur puis le recalcule.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
