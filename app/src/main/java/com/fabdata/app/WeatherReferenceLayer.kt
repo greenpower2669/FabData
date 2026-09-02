@@ -140,6 +140,16 @@ class WeatherReferenceStore(private val db: FabDataDb) {
         }
     }
 
+    fun historyBounds(referenceKey: String): LongRange? {
+        db.readableDatabase.rawQuery(
+            "SELECT MIN(timestamp), MAX(timestamp) FROM weather_reference_samples WHERE reference_key=? AND source<>'forecast'",
+            arrayOf(referenceKey)
+        ).use { c ->
+            if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
+            return c.getLong(0)..c.getLong(1)
+        }
+    }
+
     fun clear(referenceKey: String) {
         db.writableDatabase.delete("weather_reference_samples", "reference_key=?", arrayOf(referenceKey))
     }
@@ -150,6 +160,25 @@ data class WeatherReferenceSyncResult(
     val reconstructed: Int,
     val forecast: Int,
     val label: String
+)
+
+data class WeatherReferenceCoverage(
+    val from: Long,
+    val to: Long,
+    val expectedHours: Int,
+    val presentHours: Int,
+    val measuredHours: Int,
+    val reconstructedHours: Int,
+    val coverage: Double,
+    val maxGapHours: Int
+) {
+    val ready: Boolean get() = coverage >= 0.90 && maxGapHours <= 3
+}
+
+data class WeatherReferencePreparation(
+    val sync: WeatherReferenceSyncResult,
+    val coverage: WeatherReferenceCoverage,
+    val days: Int
 )
 
 class WeatherReferenceManager(
@@ -165,47 +194,104 @@ class WeatherReferenceManager(
     fun store(): WeatherReferenceStore = store
 
     /**
-     * Recharge uniquement la station sélectionnée. Lyon réutilise les mécanismes déjà
-     * validés ; les autres références utilisent l'API officielle Météo-France si un
-     * token est disponible. La prévision extérieure H+6 est chargée séparément.
+     * Recharge uniquement la station sélectionnée.
+     * v0.10.3 : weather_reference_samples EST la série de référence visible ET celle du RC.
+     * Les observations officielles gardent la priorité ; Open-Meteo historique sert
+     * seulement de reconstruction de secours pour obtenir une entrée longue/continue.
      */
     fun refreshSelected(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
         store.keepOnly(reference.key)
-        var measured = 0
-        var reconstructed = 0
+
+        // Filet de sécurité historique public/modelisé. Ne peut jamais écraser measured.
+        runCatching { fetchOpenMeteoHistory(reference, from, to) }
+            .getOrDefault(emptyList())
+            .forEach { store.upsert(reference.key, it) }
 
         if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
             val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
-            val fallback = db.querySamples(sensor.id, from, to, maxPoints = 30_000)
-            fallback.forEach { p ->
+            db.querySamples(sensor.id, from, to, maxPoints = 30_000).forEach { p ->
                 val source = PointSourceStore.sourceFor(db, sensor.id, p.timestamp)
                 store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, source))
-                if (source == PointSource.MEASURED) measured++ else reconstructed++
             }
+
+            // Si un token existe, l'horaire officiel étend Lyon au-delà du seed embarqué.
+            if (credentials.hasCredential()) {
+                runCatching { fetchOfficialHourly(reference, from, to) }
+                    .getOrDefault(emptyList())
+                    .forEach { store.upsert(reference.key, it) }
+            }
+
             lyonLab.queryOfficial(LyonSeriesKind.HOURLY, from, to).forEach { p ->
                 store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.MEASURED))
-                measured++
             }
             lyonLab.queryOfficial(LyonSeriesKind.SIX_MIN, from, to).forEach { p ->
                 store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.MEASURED))
-                measured++
             }
-            val recon = lyonLab.reconstruct(from, to).points
-            recon.forEach { p ->
+            lyonLab.reconstruct(from, to).points.forEach { p ->
                 store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.RECONSTRUCTED, 0.72))
             }
-            reconstructed += recon.size
         } else {
-            if (!credentials.hasCredential()) {
-                error("Une clé/token Météo-France est nécessaire pour charger les observations de ${reference.label}")
+            if (credentials.hasCredential()) {
+                runCatching { fetchOfficialHourly(reference, from, to) }
+                    .getOrDefault(emptyList())
+                    .forEach { store.upsert(reference.key, it) }
             }
-            val official = fetchOfficialHourly(reference, from, to)
-            official.forEach { store.upsert(reference.key, it); measured++ }
-            reconstructed += reconstructShortGaps(reference.key, from, to)
+            reconstructShortGaps(reference.key, from, to)
         }
 
-        val forecast = refreshForecast(reference)
-        return WeatherReferenceSyncResult(measured, reconstructed, forecast, reference.label)
+        val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
+        val actual = store.query(reference.key, from, minOf(to, System.currentTimeMillis()))
+        return WeatherReferenceSyncResult(
+            measured = actual.count { it.source == PointSource.MEASURED },
+            reconstructed = actual.count { it.source == PointSource.RECONSTRUCTED },
+            forecast = forecast,
+            label = reference.label
+        )
+    }
+
+    /**
+     * Prépare explicitement 30/60/90 jours AVANT la première vraie mesure intérieure.
+     * 18 h supplémentaires sont chargées en amont : retard RC max 12 h + moyenne 6 h.
+     */
+    fun prepareHistory(reference: WeatherReference, requestedDays: Int): WeatherReferencePreparation {
+        val days = requestedDays.coerceIn(1, 90)
+        val indoor = db.physicalMeasuredBounds() ?: db.physicalSensorBounds() ?: db.globalTimeBounds()
+            ?: error("Aucune donnée intérieure")
+        val coreFrom = indoor.first - days.toLong() * 24L * hourMs
+        val loadFrom = coreFrom - 18L * hourMs
+        val loadTo = maxOf(indoor.last, System.currentTimeMillis() + 7L * hourMs)
+        val sync = refreshSelected(reference, loadFrom, loadTo)
+        val coverage = coverage(reference.key, loadFrom, indoor.first)
+        return WeatherReferencePreparation(sync, coverage, days)
+    }
+
+    fun coverage(referenceKey: String, from: Long, to: Long): WeatherReferenceCoverage {
+        val start = roundHour(from)
+        val end = roundHour(to)
+        if (end < start) return WeatherReferenceCoverage(from, to, 0, 0, 0, 0, 0.0, Int.MAX_VALUE)
+        val points = store.query(referenceKey, from, to).filter { it.source != PointSource.FORECAST }
+        val byHour = points.groupBy { roundHour(it.timestamp) }
+            .filterKeys { it in start..end }
+        val expected = (((end - start) / hourMs) + 1L).toInt().coerceAtLeast(1)
+        val buckets = byHour.keys.sorted()
+        val measured = byHour.values.count { values -> values.any { it.source == PointSource.MEASURED } }
+        val reconstructed = byHour.values.count { values -> values.none { it.source == PointSource.MEASURED } }
+        val coverage = byHour.size.toDouble() / expected.toDouble()
+        val leading = buckets.firstOrNull()?.let { ((it - start) / hourMs).toInt().coerceAtLeast(0) } ?: expected
+        val trailing = buckets.lastOrNull()?.let { ((end - it) / hourMs).toInt().coerceAtLeast(0) } ?: expected
+        val internal = buckets.zipWithNext().maxOfOrNull { (a, b) ->
+            (((b - a) / hourMs).toInt() - 1).coerceAtLeast(0)
+        } ?: 0
+        return WeatherReferenceCoverage(
+            from = start,
+            to = end,
+            expectedHours = expected,
+            presentHours = byHour.size,
+            measuredHours = measured,
+            reconstructedHours = reconstructed,
+            coverage = coverage,
+            maxGapHours = maxOf(leading, trailing, internal)
+        )
     }
 
     /** Rafraîchit seulement H+6 sans retélécharger l'historique. */
@@ -289,6 +375,58 @@ class WeatherReferenceManager(
             }
         }
         return created
+    }
+
+    private fun fetchOpenMeteoHistory(
+        reference: WeatherReference,
+        from: Long,
+        to: Long
+    ): List<WeatherReferencePoint> {
+        val historyTo = minOf(to, System.currentTimeMillis() - hourMs)
+        if (historyTo <= from) return emptyList()
+        val startDate = Instant.ofEpochMilli(from).atZone(zone).toLocalDate()
+        val endDate = Instant.ofEpochMilli(historyTo).atZone(zone).toLocalDate()
+        if (startDate.isAfter(endDate)) return emptyList()
+        val url = "https://archive-api.open-meteo.com/v1/archive" +
+            "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
+            "&start_date=$startDate&end_date=$endDate" +
+            "&hourly=temperature_2m%2Crelative_humidity_2m&timezone=Europe%2FParis"
+        val raw = httpGetAnonymous(url)
+        val hourly = JSONObject(raw).getJSONObject("hourly")
+        val times = hourly.getJSONArray("time")
+        val temps = hourly.getJSONArray("temperature_2m")
+        val hums = hourly.getJSONArray("relative_humidity_2m")
+        val out = mutableListOf<WeatherReferencePoint>()
+        for (i in 0 until minOf(times.length(), temps.length(), hums.length())) {
+            val time = times.optString(i)
+            val temp = temps.optDouble(i, Double.NaN)
+            val hum = hums.optDouble(i, Double.NaN)
+            if (!temp.isFinite() || !hum.isFinite()) continue
+            val ts = runCatching {
+                LocalDateTime.parse(time).atZone(zone).toInstant().toEpochMilli()
+            }.getOrNull() ?: continue
+            if (ts !in from..historyTo || temp !in -60.0..65.0 || hum !in 0.0..100.0) continue
+            out += WeatherReferencePoint(ts, temp, hum, PointSource.RECONSTRUCTED, 0.68)
+        }
+        return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
+    }
+
+    private fun httpGetAnonymous(url: String): String {
+        val c = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "FabData/0.10.3 Android")
+            setRequestProperty("Accept", "application/json")
+        }
+        return try {
+            val code = c.responseCode
+            if (code !in 200..299) error("Historique météo HTTP $code")
+            c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } finally {
+            c.disconnect()
+        }
     }
 
     private fun fetchOfficialHourly(reference: WeatherReference, from: Long, to: Long): List<WeatherReferencePoint> {

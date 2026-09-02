@@ -312,6 +312,25 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         }
     }
 
+    /** Bornes des seules vraies mesures intérieures (pas reconstruit/forecast). */
+    fun physicalMeasuredBounds(): LongRange? {
+        PointSourceStore.ensure(readableDatabase)
+        readableDatabase.rawQuery(
+            """
+            SELECT MIN(p.timestamp), MAX(p.timestamp)
+            FROM samples p
+            JOIN sensors s ON s.id = p.sensor_id
+            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+            WHERE s.stable_key NOT LIKE 'meteo-%'
+              AND s.stable_key NOT LIKE 'http-get-%'
+              AND (ps.source IS NULL OR ps.source='measured')
+            """.trimIndent(), null
+        ).use { c ->
+            if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
+            return c.getLong(0)..c.getLong(1)
+        }
+    }
+
     fun existingSampleTimestamps(sensorId: Long, from: Long, to: Long): Set<Long> {
         val out = linkedSetOf<Long>()
         readableDatabase.rawQuery(

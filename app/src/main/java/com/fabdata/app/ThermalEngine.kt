@@ -260,9 +260,12 @@ class ThermalEngine(
                 if (diagnostic == null) diagnostic = "Référence ${reference.city} insuffisante sur la période demandée."
                 return@forEach
             }
-            if (!referenceCoverageReady(outside, startAt, first.timestamp)) {
+            // v0.10.3 : la première heure du RC consomme déjà Tout(t-lag) et sa moyenne 6 h.
+            // La couverture doit donc être valide AVANT startAt, pas seulement à partir de startAt.
+            val requiredReferenceStart = startAt - (model.lagHours + 5L) * THERMAL_HOUR_MS
+            if (!referenceCoverageReady(outside, requiredReferenceStart, first.timestamp)) {
                 skipped++
-                if (diagnostic == null) diagnostic = "Référence ${reference.city} encore trop trouée avant la première mesure intérieure."
+                if (diagnostic == null) diagnostic = "Référence ${reference.city} encore trop trouée avec la marge de retard du modèle."
                 return@forEach
             }
             val outMap = outside.associateBy { hourBucket(it.timestamp) }

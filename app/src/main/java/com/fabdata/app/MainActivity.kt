@@ -423,7 +423,15 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
             // Les thermomètres physiques/importés définissent la période de navigation.
             // Lyon et les sondes HTTP complètent cette période sans pousser l'ancien hors écran.
-            val all = db.physicalSensorBounds() ?: db.globalTimeBounds()
+            val physicalBounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
+            val selectedWeatherReference = WeatherReferenceCatalog.byKey(WeatherReferencePrefs(context).selectedKey())
+            val weatherReferenceStore = WeatherReferenceStore(db)
+            val weatherBounds = weatherReferenceStore.historyBounds(selectedWeatherReference.key)
+            val all = when {
+                physicalBounds == null -> weatherBounds
+                weatherBounds == null -> physicalBounds
+                else -> minOf(physicalBounds.first, weatherBounds.first)..maxOf(physicalBounds.last, weatherBounds.last)
+            }
             val chosen = all?.let { bounds ->
                 val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
                 val requested = minOf(preset.spanMs, fullSpan)
@@ -471,8 +479,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     sensor.id to value
                 }
-                val lyonReconstructed = lyonLab.reconstruct(chosen.first, chosen.last).points.map {
-                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, PointSource.RECONSTRUCTED, 0.72)
+                // v0.10.3 : cette couche EST la série météo effectivement consommée par le RC.
+                val lyonReconstructed = weatherReferenceStore.query(
+                    selectedWeatherReference.key, chosen.first, chosen.last
+                ).filter { it.source != PointSource.FORECAST }.map {
+                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, it.source, it.confidence)
                 }
                 val overview = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
@@ -484,6 +495,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     sensor.id to value
                 }
+                val overviewReference = weatherReferenceStore.query(
+                    selectedWeatherReference.key, all.first, all.last
+                ).filter { it.source != PointSource.FORECAST }.map {
+                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, it.source, it.confidence)
+                }
+                val overviewWithReference = overview + (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference)
                 val stat = s.mapNotNull { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         sensorStatsFromSamples(sensor.id, samples[sensor.id].orEmpty())
@@ -493,7 +510,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     value?.let { sensor.id to it }
                 }.toMap()
                 LoadedData(
-                    s, all, chosen, samples, overview, stat,
+                    s, all, chosen, samples, overviewWithReference, stat,
                     db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed
                 )
             }
@@ -533,11 +550,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         busy = false
     }
 
+    val visualReference = WeatherReferenceCatalog.byKey(WeatherReferencePrefs(context).selectedKey())
     val lyonReconstructedSensor = Sensor(
         id = LYON_RECONSTRUCTED_SENSOR_ID,
         stableKey = LYON_RECONSTRUCTED_STABLE_KEY,
-        name = "Lyon reconstruit",
-        room = "Lyon reconstruit",
+        name = "${visualReference.city} reconstruit",
+        room = "${visualReference.city} reconstruit",
         colorIndex = 3,
         latestTimestamp = lyonReconstructedSamples.lastOrNull()?.timestamp
     )
@@ -712,7 +730,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item {
                     HistoryOverviewCard(
-                        sensors = sensors,
+                        sensors = chartSensors,
                         sampleMap = overviewSampleMap,
                         historyBounds = globalBounds,
                         viewBounds = viewBounds,

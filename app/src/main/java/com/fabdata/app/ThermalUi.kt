@@ -55,6 +55,8 @@ fun ThermalReferenceCard(
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<ThermalStatus?>(null) }
     var info by remember { mutableStateOf("Référence prête à être chargée") }
+    var weatherHistoryDialog by remember { mutableStateOf(false) }
+    var weatherHistoryDays by remember { mutableIntStateOf(30) }
     var historyDialog by remember { mutableStateOf(false) }
     var historyDays by remember { mutableIntStateOf(30) }
     var suppressNextAuto by remember { mutableStateOf(false) }
@@ -84,7 +86,7 @@ fun ThermalReferenceCard(
                     selectedSensorId = thermalStatus.preferred?.sensor?.id
                 }
                 info = "${sync.label} · ${sync.measured} réel(s) · ${sync.reconstructed} reconstruit(s) · H+6 ${forecast.forecast} point(s)"
-                if (triggerChartReload && forecast.forecast > 0) {
+                if (triggerChartReload) {
                     suppressNextAuto = true
                     onDataChanged()
                 }
@@ -207,6 +209,12 @@ fun ThermalReferenceCard(
                 Text(s.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
+            OutlinedButton(
+                onClick = { weatherHistoryDialog = true },
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Étendre historique météo") }
+
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { scope.launch { refresh(allHistory = true, triggerChartReload = true) } },
@@ -226,6 +234,49 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+
+    if (weatherHistoryDialog) {
+        AlertDialog(
+            onDismissRequest = { weatherHistoryDialog = false },
+            title = { Text("Étendre la référence météo ?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("FabData va préparer ${reference.label} avant le modèle thermique. La courbe affichée sera exactement la série donnée au moteur RC.")
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(30, 60, 90).forEach { d ->
+                            AssistChip(
+                                onClick = { weatherHistoryDays = d },
+                                label = { Text("$d jours") }
+                            )
+                        }
+                    }
+                    Text("Sélection : $weatherHistoryDays jours avant la première vraie mesure intérieure.", style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    weatherHistoryDialog = false
+                    scope.launch {
+                        busy = true
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching { manager.prepareHistory(reference, weatherHistoryDays) }
+                        }
+                        busy = false
+                        result.fold(
+                            onSuccess = { prepared ->
+                                val c = prepared.coverage
+                                info = "${prepared.sync.label} · historique ${prepared.days} j · couverture ${(c.coverage * 100).toInt()} % · trou max ${c.maxGapHours} h · ${c.measuredHours} h réelles · ${c.reconstructedHours} h reconstruites"
+                                suppressNextAuto = true
+                                onDataChanged()
+                            },
+                            onFailure = { info = it.message ?: "Extension météo impossible" }
+                        )
+                    }
+                }) { Text("Étendre") }
+            },
+            dismissButton = { TextButton(onClick = { weatherHistoryDialog = false }) { Text("Annuler") } }
+        )
     }
 
     if (historyDialog) {
@@ -254,13 +305,11 @@ fun ThermalReferenceCard(
                         busy = true
                         val result = withContext(Dispatchers.IO) {
                             runCatching {
-                                // Ordre strict : construire d'abord la référence extérieure complète,
-                                // puis seulement lancer le modèle intérieur dans le sens du temps.
-                                val bounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
-                                    ?: error("Aucune donnée intérieure")
-                                val from = bounds.first - historyDays.toLong() * 24L * 60L * 60L * 1000L - 18L * 60L * 60L * 1000L
-                                val to = maxOf(bounds.last, System.currentTimeMillis() + 7L * 60L * 60L * 1000L)
-                                manager.refreshSelected(reference, from, to)
+                                // Ordre strict v0.10.3 : la référence visible/RC est préparée AVANT tout.
+                                val prepared = manager.prepareHistory(reference, historyDays)
+                                if (!prepared.coverage.ready) {
+                                    error("${reference.city} incomplet : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
+                                }
                                 val checked = engine.status(reference, selectedSensorId)
                                 if (!checked.canReconstruct) error(checked.message)
                                 engine.reconstructHistory(reference, historyDays, selectedSensorId ?: checked.preferred?.sensor?.id)
