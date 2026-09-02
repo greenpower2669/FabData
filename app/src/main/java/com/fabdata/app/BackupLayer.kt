@@ -51,8 +51,8 @@ fun ImportResult.toFabDataImportSummary() = FabDataImportSummary(
  */
 class FabDataBackup(private val context: Context, private val db: FabDataDb) {
     companion object {
-        const val FORMAT_VERSION = "1"
-        const val HEADER = "FabData_Record,Format_Version,Capteur_ID,Capteur,Piece,Couleur,Temps_Epoch_ms,Temps,Temperature_Celsius,Humidite_relative_Pourcentage,Titre,Note,Type,UpdatedAt_Epoch_ms"
+        const val FORMAT_VERSION = "2"
+        const val HEADER = "FabData_Record,Format_Version,Capteur_ID,Capteur,Piece,Couleur,Temps_Epoch_ms,Temps,Temperature_Celsius,Humidite_relative_Pourcentage,Titre,Note,Type,UpdatedAt_Epoch_ms,Source,Confiance,Reference_Station_ID,Reference_Ville,Calibration_Debut_ms,Calibration_Fin_ms,Model_Version"
     }
 
     private val dateFormatter = DateTimeFormatter.ofPattern("uuuu/MM/dd HH:mm:ss", Locale.ROOT)
@@ -88,7 +88,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                         val fields = splitCsv(line, ',')
                         val record = col(fields, "FabData_Record").trim().uppercase(Locale.ROOT)
                         val formatVersion = col(fields, "Format_Version").trim()
-                        if (formatVersion.isNotBlank() && formatVersion != FORMAT_VERSION) {
+                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", FORMAT_VERSION)) {
                             invalid++
                             return@forEach
                         }
@@ -127,11 +127,21 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                                 } else {
                                     val sensor = db.getOrCreateSensor(stableKey, sensorName)
                                     db.updateSensor(sensor.id, sensorName, room, color)
-                                    if (db.insertSample(sensor.id, timestamp, temperature, humidity)) {
-                                        measurementsAdded++
-                                    } else {
-                                        measurementsDuplicates++
-                                    }
+                                    val source = PointSource.fromDb(col(fields, "Source"))
+                                    val provenance = PointProvenance(
+                                        source = source,
+                                        confidence = parseNumber(col(fields, "Confiance"))?.coerceIn(0.0, 1.0),
+                                        referenceStationId = col(fields, "Reference_Station_ID").trim().ifBlank { null },
+                                        referenceCity = col(fields, "Reference_Ville").trim().ifBlank { null },
+                                        calibrationFrom = col(fields, "Calibration_Debut_ms").trim().toLongOrNull(),
+                                        calibrationTo = col(fields, "Calibration_Fin_ms").trim().toLongOrNull(),
+                                        modelVersion = col(fields, "Model_Version").trim().ifBlank { null }
+                                    )
+                                    val write = PointSourceStore.upsertByPriority(
+                                        db, sensor.id, timestamp, temperature, humidity, provenance
+                                    )
+                                    if (write == PriorityWriteResult.INSERTED || write == PriorityWriteResult.REPLACED) measurementsAdded++
+                                    else measurementsDuplicates++
                                 }
                             }
 
@@ -242,9 +252,12 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
             readableDatabase().rawQuery(
                 """
                 SELECT s.stable_key, s.name, s.room, s.color_index,
-                       p.timestamp, p.temperature, p.humidity
+                       p.timestamp, p.temperature, p.humidity,
+                       ps.source, ps.confidence, ps.reference_station_id, ps.reference_city,
+                       ps.calibration_from, ps.calibration_to, ps.model_version
                 FROM samples p
                 JOIN sensors s ON s.id = p.sensor_id
+                LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
                 ORDER BY p.timestamp, s.id
                 """.trimIndent(),
                 null
@@ -258,7 +271,14 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                             c.getString(0), c.getString(1), c.getString(2), c.getInt(3).toString(),
                             ts.toString(), formatTimestamp(ts),
                             c.getDouble(5).toString(), c.getDouble(6).toString(),
-                            "", "", "", ""
+                            "", "", "", "",
+                            PointSource.fromDb(if (c.isNull(7)) null else c.getString(7)).dbValue,
+                            if (c.isNull(8)) "" else c.getDouble(8).toString(),
+                            if (c.isNull(9)) "" else c.getString(9),
+                            if (c.isNull(10)) "" else c.getString(10),
+                            if (c.isNull(11)) "" else c.getLong(11).toString(),
+                            if (c.isNull(12)) "" else c.getLong(12).toString(),
+                            if (c.isNull(13)) "" else c.getString(13)
                         )
                     )
                     measurementCount++

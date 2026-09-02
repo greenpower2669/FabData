@@ -108,11 +108,25 @@ object LyonEmbeddedHistory {
             values,
             android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE
         )
+        val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+        PointSourceStore.setProvenance(
+            db, sensor.id, timestamp,
+            PointProvenance(
+                source = PointSource.RECONSTRUCTED,
+                confidence = 0.72,
+                referenceKey = WeatherReferenceCatalog.DEFAULT_KEY,
+                referenceStationId = "69029001",
+                referenceCity = "Lyon",
+                modelVersion = "lyon-embedded-2026-07-08"
+            )
+        )
     }
 
     fun markObserved(db: FabDataDb, timestamp: Long) {
         ensureMarkerTable(db)
         db.writableDatabase.delete(MARKER_TABLE, "timestamp=?", arrayOf(timestamp.toString()))
+        val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+        PointSourceStore.markMeasured(db, sensor.id, timestamp)
     }
 
     fun isProvisional(db: FabDataDb, timestamp: Long): Boolean {

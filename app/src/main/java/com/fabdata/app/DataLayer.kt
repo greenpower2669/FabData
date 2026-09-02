@@ -33,7 +33,9 @@ data class SamplePoint(
     val sensorId: Long,
     val timestamp: Long,
     val temperature: Double,
-    val humidity: Double
+    val humidity: Double,
+    val source: PointSource = PointSource.MEASURED,
+    val confidence: Double? = null
 )
 
 data class AnnotationItem(
@@ -69,7 +71,7 @@ data class ImportResult(
     val lastTimestamp: Long?
 )
 
-class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 3) {
+class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 4) {
     private val appContext = context.applicationContext
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -117,6 +119,8 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         )
         db.execSQL("CREATE INDEX idx_annotations_time ON annotations(timestamp)")
         ensureLyonLabSchema(db)
+        PointSourceStore.ensure(db)
+        WeatherReferenceStore.ensure(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -129,6 +133,11 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         if (oldVersion < 3) {
             // Migration strictement additive : aucune table historique n'est réécrite.
             ensureLyonLabSchema(db)
+        }
+        if (oldVersion < 4) {
+            // v0.10 : métadonnées additives uniquement. Les anciennes lignes restent measured par défaut.
+            PointSourceStore.ensure(db)
+            WeatherReferenceStore.ensure(db)
         }
     }
 
@@ -177,9 +186,28 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             put("temperature", temperature)
             put("humidity", humidity)
         }
-        return writableDatabase.insertWithOnConflict(
+        val inserted = writableDatabase.insertWithOnConflict(
             "samples", null, values, SQLiteDatabase.CONFLICT_IGNORE
         ) != -1L
+        if (inserted) {
+            PointSourceStore.markMeasured(this, sensorId, timestamp)
+            return true
+        }
+        val existingSource = PointSourceStore.sourceFor(this, sensorId, timestamp)
+        if (existingSource != PointSource.MEASURED) {
+            val measuredValues = ContentValues().apply {
+                put("temperature", temperature)
+                put("humidity", humidity)
+            }
+            writableDatabase.update(
+                "samples", measuredValues,
+                "sensor_id=? AND timestamp=?",
+                arrayOf(sensorId.toString(), timestamp.toString())
+            )
+            PointSourceStore.markMeasured(this, sensorId, timestamp)
+            return true
+        }
+        return false
     }
 
     /**
@@ -198,6 +226,10 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         ).use { c ->
             if (!c.moveToFirst()) null else c.getDouble(0) to c.getDouble(1)
         } ?: return false
+
+        // Cette méthode est réservée aux données réelles revalidées : même si la valeur
+        // numérique est identique, elle remplace la provenance calculée éventuelle.
+        PointSourceStore.markMeasured(this, sensorId, timestamp)
 
         if (kotlin.math.abs(current.first - temperature) < 0.001 &&
             kotlin.math.abs(current.second - humidity) < 0.001
@@ -300,12 +332,23 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
 
     fun querySamples(sensorId: Long, from: Long, to: Long, maxPoints: Int = 5000): List<SamplePoint> {
         val all = ArrayList<SamplePoint>()
+        PointSourceStore.ensure(readableDatabase)
         readableDatabase.rawQuery(
-            "SELECT timestamp, temperature, humidity FROM samples WHERE sensor_id = ? AND timestamp BETWEEN ? AND ? ORDER BY timestamp",
+            """
+            SELECT p.timestamp, p.temperature, p.humidity, ps.source, ps.confidence
+            FROM samples p
+            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+            WHERE p.sensor_id = ? AND p.timestamp BETWEEN ? AND ?
+            ORDER BY p.timestamp
+            """.trimIndent(),
             arrayOf(sensorId.toString(), from.toString(), to.toString())
         ).use { c ->
             while (c.moveToNext()) {
-                all += SamplePoint(sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2))
+                all += SamplePoint(
+                    sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2),
+                    PointSource.fromDb(if (c.isNull(3)) null else c.getString(3)),
+                    if (c.isNull(4)) null else c.getDouble(4)
+                )
             }
         }
         if (all.size <= maxPoints) return all
@@ -477,7 +520,13 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
 }
 
 class CsvImporter(private val context: Context, private val db: FabDataDb) {
-    private data class ParsedPoint(val timestamp: Long, val temperature: Double, val humidity: Double)
+    private data class ParsedPoint(
+        val timestamp: Long,
+        val temperature: Double,
+        val humidity: Double,
+        val source: PointSource = PointSource.MEASURED,
+        val confidence: Double? = null
+    )
 
     private val genericLocalFormatters = listOf(
         "uuuu/M/d H:m", "uuuu/M/d H:m:s", "uuuu/M/d H:m:s.SSS",
@@ -509,6 +558,8 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
                 val headers = splitCsv(headerLine, delimiter).map(::normalize)
                 val exactKnownFormat = delimiter == ',' && headers.size >= 3 &&
                     headers[0] == "temps" && headers[1] == "temperaturecelsius" && headers[2] == "humiditerelativepourcentage"
+                val sourceIndex = headers.indexOfFirst { it == "source" }
+                val confidenceIndex = headers.indexOfFirst { it == "confidence" || it == "confiance" }
 
                 val rows = reader.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() }.toList()
                 if (exactKnownFormat && rows.isNotEmpty()) {
@@ -526,7 +577,9 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
                             ) {
                                 invalid++
                             } else {
-                                parsed += ParsedPoint(ts, temp, hum)
+                                val pointSource = if (sourceIndex >= 0) parsePointSource(fields.getOrNull(sourceIndex).orEmpty()) else PointSource.MEASURED
+                                val confidence = if (confidenceIndex >= 0) parseNumber(fields.getOrNull(confidenceIndex).orEmpty())?.coerceIn(0.0, 1.0) else null
+                                parsed += ParsedPoint(ts, temp, hum, pointSource, confidence)
                             }
                         } catch (_: Exception) {
                             invalid++
@@ -553,19 +606,14 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
             pointsToStore.forEach { point ->
                 firstTs = firstTs?.let { minOf(it, point.timestamp) } ?: point.timestamp
                 lastTs = lastTs?.let { maxOf(it, point.timestamp) } ?: point.timestamp
-                if (db.insertSample(sensor.id, point.timestamp, point.temperature, point.humidity)) {
-                    added++
-                    if (isLyonImport) LyonEmbeddedHistory.markProvisional(db, point.timestamp)
-                } else if (
-                    isLyonImport && LyonEmbeddedHistory.isProvisional(db, point.timestamp) &&
-                    db.updateSampleIfDifferent(sensor.id, point.timestamp, point.temperature, point.humidity)
-                ) {
-                    // Un fichier Lyon peut préciser/remplacer notre propre reconstruction,
-                    // mais n'écrase jamais une heure déjà confirmée par une source réelle.
-                    added++
-                    LyonEmbeddedHistory.markProvisional(db, point.timestamp)
-                } else {
-                    duplicates++
+                val result = PointSourceStore.upsertByPriority(
+                    db, sensor.id, point.timestamp, point.temperature, point.humidity,
+                    PointProvenance(point.source, point.confidence)
+                )
+                if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) added++ else duplicates++
+                if (isLyonImport) {
+                    if (point.source == PointSource.MEASURED) LyonEmbeddedHistory.markObserved(db, point.timestamp)
+                    else LyonEmbeddedHistory.markProvisional(db, point.timestamp)
                 }
             }
         }
@@ -592,7 +640,9 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
                     out += ParsedPoint(
                         ts,
                         kotlin.math.round(temperature * 10.0) / 10.0,
-                        (kotlin.math.round(humidity * 10.0) / 10.0).coerceIn(0.0, 100.0)
+                        (kotlin.math.round(humidity * 10.0) / 10.0).coerceIn(0.0, 100.0),
+                        PointSource.RECONSTRUCTED,
+                        0.72
                     )
                     ts += hourMs
                 }
@@ -606,6 +656,8 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
         val timeIndex = findHeader(headers, listOf("temps", "heure", "time", "timestamp", "date", "datetime"))
         val tempIndex = findHeader(headers, listOf("temperaturecelsius", "temperature", "temp", "tempc", "celsius"))
         val humidityIndex = findHeader(headers, listOf("humiditerelativepourcentage", "humiditerelative", "humidite", "humidity", "relativehumidity", "rh", "hygrometrie"))
+        val sourceIndex = findHeader(headers, listOf("source", "origine"))
+        val confidenceIndex = findHeader(headers, listOf("confidence", "confiance"))
         if (timeIndex < 0 || tempIndex < 0 || humidityIndex < 0) error("Colonnes Temps / Température / Humidité introuvables")
         var invalid = 0
         rows.forEach { line ->
@@ -615,7 +667,11 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
                 val temp = parseNumber(fields.getOrNull(tempIndex).orEmpty())
                 val hum = parseNumber(fields.getOrNull(humidityIndex).orEmpty())
                 if (ts == null || temp == null || hum == null || temp !in -100.0..150.0 || hum !in 0.0..100.0) invalid++
-                else target += ParsedPoint(ts, temp, hum)
+                else target += ParsedPoint(
+                    ts, temp, hum,
+                    if (sourceIndex >= 0) parsePointSource(fields.getOrNull(sourceIndex).orEmpty()) else PointSource.MEASURED,
+                    if (confidenceIndex >= 0) parseNumber(fields.getOrNull(confidenceIndex).orEmpty())?.coerceIn(0.0, 1.0) else null
+                )
             } catch (_: Exception) {
                 invalid++
             }
@@ -669,6 +725,8 @@ class CsvImporter(private val context: Context, private val db: FabDataDb) {
             LocalDateTime.of(year, month, day, hour, minute, second).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
         } catch (_: Exception) { null }
     }
+
+    private fun parsePointSource(raw: String): PointSource = PointSource.fromDb(raw.trim().trim('"'))
 
     private fun parseNumber(rawInput: String): Double? {
         val raw = rawInput.trim().trim('"').replace('\u00A0', ' ')

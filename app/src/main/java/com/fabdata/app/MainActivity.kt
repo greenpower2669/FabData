@@ -452,19 +452,27 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             } else {
                 val samples = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
-                        // La ligne Lyon reste la donnée officielle brute 6 min.
-                        val officialSix = lyonLab.queryOfficial(LyonSeriesKind.SIX_MIN, chosen.first, chosen.last).map {
-                            SamplePoint(sensor.id, it.timestamp, it.temperature, it.humidity)
+                        // v0.10 : une seule chronologie Lyon. Reconstruction d'abord, puis
+                        // données stockées, puis officiel 6 min qui garde la priorité absolue.
+                        val merged = linkedMapOf<Long, SamplePoint>()
+                        lyonLab.reconstruct(chosen.first, chosen.last).points.forEach {
+                            merged[it.timestamp] = SamplePoint(
+                                sensor.id, it.timestamp, it.temperature, it.humidity,
+                                PointSource.RECONSTRUCTED, 0.72
+                            )
                         }
-                        // Secours lecture seule pour les anciennes bases avant l'API officielle.
-                        officialSix.ifEmpty { db.querySamples(sensor.id, chosen.first, chosen.last) }
+                        db.querySamples(sensor.id, chosen.first, chosen.last).forEach { merged[it.timestamp] = it }
+                        lyonLab.queryOfficial(LyonSeriesKind.SIX_MIN, chosen.first, chosen.last).forEach {
+                            merged[it.timestamp] = SamplePoint(sensor.id, it.timestamp, it.temperature, it.humidity, PointSource.MEASURED, 1.0)
+                        }
+                        merged.values.sortedBy { it.timestamp }
                     } else {
                         db.querySamples(sensor.id, chosen.first, chosen.last)
                     }
                     sensor.id to value
                 }
                 val lyonReconstructed = lyonLab.reconstruct(chosen.first, chosen.last).points.map {
-                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity)
+                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, PointSource.RECONSTRUCTED, 0.72)
                 }
                 val overview = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
@@ -533,9 +541,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         colorIndex = 3,
         latestTimestamp = lyonReconstructedSamples.lastOrNull()?.timestamp
     )
-    // Permanent virtual curve: never hidden by token/network/source state.
-    val chartSensors = sensors.filterNot { it.id == LYON_RECONSTRUCTED_SENSOR_ID } + lyonReconstructedSensor
-    val chartSampleMap = sampleMap + (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples)
+    // v0.10 : measured / reconstructed / forecast restent sur la même sonde.
+    // Le capteur virtuel Lyon reconstruit est conservé en mémoire pour compatibilité
+    // du détail historique, mais n'est plus présenté comme une seconde sonde.
+    val chartSensors = sensors
+    val chartSampleMap = sampleMap
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
@@ -668,6 +678,20 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             remoteConfigs = remoteSensorStore.load()
                         }
                     )
+                }
+
+                item {
+                    ThermalReferenceCard(
+                        db = db,
+                        lyonLab = lyonLab,
+                        credentials = meteoCredentials,
+                        dataVersion = reloadToken,
+                        onDataChanged = { reloadToken++ }
+                    )
+                }
+
+                item {
+                    SourceAwareExportCard(db)
                 }
 
                 item {
@@ -1477,7 +1501,7 @@ private fun ChartCard(
                 Column(Modifier.weight(1f)) {
                     Text("Courbes interactives", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                     Text(
-                        "Point épais = événement · 1 clic = aperçu · double clic = fiche",
+                        "Plein = réel · tirets = reconstruit · pointillés = prévision · point épais = événement",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1737,49 +1761,73 @@ private fun InteractiveChart(
             val points = sampleMap[sensor.id].orEmpty().filter { it.timestamp in visibleFrom..visibleTo }
 
             if (showTemp[sensor.id] == true && points.size >= 2) {
-                val path = Path()
+                val sourcePaths = PointSource.entries.associateWith { Path() }
                 var previous: SamplePoint? = null
                 points.forEach { p ->
-                    val x = mapX(p.timestamp)
-                    val y = mapTemp(p.temperature)
-                    val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
-                        previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
-                    if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                    val prev = previous
+                    if (prev != null) {
+                        val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                            p.timestamp - prev.timestamp > LYON_DETAIL_GAP_MS
+                        if (!breakHere) {
+                            val path = sourcePaths[p.source]!!
+                            path.moveTo(mapX(prev.timestamp), mapTemp(prev.temperature))
+                            path.lineTo(mapX(p.timestamp), mapTemp(p.temperature))
+                        }
+                    }
                     previous = p
                 }
-                auraColor?.let { aura ->
-                    drawPath(path, aura, style = Stroke(width = (prefs.lineWidth + 7f).dp.toPx()))
+                sourcePaths.forEach { (source, path) ->
+                    val alpha = when (source) {
+                        PointSource.MEASURED -> 1.0f
+                        PointSource.RECONSTRUCTED -> 0.78f
+                        PointSource.FORECAST -> 0.62f
+                    }
+                    val effect = when (source) {
+                        PointSource.MEASURED -> null
+                        PointSource.RECONSTRUCTED -> PathEffect.dashPathEffect(floatArrayOf(13f, 7f))
+                        PointSource.FORECAST -> PathEffect.dashPathEffect(floatArrayOf(3f, 7f))
+                    }
+                    auraColor?.let { aura ->
+                        drawPath(path, aura.copy(alpha = aura.alpha * alpha), style = Stroke(width = (prefs.lineWidth + 7f).dp.toPx(), pathEffect = effect))
+                    }
+                    drawPath(path, color.copy(alpha = color.alpha * alpha), style = Stroke(width = prefs.lineWidth.dp.toPx(), pathEffect = effect))
                 }
-                drawPath(path, color, style = Stroke(width = prefs.lineWidth.dp.toPx()))
                 if (prefs.showPoints || zoom > 18f) {
                     points.forEach { p ->
-                        drawCircle(color, 2.2.dp.toPx(), Offset(mapX(p.timestamp), mapTemp(p.temperature)))
+                        val alpha = when (p.source) { PointSource.MEASURED -> 1f; PointSource.RECONSTRUCTED -> 0.78f; PointSource.FORECAST -> 0.60f }
+                        drawCircle(color.copy(alpha = color.alpha * alpha), 2.2.dp.toPx(), Offset(mapX(p.timestamp), mapTemp(p.temperature)))
                     }
                 }
             }
 
             if (showHumidity[sensor.id] == true && points.size >= 2) {
-                val path = Path()
+                val sourcePaths = PointSource.entries.associateWith { Path() }
                 var previous: SamplePoint? = null
                 points.forEach { p ->
-                    val x = mapX(p.timestamp)
-                    val y = mapHum(p.humidity)
-                    val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
-                        previous?.let { p.timestamp - it.timestamp > LYON_DETAIL_GAP_MS } == true
-                    if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                    val prev = previous
+                    if (prev != null) {
+                        val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                            p.timestamp - prev.timestamp > LYON_DETAIL_GAP_MS
+                        if (!breakHere) {
+                            val path = sourcePaths[p.source]!!
+                            path.moveTo(mapX(prev.timestamp), mapHum(prev.humidity))
+                            path.lineTo(mapX(p.timestamp), mapHum(p.humidity))
+                        }
+                    }
                     previous = p
                 }
-                drawPath(
-                    path,
-                    color.copy(alpha = 0.82f),
-                    style = Stroke(
-                        width = max(1.2f, prefs.lineWidth - 0.5f).dp.toPx(),
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 7f))
-                    )
-                )
+                sourcePaths.forEach { (source, path) ->
+                    val alpha = when (source) { PointSource.MEASURED -> 0.82f; PointSource.RECONSTRUCTED -> 0.68f; PointSource.FORECAST -> 0.54f }
+                    val effect = when (source) {
+                        PointSource.MEASURED -> PathEffect.dashPathEffect(floatArrayOf(10f, 7f))
+                        PointSource.RECONSTRUCTED -> PathEffect.dashPathEffect(floatArrayOf(16f, 9f))
+                        PointSource.FORECAST -> PathEffect.dashPathEffect(floatArrayOf(3f, 7f))
+                    }
+                    drawPath(path, color.copy(alpha = color.alpha * alpha), style = Stroke(width = max(1.2f, prefs.lineWidth - 0.5f).dp.toPx(), pathEffect = effect))
+                }
                 if (prefs.showPoints || zoom > 18f) {
                     points.forEach { p ->
-                        drawCircle(color.copy(alpha = 0.82f), 2.dp.toPx(), Offset(mapX(p.timestamp), mapHum(p.humidity)))
+                        drawCircle(color.copy(alpha = if (p.source == PointSource.MEASURED) 0.82f else 0.58f), 2.dp.toPx(), Offset(mapX(p.timestamp), mapHum(p.humidity)))
                     }
                 }
             }
