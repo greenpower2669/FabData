@@ -1,4 +1,4 @@
-name: Android APK + AAB v0.12.1
+name: Android APK + AAB v0.12.2
 
 on:
   push:
@@ -11,8 +11,7 @@ on:
 permissions:
   contents: write
 
-# Keep the same group as v0.12.0 so this run cancels any stale v0.12 build
-# triggered while the v0.12.1 patch file was being added.
+# Same family group: any stale v0.12.1 build is cancelled as soon as v0.12.2 starts.
 concurrency:
   group: fabdata-v0120-${{ github.ref }}
   cancel-in-progress: true
@@ -26,7 +25,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.12.0 base + v0.12.1 history fix
+      - name: Apply v0.12 base + history gate + reconstruction pipeline
         run: |
           python3 scripts/apply-v120-adaptive-forecast-invalidation.py
           python3 - <<'PY'
@@ -38,6 +37,7 @@ jobs:
           p.write_text(t, encoding='utf-8')
           PY
           python3 scripts/apply-v121-history-gate-fix.py
+          python3 scripts/apply-v122-reconstruction-pipeline.py
 
       - name: Commit generated source
         if: github.event_name == 'push'
@@ -53,9 +53,9 @@ jobs:
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
             app/src/main/java/com/fabdata/app/PointSourceLayer.kt
           if git diff --cached --quiet; then
-            echo "v0.12.1 source already generated"
+            echo "v0.12.2 source already generated"
           else
-            git commit -m "Apply FabData v0.12.1 history reconstruction fix"
+            git commit -m "Apply FabData v0.12.2 reconstruction pipeline fix"
             git push
           fi
 
@@ -105,18 +105,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.12.1-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.12.1-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.12.1-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.12.2-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.12.2-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.12.2-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.12.1-release
+          name: FabData-v0.12.2-release
           path: |
-            artifacts/FabData-v0.12.1-release.apk
-            artifacts/FabData-v0.12.1-release.aab
-            artifacts/FabData-v0.12.1-signing-mode.txt
+            artifacts/FabData-v0.12.2-release.apk
+            artifacts/FabData-v0.12.2-release.aab
+            artifacts/FabData-v0.12.2-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -124,11 +124,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.12.1-release.apk artifacts/FabData-v0.12.1-release.aab artifacts/FabData-v0.12.1-signing-mode.txt
+          git add artifacts/FabData-v0.12.2-release.apk artifacts/FabData-v0.12.2-release.aab artifacts/FabData-v0.12.2-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.12.1 APK + AAB"
+            git commit -m "Build FabData v0.12.2 APK + AAB"
             git push
           fi
 
@@ -136,16 +136,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.12.1
+          TAG: v0.12.2
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
-              --title "FabData v0.12.1" \
-              --notes "FabData v0.12.1 — corrige la régression de reconstruction passée introduite en v0.12.0. Le garde-fou historique retrouve les critères v0.11 et la sélection du modèle par RMSE court terme ; la dérive libre reste réservée au garde-fou de prévision. Le recalcul automatique d'un historique déjà reconstruit ne se déclenche désormais que lorsqu'une vraie mesure MEASURED a effectivement été ajoutée ou a remplacé un point calculé. Prévision adaptative, sigma, analogues et priorité MEASURED > RECONSTRUCTED > FORECAST conservés."
+              --title "FabData v0.12.2" \
+              --notes "FabData v0.12.2 — corrige le pipeline de reconstruction historique sans modifier les équations du modèle RC/masse. Les vérifications de schéma PointSource ne sont plus répétées à chaque point, les points reconstruits sont écrits par transactions de 256, la calibration déjà validée est réutilisée, la progression devient visible par étapes et la courbe est rechargée après chaque lot validé. Les animations de style à 180 ms sont suspendues pendant le calcul et les rechargements progressifs ne peuvent plus relancer un second moteur thermique. Priorité MEASURED > RECONSTRUCTED > FORECAST et garde-fous v0.12.1 conservés."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.12.1-release.apk \
-            artifacts/FabData-v0.12.1-release.aab \
-            artifacts/FabData-v0.12.1-signing-mode.txt \
+            artifacts/FabData-v0.12.2-release.apk \
+            artifacts/FabData-v0.12.2-release.aab \
+            artifacts/FabData-v0.12.2-signing-mode.txt \
             --clobber
