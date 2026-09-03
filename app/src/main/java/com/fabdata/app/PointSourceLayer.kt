@@ -2,6 +2,8 @@ package com.fabdata.app
 
 import android.content.ContentValues
 import android.database.sqlite.SQLiteDatabase
+import java.util.Collections
+import java.util.WeakHashMap
 
 /**
  * Provenance d'un point FabData.
@@ -39,10 +41,25 @@ data class PointProvenance(
 
 enum class PriorityWriteResult { INSERTED, REPLACED, UNCHANGED, REJECTED }
 
+data class PriorityPointWrite(
+    val sensorId: Long,
+    val timestamp: Long,
+    val temperature: Double,
+    val humidity: Double,
+    val provenance: PointProvenance
+)
+
 object PointSourceStore {
     const val MODEL_VERSION = "thermal-rc-mass-3"
 
+    // v0.12.2 : une migration additive n'a besoin d'être vérifiée qu'une seule fois
+    // par handle SQLite. WeakHashMap évite de retenir une base fermée en mémoire.
+    private val ensuredDatabases = Collections.synchronizedMap(WeakHashMap<SQLiteDatabase, Boolean>())
+
     fun ensure(db: SQLiteDatabase) {
+        synchronized(ensuredDatabases) {
+            if (ensuredDatabases[db] == true) return
+        }
         db.execSQL(
             """
             CREATE TABLE IF NOT EXISTS point_sources (
@@ -67,6 +84,7 @@ object PointSourceStore {
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_point_sources_time ON point_sources(sensor_id, timestamp)")
         ensureColumn(db, "sigma_c", "REAL")
         ensureColumn(db, "analog_count", "INTEGER")
+        synchronized(ensuredDatabases) { ensuredDatabases[db] = true }
     }
 
     private fun ensureColumn(db: SQLiteDatabase, name: String, type: String) {
@@ -193,10 +211,16 @@ object PointSourceStore {
         ensure(db.writableDatabase)
 
         val existing = db.readableDatabase.rawQuery(
-            "SELECT temperature, humidity FROM samples WHERE sensor_id=? AND timestamp=? LIMIT 1",
+            """
+            SELECT p.temperature, p.humidity, ps.source
+            FROM samples p
+            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+            WHERE p.sensor_id=? AND p.timestamp=? LIMIT 1
+            """.trimIndent(),
             arrayOf(sensorId.toString(), timestamp.toString())
         ).use { c ->
-            if (!c.moveToFirst()) null else c.getDouble(0) to c.getDouble(1)
+            if (!c.moveToFirst()) null
+            else Triple(c.getDouble(0), c.getDouble(1), PointSource.fromDb(if (c.isNull(2)) null else c.getString(2)))
         }
 
         if (existing == null) {
@@ -214,7 +238,7 @@ object PointSourceStore {
             return PriorityWriteResult.INSERTED
         }
 
-        val existingSource = sourceFor(db, sensorId, timestamp)
+        val existingSource = existing.third
         if (provenance.source.priority < existingSource.priority) {
             return PriorityWriteResult.REJECTED
         }
@@ -242,6 +266,37 @@ object PointSourceStore {
         )
         setProvenance(db, sensorId, timestamp, provenance)
         return PriorityWriteResult.REPLACED
+    }
+
+    /**
+     * Écrit les points calculés par petits lots transactionnels. Un historique de 90 jours
+     * passe ainsi d'environ 2000 commits SQLite à quelques commits seulement.
+     * Le callback est appelé APRES chaque commit afin que l'UI puisse afficher la progression.
+     */
+    fun upsertBatchByPriority(
+        db: FabDataDb,
+        points: List<PriorityPointWrite>,
+        chunkSize: Int = 256,
+        onChunkCommitted: ((processed: Int, changed: Int) -> Unit)? = null
+    ): Int {
+        if (points.isEmpty()) return 0
+        ensure(db.writableDatabase)
+        val size = chunkSize.coerceIn(32, 1024)
+        var processed = 0
+        var changed = 0
+        points.chunked(size).forEach { chunk ->
+            db.inTransaction {
+                chunk.forEach { p ->
+                    val result = upsertByPriority(
+                        db, p.sensorId, p.timestamp, p.temperature, p.humidity, p.provenance
+                    )
+                    if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) changed++
+                }
+            }
+            processed += chunk.size
+            onChunkCommitted?.invoke(processed, changed)
+        }
+        return changed
     }
 
     fun deleteForecastsAtOrAfter(db: FabDataDb, sensorId: Long, timestamp: Long) {

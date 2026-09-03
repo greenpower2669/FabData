@@ -45,7 +45,8 @@ fun ThermalReferenceCard(
     lyonLab: LyonLabStore,
     credentials: MeteoFranceCredentialStore,
     dataVersion: Int,
-    onDataChanged: () -> Unit
+    onDataChanged: () -> Unit,
+    onBusyChanged: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val prefs = remember { WeatherReferencePrefs(context) }
@@ -60,6 +61,8 @@ fun ThermalReferenceCard(
     val reference = WeatherReferenceCatalog.byKey(selectedKey)
     var menuOpen by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+
+    LaunchedEffect(busy) { onBusyChanged(busy) }
     var status by remember { mutableStateOf<ThermalStatus?>(null) }
     var info by remember { mutableStateOf("Référence prête à être chargée") }
     var weatherHistoryDialog by remember { mutableStateOf(false) }
@@ -124,6 +127,8 @@ fun ThermalReferenceCard(
     // v0.12.1 : dataVersion peut aussi changer pour des écritures calculées ou l'UI.
     // On ne recalcule le passé que si COUNT/MIN/MAX des vraies mesures a réellement changé.
     LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile, forecastMode) {
+        // Les rechargements progressifs du graphe ne doivent jamais lancer un second moteur.
+        if (busy) return@LaunchedEffect
         val currentMeasuredRevision = withContext(Dispatchers.IO) { db.physicalMeasuredRevision() }
         val measuredChanged = measuredRevision != null && currentMeasuredRevision != measuredRevision
         measuredRevision = currentMeasuredRevision
@@ -388,6 +393,7 @@ fun ThermalReferenceCard(
                     historyDialog = false
                     scope.launch {
                         busy = true
+                        info = "Reconstruction · préparation météo…"
                         val result = withContext(Dispatchers.IO) {
                             runCatching {
                                 // Ordre strict v0.10.3 : la référence visible/RC est préparée AVANT tout.
@@ -397,7 +403,28 @@ fun ThermalReferenceCard(
                                 }
                                 val checked = engine.status(reference, selectedSensorId, profile)
                                 if (!checked.canReconstruct) error(checked.message)
-                                engine.reconstructHistory(reference, historyDays, selectedSensorId ?: checked.preferred?.sensor?.id, profile)
+                                val activeId = selectedSensorId ?: checked.preferred?.sensor?.id
+                                val activeModel = checked.preferred?.model?.takeIf { it.sensorId == activeId }
+                                engine.reconstructHistory(
+                                    reference = reference,
+                                    requestedDays = historyDays,
+                                    sensorId = activeId,
+                                    profile = profile,
+                                    precalibratedModel = activeModel
+                                ) { p ->
+                                    scope.launch {
+                                        info = if (p.total > 0) {
+                                            val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
+                                            "${p.stage} · $percent % · ${p.changed} point(s) écrit(s)"
+                                        } else p.stage
+                                        // Le callback arrive après un commit SQLite de 256 points :
+                                        // la courbe peut donc montrer la reconstruction sans attendre la fin.
+                                        if (p.total > 0 && p.processed > 0) {
+                                            suppressNextAuto = true
+                                            onDataChanged()
+                                        }
+                                    }
+                                }
                             }
                         }
                         busy = false

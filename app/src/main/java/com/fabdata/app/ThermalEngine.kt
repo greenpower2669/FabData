@@ -104,6 +104,13 @@ data class ThermalWriteSummary(
     val analogCount: Int = 0
 )
 
+data class ThermalProgress(
+    val stage: String,
+    val processed: Int = 0,
+    val total: Int = 0,
+    val changed: Int = 0
+)
+
 private data class ForwardFillSummary(
     val created: Int = 0,
     val raccords: Int = 0,
@@ -259,7 +266,9 @@ class ThermalEngine(
         reference: WeatherReference,
         requestedDays: Int,
         sensorId: Long? = null,
-        profile: ThermalBuildingProfile = ThermalBuildingProfile()
+        profile: ThermalBuildingProfile = ThermalBuildingProfile(),
+        precalibratedModel: ThermalModel? = null,
+        progress: ((ThermalProgress) -> Unit)? = null
     ): ThermalWriteSummary {
         val days = requestedDays.coerceIn(1, MAX_HISTORY_DAYS)
         var total = 0
@@ -267,9 +276,13 @@ class ThermalEngine(
         var raccords = 0
         var maxDrift = 0.0
         var diagnostic: String? = null
+        PointSourceStore.ensure(db.writableDatabase)
         val targets = physicalSensors().filter { sensorId == null || it.id == sensorId }
         targets.forEach { sensor ->
-            val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
+            progress?.invoke(ThermalProgress("Calibration · ${sensor.room}"))
+            val model = precalibratedModel?.takeIf {
+                it.sensorId == sensor.id && it.referenceKey == reference.key
+            } ?: runCatching { calibrate(sensor, reference, profile) }.getOrNull()
             if (model == null || !model.acceptableForHistory) {
                 skipped++
                 if (diagnostic == null) diagnostic = "Modèle de ${sensor.room} non validé pour la reconstruction."
@@ -317,13 +330,14 @@ class ThermalEngine(
             }
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
 
-            val before = reconstructBeforeFirst(sensor, model, reference, first, startAt, outMap, profile)
+            progress?.invoke(ThermalProgress("État initial · ${sensor.room}"))
+            val before = reconstructBeforeFirst(sensor, model, reference, first, startAt, outMap, profile, progress)
             total += before.created
             raccords += before.raccords
             maxDrift = max(maxDrift, before.maxDrift)
             if (diagnostic == null && before.diagnostic != null) diagnostic = before.diagnostic
 
-            val gaps = fillInteriorGapsForward(sensor, model, reference, profile)
+            val gaps = fillInteriorGapsForward(sensor, model, reference, profile, progress)
             total += gaps.created
             raccords += gaps.raccords
             maxDrift = max(maxDrift, gaps.maxDrift)
@@ -528,7 +542,8 @@ class ThermalEngine(
         first: HourPoint,
         startAt: Long,
         outside: Map<Long, HourPoint>,
-        profile: ThermalBuildingProfile
+        profile: ThermalBuildingProfile,
+        progress: ((ThermalProgress) -> Unit)? = null
     ): ForwardFillSummary {
         val start = hourBucket(startAt)
         val firstHour = hourBucket(first.timestamp)
@@ -540,28 +555,33 @@ class ThermalEngine(
         var current = initial.first
         var currentH = initial.second
         var currentMass = initial.third
-        var created = 0
         var ts = start
+        var stopDiagnostic: String? = null
+        val writes = ArrayList<PriorityPointWrite>(((firstHour - start) / THERMAL_HOUR_MS).toInt().coerceAtLeast(0))
 
+        // Calcul pur d'abord : aucune écriture SQLite dans la boucle RC.
         while (ts < firstHour) {
             val horizonDays = (first.timestamp - ts).toDouble() / THERMAL_DAY_MS.toDouble()
             val confidence = (model.confidence * (1.0 - 0.0065 * horizonDays)).coerceIn(0.20, model.confidence)
-            val write = PointSourceStore.upsertByPriority(
-                db, sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
+            writes += PriorityPointWrite(
+                sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
                 provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
             )
-            if (write == PriorityWriteResult.INSERTED || write == PriorityWriteResult.REPLACED) created++
 
             val extTs = ts - model.lagHours * THERMAL_HOUR_MS
             val ext = outsideAt(outside, extTs)
-                ?: return ForwardFillSummary(created, 0, 0.0, "Propagation arrêtée : météo extérieure absente vers ${Instant.ofEpochMilli(ts).atZone(zone).toLocalDateTime()}.")
+            if (ext == null) {
+                stopDiagnostic = "Propagation arrêtée : météo extérieure absente vers ${Instant.ofEpochMilli(ts).atZone(zone).toLocalDateTime()}."
+                break
+            }
             val extAvg6 = outsideAverage(outside, extTs, 6) ?: ext
             val stepHour = Instant.ofEpochMilli(ts).atZone(zone).hour
             val delta = massAwareDelta(model.coefficients, current, currentMass, ext, extAvg6, stepHour, profile)
                 .coerceIn(-1.2, 1.2)
             val next = current + delta
             if (!plausibleIndoor(next)) {
-                return ForwardFillSummary(created, 0, 0.0, "Propagation arrêtée avant dérive physique abusive (${round2(next)} °C).")
+                stopDiagnostic = "Propagation arrêtée avant dérive physique abusive (${round2(next)} °C)."
+                break
             }
             val nextMass = advanceMass(profile, current, currentMass, extAvg6)
             val outHum = outside[hourBucket(ts)]?.humidity ?: currentH
@@ -570,6 +590,13 @@ class ThermalEngine(
             currentMass = nextMass
             ts += THERMAL_HOUR_MS
         }
+
+        val created = PointSourceStore.upsertBatchByPriority(db, writes, 256) { processed, changed ->
+            progress?.invoke(
+                ThermalProgress("Écriture historique · ${sensor.room}", processed, writes.size, changed)
+            )
+        }
+        if (stopDiagnostic != null) return ForwardFillSummary(created, 0, 0.0, stopDiagnostic)
 
         val drift = abs(current - first.temperature)
         return ForwardFillSummary(
@@ -640,7 +667,8 @@ class ThermalEngine(
         sensor: Sensor,
         model: ThermalModel,
         reference: WeatherReference,
-        profile: ThermalBuildingProfile
+        profile: ThermalBuildingProfile,
+        progress: ((ThermalProgress) -> Unit)? = null
     ): ForwardFillSummary {
         val measured = measuredHourly(sensor.id)
         if (measured.size < 2) return ForwardFillSummary()
@@ -651,9 +679,9 @@ class ThermalEngine(
             false
         )
         val outMap = out.associateBy { hourBucket(it.timestamp) }
-        var created = 0
         var raccords = 0
         var maxDrift = 0.0
+        val writes = ArrayList<PriorityPointWrite>()
 
         measured.zipWithNext().forEach { (left, right) ->
             val gapHours = ((right.timestamp - left.timestamp) / THERMAL_HOUR_MS).toInt()
@@ -684,11 +712,10 @@ class ThermalEngine(
                 val outHum = outMap[hourBucket(ts)]?.humidity ?: currentH
                 currentH += 0.08 * (outHum - currentH)
                 val confidence = (model.confidence * 0.82).coerceIn(0.20, 0.85)
-                val result = PointSourceStore.upsertByPriority(
-                    db, sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
+                writes += PriorityPointWrite(
+                    sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
                     provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
                 )
-                if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) created++
             }
 
             if (completed) {
@@ -707,6 +734,10 @@ class ThermalEngine(
                     }
                 }
             }
+        }
+
+        val created = PointSourceStore.upsertBatchByPriority(db, writes, 256) { processed, changed ->
+            progress?.invoke(ThermalProgress("Comblement des trous · ${sensor.room}", processed, writes.size, changed))
         }
         return ForwardFillSummary(created, raccords, maxDrift)
     }

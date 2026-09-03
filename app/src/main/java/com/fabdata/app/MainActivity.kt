@@ -293,6 +293,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var showAllAnnotations by rememberSaveable { mutableStateOf(true) }
     var reloadToken by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
+    var thermalBusy by remember { mutableStateOf(false) }
     var selectedTimestamp by remember { mutableStateOf<Long?>(null) }
     var selectedAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var detailAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
@@ -320,8 +321,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
     LaunchedEffect(Unit) {
         while (true) {
-            styleTick = System.currentTimeMillis()
-            delay(180L)
+            if (!thermalBusy) styleTick = System.currentTimeMillis()
+            delay(if (thermalBusy) 900L else 180L)
         }
     }
 
@@ -704,7 +705,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         lyonLab = lyonLab,
                         credentials = meteoCredentials,
                         dataVersion = reloadToken,
-                        onDataChanged = { reloadToken++ }
+                        onDataChanged = { reloadToken++ },
+                        onBusyChanged = { thermalBusy = it }
                     )
                 }
 
