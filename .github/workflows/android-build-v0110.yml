@@ -11,7 +11,6 @@ on:
 permissions:
   contents: write
 
-# Same family group: any stale v0.12.1 build is cancelled as soon as v0.12.2 starts.
 concurrency:
   group: fabdata-v0120-${{ github.ref }}
   cancel-in-progress: true
@@ -25,18 +24,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.12 base + history gate + reconstruction pipeline
+      - name: Apply v0.12.2 reconstruction pipeline
         run: |
-          python3 scripts/apply-v120-adaptive-forecast-invalidation.py
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('app/src/main/java/com/fabdata/app/ThermalUi.kt')
-          t = p.read_text(encoding='utf-8')
-          duplicate = '    var profileDialog by remember { mutableStateOf(false) }\n    var profileDialog by remember { mutableStateOf(false) }'
-          t = t.replace(duplicate, '    var profileDialog by remember { mutableStateOf(false) }')
-          p.write_text(t, encoding='utf-8')
-          PY
-          python3 scripts/apply-v121-history-gate-fix.py
+          # The branch already contains the generated v0.12.1 source.
+          # Older generators are intentionally NOT replayed: they are not idempotent
+          # once their generated source has been committed.
           python3 scripts/apply-v122-reconstruction-pipeline.py
 
       - name: Commit generated source
@@ -46,9 +38,7 @@ jobs:
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
           git add \
             app/build.gradle.kts \
-            app/src/main/java/com/fabdata/app/DataLayer.kt \
             app/src/main/java/com/fabdata/app/MainActivity.kt \
-            app/src/main/java/com/fabdata/app/ThermalProfile.kt \
             app/src/main/java/com/fabdata/app/ThermalEngine.kt \
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
             app/src/main/java/com/fabdata/app/PointSourceLayer.kt
