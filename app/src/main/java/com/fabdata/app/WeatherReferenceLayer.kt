@@ -43,14 +43,67 @@ object WeatherReferenceCatalog {
         WeatherReference("mf-06088001", "Nice", "Nice Aéroport", "06088001", 43.6489, 7.2092, "06")
     )
 
-    fun byKey(key: String?): WeatherReference = stations.firstOrNull { it.key == key } ?: stations.first()
+    fun byKeyOrNull(key: String?): WeatherReference? = stations.firstOrNull { it.key == key }
+    fun byKey(key: String?): WeatherReference = byKeyOrNull(key) ?: stations.first()
 }
 
 class WeatherReferencePrefs(context: Context) {
     private val prefs = context.getSharedPreferences("fabdata_weather_reference", Context.MODE_PRIVATE)
+
     fun selectedKey(): String = prefs.getString("selected_key", WeatherReferenceCatalog.DEFAULT_KEY)
         ?: WeatherReferenceCatalog.DEFAULT_KEY
-    fun select(key: String) = prefs.edit().putString("selected_key", WeatherReferenceCatalog.byKey(key).key).apply()
+
+    fun selectedReference(): WeatherReference {
+        val key = selectedKey()
+        WeatherReferenceCatalog.byKeyOrNull(key)?.let { return it }
+        if (prefs.getString("custom_key", null) == key) {
+            val latitude = prefs.getString("custom_latitude", null)?.toDoubleOrNull()
+            val longitude = prefs.getString("custom_longitude", null)?.toDoubleOrNull()
+            val stationId = prefs.getString("custom_station_id", null)
+            val stationName = prefs.getString("custom_station_name", null)
+            val city = prefs.getString("custom_city", null)
+            val departmentId = prefs.getString("custom_department_id", null).orEmpty()
+            if (latitude != null && longitude != null && !stationId.isNullOrBlank() && !stationName.isNullOrBlank()) {
+                return WeatherReference(
+                    key = key,
+                    city = city?.takeIf { it.isNotBlank() } ?: stationName,
+                    stationName = stationName,
+                    stationId = stationId,
+                    latitude = latitude,
+                    longitude = longitude,
+                    departmentId = departmentId
+                )
+            }
+        }
+        return WeatherReferenceCatalog.byKey(null)
+    }
+
+    fun select(key: String) = select(WeatherReferenceCatalog.byKey(key))
+
+    fun select(reference: WeatherReference) {
+        val editor = prefs.edit().putString("selected_key", reference.key)
+        if (WeatherReferenceCatalog.byKeyOrNull(reference.key) != null) {
+            editor.remove("custom_key")
+                .remove("custom_city")
+                .remove("custom_station_name")
+                .remove("custom_station_id")
+                .remove("custom_latitude")
+                .remove("custom_longitude")
+                .remove("custom_department_id")
+        } else {
+            editor.putString("custom_key", reference.key)
+                .putString("custom_city", reference.city)
+                .putString("custom_station_name", reference.stationName)
+                .putString("custom_station_id", reference.stationId)
+                .putString("custom_latitude", reference.latitude.toString())
+                .putString("custom_longitude", reference.longitude.toString())
+                .putString("custom_department_id", reference.departmentId)
+        }
+        editor.apply()
+    }
+
+    fun autoProtection(): Boolean = prefs.getBoolean("station_auto_protection", false)
+    fun setAutoProtection(enabled: Boolean) = prefs.edit().putBoolean("station_auto_protection", enabled).apply()
 }
 
 data class WeatherReferencePoint(

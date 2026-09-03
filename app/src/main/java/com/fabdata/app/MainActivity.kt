@@ -551,7 +551,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         busy = false
     }
 
-    val visualReference = WeatherReferenceCatalog.byKey(WeatherReferencePrefs(context).selectedKey())
+    val visualReference = WeatherReferencePrefs(context).selectedReference()
     val lyonReconstructedSensor = Sensor(
         id = LYON_RECONSTRUCTED_SENSOR_ID,
         stableKey = LYON_RECONSTRUCTED_STABLE_KEY,

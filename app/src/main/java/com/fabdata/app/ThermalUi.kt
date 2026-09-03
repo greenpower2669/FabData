@@ -58,8 +58,9 @@ fun ThermalReferenceCard(
     val scope = rememberCoroutineScope()
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
-    val reference = WeatherReferenceCatalog.byKey(selectedKey)
+    val reference = remember(selectedKey) { prefs.selectedReference() }
     var menuOpen by remember { mutableStateOf(false) }
+    var stationDiscoveryOpen by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
     LaunchedEffect(busy) { onBusyChanged(busy) }
@@ -150,7 +151,7 @@ fun ThermalReferenceCard(
         ) {
             Text("Référence météo & moteur thermique", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Lyon reste la référence par défaut. Une seule station charge ses séries à la fois.",
+                "Lyon reste le secours par défaut. Auto protection peut choisir la station historiquement la plus chaude du secteur ; une seule station charge ses séries à la fois.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -159,7 +160,7 @@ fun ThermalReferenceCard(
                 Column(Modifier.weight(1f)) {
                     Text("Ville / station", style = MaterialTheme.typography.labelMedium)
                     Text(reference.label, fontWeight = FontWeight.SemiBold)
-                    Text("ID ${reference.stationId}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("ID ${reference.stationId} · ${if (prefs.autoProtection()) "★ Auto protection" else "choix manuel"}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 Column {
                     OutlinedButton(onClick = { menuOpen = true }) { Text("Changer") }
@@ -168,6 +169,7 @@ fun ThermalReferenceCard(
                             DropdownMenuItem(
                                 text = { Text(station.label) },
                                 onClick = {
+                                    prefs.setAutoProtection(false)
                                     prefs.select(station.key)
                                     selectedKey = station.key
                                     menuOpen = false
@@ -177,6 +179,12 @@ fun ThermalReferenceCard(
                     }
                 }
             }
+
+            OutlinedButton(
+                onClick = { stationDiscoveryOpen = true },
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Sondes proches · Auto protection") }
 
             Text(info, style = MaterialTheme.typography.bodySmall)
 
@@ -308,6 +316,20 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+
+    if (stationDiscoveryOpen) {
+        StationDiscoveryDialog(
+            currentReference = reference,
+            credentials = credentials,
+            onDismiss = { stationDiscoveryOpen = false },
+            onSelect = { station, auto ->
+                prefs.setAutoProtection(auto)
+                prefs.select(station)
+                selectedKey = station.key
+                stationDiscoveryOpen = false
+            }
+        )
     }
 
     if (profileDialog) {
