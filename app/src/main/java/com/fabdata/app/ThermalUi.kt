@@ -57,8 +57,8 @@ fun ThermalReferenceCard(
     var forecastMode by remember { mutableStateOf(profileStore.forecastMode()) }
     val scope = rememberCoroutineScope()
 
-    var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
-    val reference = WeatherReferenceCatalog.byKey(selectedKey)
+    var reference by remember { mutableStateOf(prefs.selectedReference()) }
+    val selectedKey = reference.key
     var menuOpen by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
@@ -72,6 +72,7 @@ fun ThermalReferenceCard(
     var suppressNextAuto by remember { mutableStateOf(false) }
     var selectedSensorId by remember { mutableStateOf<Long?>(null) }
     var profileDialog by remember { mutableStateOf(false) }
+    var stationDiscoveryDialog by remember { mutableStateOf(false) }
     var measuredRevision by remember { mutableStateOf<String?>(null) }
 
     suspend fun refresh(
@@ -161,15 +162,16 @@ fun ThermalReferenceCard(
                     Text(reference.label, fontWeight = FontWeight.SemiBold)
                     Text("ID ${reference.stationId}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Column {
-                    OutlinedButton(onClick = { menuOpen = true }) { Text("Changer") }
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    OutlinedButton(onClick = { menuOpen = true }, enabled = !busy) { Text("Changer") }
+                    OutlinedButton(onClick = { stationDiscoveryDialog = true }, enabled = !busy) { Text("Secteur / Auto") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         WeatherReferenceCatalog.stations.forEach { station ->
                             DropdownMenuItem(
                                 text = { Text(station.label) },
                                 onClick = {
                                     prefs.select(station.key)
-                                    selectedKey = station.key
+                                    reference = station
                                     menuOpen = false
                                 }
                             )
@@ -177,6 +179,13 @@ fun ThermalReferenceCard(
                     }
                 }
             }
+
+            Text(
+                if (prefs.autoProtection()) "★ Auto protection · plus chaude historiquement dans le secteur"
+                else "Sélection manuelle · une seule station pilote le RC",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             Text(info, style = MaterialTheme.typography.bodySmall)
 
@@ -308,6 +317,24 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+
+    if (stationDiscoveryDialog) {
+        WeatherStationDiscoveryDialog(
+            credentials = credentials,
+            current = reference,
+            prefs = prefs,
+            onDismiss = { stationDiscoveryDialog = false },
+            onSelect = { station, auto ->
+                reference = station
+                stationDiscoveryDialog = false
+                info = if (auto) {
+                    "Auto protection · ${station.label} · actualisation…"
+                } else {
+                    "Station choisie · ${station.label} · actualisation…"
+                }
+            }
+        )
     }
 
     if (profileDialog) {

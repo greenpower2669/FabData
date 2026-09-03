@@ -23,7 +23,8 @@ data class WeatherReference(
     val stationId: String,
     val latitude: Double,
     val longitude: Double,
-    val departmentId: String
+    val departmentId: String,
+    val altitudeM: Double? = null
 ) {
     val label: String get() = if (city.equals(stationName, ignoreCase = true)) city else "$city · $stationName"
 }
@@ -48,9 +49,63 @@ object WeatherReferenceCatalog {
 
 class WeatherReferencePrefs(context: Context) {
     private val prefs = context.getSharedPreferences("fabdata_weather_reference", Context.MODE_PRIVATE)
-    fun selectedKey(): String = prefs.getString("selected_key", WeatherReferenceCatalog.DEFAULT_KEY)
-        ?: WeatherReferenceCatalog.DEFAULT_KEY
-    fun select(key: String) = prefs.edit().putString("selected_key", WeatherReferenceCatalog.byKey(key).key).apply()
+
+    fun selectedReference(): WeatherReference {
+        val key = prefs.getString("selected_key", WeatherReferenceCatalog.DEFAULT_KEY)
+            ?: WeatherReferenceCatalog.DEFAULT_KEY
+        val stationId = prefs.getString("station_id", null)
+        val lat = prefs.getString("station_latitude", null)?.toDoubleOrNull()
+        val lon = prefs.getString("station_longitude", null)?.toDoubleOrNull()
+        if (!stationId.isNullOrBlank() && lat != null && lon != null && prefs.getString("station_key", key) == key) {
+            return WeatherReference(
+                key = key,
+                city = prefs.getString("station_city", null).orEmpty().ifBlank { prefs.getString("station_name", null).orEmpty().ifBlank { "Station" } },
+                stationName = prefs.getString("station_name", null).orEmpty().ifBlank { "Station $stationId" },
+                stationId = stationId,
+                latitude = lat,
+                longitude = lon,
+                departmentId = prefs.getString("station_department", "").orEmpty(),
+                altitudeM = prefs.getString("station_altitude", null)?.toDoubleOrNull()
+            )
+        }
+        return WeatherReferenceCatalog.byKey(key)
+    }
+
+    fun selectedKey(): String = selectedReference().key
+
+    /** Compatibilité avec le sélecteur historique codé en dur. */
+    fun select(key: String) = select(WeatherReferenceCatalog.byKey(key), autoProtection = false)
+
+    fun select(reference: WeatherReference, autoProtection: Boolean) {
+        prefs.edit()
+            .putString("selected_key", reference.key)
+            .putString("station_key", reference.key)
+            .putString("station_id", reference.stationId)
+            .putString("station_city", reference.city)
+            .putString("station_name", reference.stationName)
+            .putString("station_latitude", reference.latitude.toString())
+            .putString("station_longitude", reference.longitude.toString())
+            .putString("station_department", reference.departmentId)
+            .putString("station_altitude", reference.altitudeM?.toString())
+            .putBoolean("auto_protection", autoProtection)
+            .apply()
+    }
+
+    fun autoProtection(): Boolean = prefs.getBoolean("auto_protection", false)
+
+    fun saveSector(origin: StationSearchOrigin, radiusKm: Int) {
+        prefs.edit()
+            .putString("sector_label", origin.label)
+            .putString("sector_latitude", origin.latitude.toString())
+            .putString("sector_longitude", origin.longitude.toString())
+            .putInt("sector_radius_km", radiusKm.coerceIn(5, 200))
+            .apply()
+    }
+
+    fun sectorLabel(): String? = prefs.getString("sector_label", null)
+    fun sectorLatitude(): Double? = prefs.getString("sector_latitude", null)?.toDoubleOrNull()
+    fun sectorLongitude(): Double? = prefs.getString("sector_longitude", null)?.toDoubleOrNull()
+    fun sectorRadiusKm(): Int = prefs.getInt("sector_radius_km", 50).coerceIn(5, 200)
 }
 
 data class WeatherReferencePoint(
