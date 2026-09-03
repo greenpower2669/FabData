@@ -255,8 +255,13 @@ class WeatherReferenceManager(
     fun refreshSelected(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
         store.keepOnly(reference.key)
 
-        // Filet de sécurité historique public/modelisé. Ne peut jamais écraser measured.
+        // v0.13.1 : l'archive Open-Meteo est volontairement arrêtée avant sa zone
+        // de fraîcheur incertaine, puis un pont "past_days" recolle les 14 derniers jours.
+        // Une station dynamique garde ainsi une série continue sans toucher au moteur RC.
         runCatching { fetchOpenMeteoHistory(reference, from, to) }
+            .getOrDefault(emptyList())
+            .forEach { store.upsert(reference.key, it) }
+        runCatching { fetchOpenMeteoRecentPast(reference, from, to) }
             .getOrDefault(emptyList())
             .forEach { store.upsert(reference.key, it) }
 
@@ -435,7 +440,9 @@ class WeatherReferenceManager(
         from: Long,
         to: Long
     ): List<WeatherReferencePoint> {
-        val historyTo = minOf(to, System.currentTimeMillis() - hourMs)
+        // L'archive n'est pas une source temps réel. Demander aujourd'hui peut faire
+        // échouer toute la requête ; on laisse 10 jours de marge, couverts par past_days=14.
+        val historyTo = minOf(to, System.currentTimeMillis() - 10L * 24L * hourMs)
         if (historyTo <= from) return emptyList()
         val startDate = Instant.ofEpochMilli(from).atZone(zone).toLocalDate()
         val endDate = Instant.ofEpochMilli(historyTo).atZone(zone).toLocalDate()
@@ -464,6 +471,45 @@ class WeatherReferenceManager(
         return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
     }
 
+    /**
+     * Pont récent pour les stations dynamiques : les derniers jours sont servis par
+     * l'API forecast avec past_days, donc indépendamment du délai de l'archive.
+     * Ces points restent RECONSTRUCTED et ne peuvent jamais écraser une observation.
+     */
+    private fun fetchOpenMeteoRecentPast(
+        reference: WeatherReference,
+        from: Long,
+        to: Long
+    ): List<WeatherReferencePoint> {
+        val now = System.currentTimeMillis()
+        val recentFrom = maxOf(from, now - 14L * 24L * hourMs)
+        val recentTo = minOf(to, now - 20L * 60L * 1000L)
+        if (recentTo <= recentFrom) return emptyList()
+
+        val url = "https://api.open-meteo.com/v1/forecast" +
+            "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
+            "&hourly=temperature_2m,relative_humidity_2m" +
+            "&past_days=14&forecast_days=1&timezone=Europe%2FParis"
+        val raw = httpGetAnonymous(url)
+        val hourly = JSONObject(raw).getJSONObject("hourly")
+        val times = hourly.getJSONArray("time")
+        val temps = hourly.getJSONArray("temperature_2m")
+        val hums = hourly.getJSONArray("relative_humidity_2m")
+        val out = mutableListOf<WeatherReferencePoint>()
+        for (i in 0 until minOf(times.length(), temps.length(), hums.length())) {
+            val time = times.optString(i)
+            val temp = temps.optDouble(i, Double.NaN)
+            val hum = hums.optDouble(i, Double.NaN)
+            if (!temp.isFinite() || !hum.isFinite()) continue
+            val ts = runCatching {
+                LocalDateTime.parse(time).atZone(zone).toInstant().toEpochMilli()
+            }.getOrNull() ?: continue
+            if (ts !in recentFrom..recentTo || temp !in -60.0..65.0 || hum !in 0.0..100.0) continue
+            out += WeatherReferencePoint(ts, temp, hum, PointSource.RECONSTRUCTED, 0.72)
+        }
+        return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
+    }
+
     private fun httpGetAnonymous(url: String): String {
         val c = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -484,11 +530,13 @@ class WeatherReferenceManager(
 
     private fun fetchOfficialHourly(reference: WeatherReference, from: Long, to: Long): List<WeatherReferencePoint> {
         val credential = credentials.get().takeIf { it.isNotBlank() } ?: error("Token Météo-France absent")
+        val safeTo = minOf(to, System.currentTimeMillis() - 10L * 60L * 1000L)
+        if (safeTo <= from) return emptyList()
         val orderBase = "https://public-api.meteofrance.fr/public/DPClim/v1/commande-station/horaire"
         val fileBase = "https://public-api.meteofrance.fr/public/DPClim/v1/commande/fichier"
         val all = mutableListOf<WeatherReferencePoint>()
         var cursor = Instant.ofEpochMilli(from)
-        val end = Instant.ofEpochMilli(to)
+        val end = Instant.ofEpochMilli(safeTo)
         while (!cursor.isAfter(end)) {
             val chunkEnd = minInstant(cursor.plusSeconds(364L * 24L * 3600L), end)
             val startIso = DateTimeFormatter.ISO_INSTANT.format(cursor)
