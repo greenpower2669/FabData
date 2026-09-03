@@ -1,4 +1,4 @@
-name: Android APK + AAB v0.12.2
+name: Android APK + AAB v0.13.0
 
 on:
   push:
@@ -12,24 +12,41 @@ permissions:
   contents: write
 
 concurrency:
-  group: fabdata-v0120-${{ github.ref }}
+  group: fabdata-v0130-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.12.2 reconstruction pipeline
+      - name: Apply v0.13.0 station protection layer
         run: |
-          # The branch already contains the generated v0.12.1 source.
-          # Older generators are intentionally NOT replayed: they are not idempotent
-          # once their generated source has been committed.
-          python3 scripts/apply-v122-reconstruction-pipeline.py
+          # Start strictly from the generated and validated v0.12.2 source.
+          # No v0.12 generator is replayed here.
+          python3 scripts/apply-v130-station-protection.py
+
+      - name: Regression guard RC and reconstruction
+        run: |
+          if ! git diff --quiet -- \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            app/src/main/java/com/fabdata/app/DataLayer.kt; then
+            echo "ERROR: v0.13.0 must not modify RC/reconstruction/provenance core"
+            git diff -- \
+              app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+              app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+              app/src/main/java/com/fabdata/app/DataLayer.kt
+            exit 1
+          fi
+          grep -q 'versionName = "0.13.0"' app/build.gradle.kts
+          grep -q 'StationDiscoveryDialog' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'selectedReference()' app/src/main/java/com/fabdata/app/MainActivity.kt
+          echo "RC/reconstruction core unchanged"
 
       - name: Commit generated source
         if: github.event_name == 'push'
@@ -38,14 +55,16 @@ jobs:
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
           git add \
             app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml \
             app/src/main/java/com/fabdata/app/MainActivity.kt \
-            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
-            app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+            app/src/main/java/com/fabdata/app/StationDiscovery.kt \
+            app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
           if git diff --cached --quiet; then
-            echo "v0.12.2 source already generated"
+            echo "v0.13.0 source already generated"
           else
-            git commit -m "Apply FabData v0.12.2 reconstruction pipeline fix"
+            git commit -m "Apply FabData v0.13.0 station protection"
             git push
           fi
 
@@ -95,18 +114,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.12.2-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.12.2-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.12.2-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.13.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.13.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.13.0-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.12.2-release
+          name: FabData-v0.13.0-release
           path: |
-            artifacts/FabData-v0.12.2-release.apk
-            artifacts/FabData-v0.12.2-release.aab
-            artifacts/FabData-v0.12.2-signing-mode.txt
+            artifacts/FabData-v0.13.0-release.apk
+            artifacts/FabData-v0.13.0-release.aab
+            artifacts/FabData-v0.13.0-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -114,11 +133,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.12.2-release.apk artifacts/FabData-v0.12.2-release.aab artifacts/FabData-v0.12.2-signing-mode.txt
+          git add artifacts/FabData-v0.13.0-release.apk artifacts/FabData-v0.13.0-release.aab artifacts/FabData-v0.13.0-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.12.2 APK + AAB"
+            git commit -m "Build FabData v0.13.0 APK + AAB"
             git push
           fi
 
@@ -126,16 +145,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.12.2
+          TAG: v0.13.0
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
-              --title "FabData v0.12.2" \
-              --notes "FabData v0.12.2 — corrige le pipeline de reconstruction historique sans modifier les équations du modèle RC/masse. Les vérifications de schéma PointSource ne sont plus répétées à chaque point, les points reconstruits sont écrits par transactions de 256, la calibration déjà validée est réutilisée, la progression devient visible par étapes et la courbe est rechargée après chaque lot validé. Les animations de style à 180 ms sont suspendues pendant le calcul et les rechargements progressifs ne peuvent plus relancer un second moteur thermique. Priorité MEASURED > RECONSTRUCTED > FORECAST et garde-fous v0.12.1 conservés."
+              --title "FabData v0.13.0" \
+              --notes "FabData v0.13.0 — ajoute une couche de sélection de station sans modifier le moteur RC/reconstruction v0.12.2. Recherche par adresse, code postal, ville, coordonnées ou position GPS ; lecture de l'index courant des stations Météo-France ; rayons 25/50/100 km ; tourniquet manuel ; mode Auto protection qui choisit la station du secteur au profil historiquement le plus chaud selon le P95 des maximales juin-septembre sur les 10 dernières années complètes (réanalyse homogène Open-Meteo). Les stations découvertes dynamiquement sont persistées et deviennent la seule référence météo chargée, comme avant. Lyon reste le secours par défaut."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.12.2-release.apk \
-            artifacts/FabData-v0.12.2-release.aab \
-            artifacts/FabData-v0.12.2-signing-mode.txt \
+            artifacts/FabData-v0.13.0-release.apk \
+            artifacts/FabData-v0.13.0-release.aab \
+            artifacts/FabData-v0.13.0-signing-mode.txt \
             --clobber
