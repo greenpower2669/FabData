@@ -25,7 +25,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Apply v0.16.0 rationalization and monitoring-first UI
-        run: python3 scripts/apply-v160-rationalize-curves.py
+        run: |
+          if grep -q 'versionName = "0.16.0"' app/build.gradle.kts \
+             && test -f app/src/main/java/com/fabdata/app/ThermalCoherence.kt \
+             && grep -q 'Rationaliser les courbes' app/src/main/java/com/fabdata/app/ThermalUi.kt; then
+            echo "v0.16.0 main source already generated"
+          else
+            python3 scripts/apply-v160-rationalize-curves.py
+          fi
+          python3 scripts/apply-v160-build-fixes.py
 
       - name: Regression guards
         run: |
@@ -60,11 +68,17 @@ jobs:
           c = main.index('ChartCard(', t)
           s = main.index('SensorSourcesCard(', c)
           assert o < t < c < s, 'monitoring-first order broken'
+
           point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
           delete = point[point.index('fun deleteBySource'):point.index('fun reconstructedBounds')]
           assert 'require(source != PointSource.MEASURED)' in delete
           assert 'source=?' in delete
-          print('Regression guards: measured untouched, period controls separate, monitoring first')
+
+          inertia = Path('app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt').read_text()
+          marker = '    private fun allHourly(sensorId: Long): List<SamplePoint> {'
+          assert inertia.count(marker) == 1, 'duplicate allHourly helper remains'
+          assert 'best.mapNotNull { it.confidence }.averageOr(1.0)' in inertia
+          print('Regression guards: measured untouched, period controls separate, monitoring first, inertia helper unique')
           PY
 
       - name: Commit generated source
@@ -78,11 +92,12 @@ jobs:
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
             app/src/main/java/com/fabdata/app/ThermalEngine.kt \
             app/src/main/java/com/fabdata/app/ThermalCoherence.kt \
+            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
             app/src/main/java/com/fabdata/app/PointSourceLayer.kt
           if git diff --cached --quiet; then
             echo "v0.16.0 source already generated"
           else
-            git commit -m "Apply FabData v0.16.0 curve rationalization"
+            git commit -m "Normalize FabData v0.16.0 generated source"
             git push
           fi
 
