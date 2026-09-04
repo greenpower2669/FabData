@@ -30,6 +30,9 @@ jobs:
           # Ne pas rejouer les anciens générateurs non idempotents.
           python3 scripts/apply-v150-coupled-inertia-history.py
 
+      - name: Apply v0.15.0 build fixes
+        run: python3 scripts/apply-v150-build-fixes.py
+
       - name: Regression guard measured data and coupled history
         run: |
           if ! git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt; then
@@ -54,8 +57,11 @@ jobs:
           grep -q 'includeHistory = false' app/src/main/java/com/fabdata/app/ThermalEngine.kt
           grep -q 'reconstruction refusée' app/src/main/java/com/fabdata/app/ThermalEngine.kt
           grep -q 'outsideWeight = best.outsideWeight' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'mapNotNull { it.confidence }.averageOr(1.0)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'Estimateur inertiel couplé v0.15' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
           grep -q 'private fun allHourly' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
           grep -q 'Étendre historique météo + bâtiment' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          test "$(grep -c 'modelSensorPrefs.edit().putLong("selected_sensor_id"' app/src/main/java/com/fabdata/app/ThermalUi.kt)" -ge 3
           grep -q 'fabdata_thermal_model' app/src/main/java/com/fabdata/app/MainActivity.kt
           echo "Measured data untouched; training is MEASURED-only; history requires weather + learned inertia"
 
