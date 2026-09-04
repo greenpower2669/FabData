@@ -1,9 +1,9 @@
-name: Android APK + AAB v0.15.0
+name: Android APK + AAB v0.16.0
 
 on:
   push:
     branches:
-      - 'agent/**'
+      - 'agent/v0.16-rationalize-curves'
     paths-ignore:
       - 'artifacts/**'
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fabdata-v0150-${{ github.ref }}
+  group: fabdata-v0160-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,46 +24,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.15.0 coupled inertia history
-        run: |
-          # La branche contient déjà le source généré v0.14.0.
-          # Ne pas rejouer les anciens générateurs non idempotents.
-          python3 scripts/apply-v150-coupled-inertia-history.py
+      - name: Apply v0.16.0 rationalization and monitoring-first UI
+        run: python3 scripts/apply-v160-rationalize-curves.py
 
-      - name: Apply v0.15.0 build fixes
-        run: python3 scripts/apply-v150-build-fixes.py
-
-      - name: Regression guard measured data and coupled history
+      - name: Regression guards
         run: |
           if ! git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt; then
-            echo "ERROR: v0.15.0 must not modify measured-data storage"
+            echo "ERROR: v0.16 must not modify measured-data storage"
             git diff -- app/src/main/java/com/fabdata/app/DataLayer.kt
             exit 1
           fi
-
-          POINT_CHANGES="$(git diff --unified=0 -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt | grep -E '^[+-][^+-]' || true)"
-          echo "$POINT_CHANGES"
-          UNEXPECTED_POINT="$(printf '%s\n' "$POINT_CHANGES" | grep -vE '^[+-]    const val MODEL_VERSION = "thermal-rc-(mass-3|inertia-4)"$' || true)"
-          if [ -n "$UNEXPECTED_POINT" ]; then
-            echo "ERROR: v0.15.0 may only change PointSource MODEL_VERSION"
-            echo "$UNEXPECTED_POINT"
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt; then
+            echo "ERROR: v0.16 must keep backup/import format compatible"
+            git diff -- app/src/main/java/com/fabdata/app/BackupLayer.kt
             exit 1
           fi
 
-          grep -q 'versionCode = 30' app/build.gradle.kts
-          grep -q 'versionName = "0.15.0"' app/build.gradle.kts
-          grep -q 'MODEL_VERSION = "thermal-rc-inertia-4"' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'mass - a.temperature' app/src/main/java/com/fabdata/app/ThermalEngine.kt
-          grep -q 'includeHistory = false' app/src/main/java/com/fabdata/app/ThermalEngine.kt
-          grep -q 'reconstruction refusée' app/src/main/java/com/fabdata/app/ThermalEngine.kt
-          grep -q 'outsideWeight = best.outsideWeight' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
-          grep -q 'mapNotNull { it.confidence }.averageOr(1.0)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
-          grep -q 'Estimateur inertiel couplé v0.15' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
-          grep -q 'private fun allHourly' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
-          grep -q 'Étendre historique météo + bâtiment' app/src/main/java/com/fabdata/app/ThermalUi.kt
-          test "$(grep -c 'modelSensorPrefs.edit().putLong("selected_sensor_id"' app/src/main/java/com/fabdata/app/ThermalUi.kt)" -ge 3
-          grep -q 'fabdata_thermal_model' app/src/main/java/com/fabdata/app/MainActivity.kt
-          echo "Measured data untouched; training is MEASURED-only; history requires weather + learned inertia"
+          grep -q 'versionCode = 31' app/build.gradle.kts
+          grep -q 'versionName = "0.16.0"' app/build.gradle.kts
+          grep -q 'MEASURED("measured", 3)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'RECONSTRUCTED("reconstructed", 2)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'FORECAST("forecast", 1)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'dependency_hash TEXT' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'Une mesure réelle ne peut jamais être invalidée' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'Rationaliser les courbes' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Profil bâtiment modifié' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'PreviewPreset.entries.forEach' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'TimePreset.entries.forEach' app/src/main/java/com/fabdata/app/MainActivity.kt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
+          o = main.index('HistoryOverviewCard(')
+          t = main.index('TimeTabs(preset = preset', o)
+          c = main.index('ChartCard(', t)
+          s = main.index('SensorSourcesCard(', c)
+          assert o < t < c < s, 'monitoring-first order broken'
+          point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
+          delete = point[point.index('fun deleteBySource'):point.index('fun reconstructedBounds')]
+          assert 'require(source != PointSource.MEASURED)' in delete
+          assert 'source=?' in delete
+          print('Regression guards: measured untouched, period controls separate, monitoring first')
+          PY
 
       - name: Commit generated source
         if: github.event_name == 'push'
@@ -75,13 +77,12 @@ jobs:
             app/src/main/java/com/fabdata/app/MainActivity.kt \
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
             app/src/main/java/com/fabdata/app/ThermalEngine.kt \
-            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
-            app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt \
+            app/src/main/java/com/fabdata/app/ThermalCoherence.kt \
             app/src/main/java/com/fabdata/app/PointSourceLayer.kt
           if git diff --cached --quiet; then
-            echo "v0.15.0 source already generated"
+            echo "v0.16.0 source already generated"
           else
-            git commit -m "Apply FabData v0.15.0 coupled inertia history"
+            git commit -m "Apply FabData v0.16.0 curve rationalization"
             git push
           fi
 
@@ -131,18 +132,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.15.0-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.15.0-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.15.0-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.16.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.16.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.16.0-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.15.0-release
+          name: FabData-v0.16.0-release
           path: |
-            artifacts/FabData-v0.15.0-release.apk
-            artifacts/FabData-v0.15.0-release.aab
-            artifacts/FabData-v0.15.0-signing-mode.txt
+            artifacts/FabData-v0.16.0-release.apk
+            artifacts/FabData-v0.16.0-release.aab
+            artifacts/FabData-v0.16.0-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -150,11 +151,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.15.0-release.apk artifacts/FabData-v0.15.0-release.aab artifacts/FabData-v0.15.0-signing-mode.txt
+          git add artifacts/FabData-v0.16.0-release.apk artifacts/FabData-v0.16.0-release.aab artifacts/FabData-v0.16.0-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.15.0 APK + AAB"
+            git commit -m "Build FabData v0.16.0 APK + AAB"
             git push
           fi
 
@@ -162,16 +163,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.15.0
+          TAG: v0.16.0
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
-              --title "FabData v0.15.0" \
-              --notes "FabData v0.15.0 — historique couplé météo + inertie bâtiment. L’apprentissage utilise uniquement les points intérieurs MEASURED propres : périodes clim/fenêtre probable, variations brutales, humidité atypique ou données douteuses restent visibles mais sont exclues de l’entraînement. Le modèle apprend désormais explicitement le terme T_mass−T_air en plus de la météo. Étendre l’historique prépare automatiquement la météo, exige l’inertie apprise, puis reconstruit l’air intérieur sur la même profondeur : pas de courbe historique intérieure sans inertie. Le tourniquet de sonde pilote aussi la courbe inertielle affichée. La profondeur 6/12/24/36 mois et l’overlay de calcul de v0.14 sont conservés."
+              --title "FabData v0.16.0" \
+              --notes "FabData v0.16.0 — fiabilisation des recalculs et ergonomie monitoring-first. Les points calculés portent une empreinte légère du profil bâtiment et de leurs dépendances dans la provenance existante. Une modification du profil, des mesures ou de la référence peut invalider les résultats aval sans jamais toucher aux points MEASURED. Le bouton « Rationaliser les courbes » conserve les calculs encore cohérents, retire uniquement les couches calculées périmées/incertaines et réutilise le moteur existant pour les reconstruire. L’ouverture d’une ancienne base reste conservatrice : aucune reconstruction héritée n’est détruite automatiquement au premier affichage. L’interface place désormais Vue globale, boutons de période du détail et graphe détaillé avant les sondes/stations et outils avancés ; les deux contrôles de période restent indépendants. Import/export et format de sauvegarde restent inchangés."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.15.0-release.apk \
-            artifacts/FabData-v0.15.0-release.aab \
-            artifacts/FabData-v0.15.0-signing-mode.txt \
+            artifacts/FabData-v0.16.0-release.apk \
+            artifacts/FabData-v0.16.0-release.aab \
+            artifacts/FabData-v0.16.0-signing-mode.txt \
             --clobber
