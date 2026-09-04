@@ -26,9 +26,13 @@ jobs:
 
       - name: Apply v0.14.0 inertial experiment
         run: |
-          # La branche contient déjà le source généré v0.13.1.
+          # La branche contient déjà le source généré v0.13.1/v0.14.0.
           # Ne pas rejouer les anciens générateurs non idempotents.
           python3 scripts/apply-v140-inertial-experiment.py
+
+      - name: Apply v0.14.0 overlay scope fix
+        run: |
+          python3 scripts/apply-v140-ui-brace-fix.py
 
       - name: Regression guard thermal core
         run: |
@@ -74,7 +78,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "v0.14.0 source already generated"
           else
-            git commit -m "Apply FabData v0.14.0 inertial experiment"
+            git commit -m "Apply FabData v0.14.0 overlay scope fix"
             git push
           fi
 
