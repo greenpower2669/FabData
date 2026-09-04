@@ -36,7 +36,9 @@ data class PointProvenance(
     val calibrationTo: Long? = null,
     val modelVersion: String? = null,
     val sigmaC: Double? = null,
-    val analogCount: Int? = null
+    val analogCount: Int? = null,
+    val profileHash: String? = null,
+    val dependencyHash: String? = null
 )
 
 enum class PriorityWriteResult { INSERTED, REPLACED, UNCHANGED, REJECTED }
@@ -75,6 +77,8 @@ object PointSourceStore {
                 calibration_from INTEGER,
                 calibration_to INTEGER,
                 model_version TEXT,
+                profile_hash TEXT,
+                dependency_hash TEXT,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY(sensor_id, timestamp),
                 FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
@@ -84,6 +88,8 @@ object PointSourceStore {
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_point_sources_time ON point_sources(sensor_id, timestamp)")
         ensureColumn(db, "sigma_c", "REAL")
         ensureColumn(db, "analog_count", "INTEGER")
+        ensureColumn(db, "profile_hash", "TEXT")
+        ensureColumn(db, "dependency_hash", "TEXT")
         synchronized(ensuredDatabases) { ensuredDatabases[db] = true }
     }
 
@@ -113,7 +119,8 @@ object PointSourceStore {
         db.readableDatabase.rawQuery(
             """
             SELECT source, confidence, reference_key, reference_station_id, reference_city,
-                   calibration_from, calibration_to, model_version, sigma_c, analog_count
+                   calibration_from, calibration_to, model_version, sigma_c, analog_count,
+                   profile_hash, dependency_hash
             FROM point_sources
             WHERE sensor_id=? AND timestamp=? LIMIT 1
             """.trimIndent(),
@@ -130,7 +137,9 @@ object PointSourceStore {
                 calibrationTo = if (c.isNull(6)) null else c.getLong(6),
                 modelVersion = if (c.isNull(7)) null else c.getString(7),
                 sigmaC = if (c.isNull(8)) null else c.getDouble(8),
-                analogCount = if (c.isNull(9)) null else c.getInt(9)
+                analogCount = if (c.isNull(9)) null else c.getInt(9),
+                profileHash = if (c.isNull(10)) null else c.getString(10),
+                dependencyHash = if (c.isNull(11)) null else c.getString(11)
             )
         }
     }
@@ -188,6 +197,8 @@ object PointSourceStore {
             provenance.calibrationFrom?.let { put("calibration_from", it) }
             provenance.calibrationTo?.let { put("calibration_to", it) }
             provenance.modelVersion?.let { put("model_version", it) }
+            provenance.profileHash?.let { put("profile_hash", it) }
+            provenance.dependencyHash?.let { put("dependency_hash", it) }
             put("updated_at", System.currentTimeMillis())
         }
         db.writableDatabase.insertWithOnConflict(
@@ -248,7 +259,10 @@ object PointSourceStore {
 
         if (provenance.source.priority == existingSource.priority && sameValues) {
             // La vraie mesure doit quand même effacer une ancienne provenance calculée.
+            // Pour un point calculé inchangé numériquement, la provenance doit malgré tout
+            // suivre les paramètres/dépendances qui viennent réellement de le recalculer.
             if (provenance.source == PointSource.MEASURED) markMeasured(db, sensorId, timestamp)
+            else setProvenance(db, sensorId, timestamp, provenance)
             return PriorityWriteResult.UNCHANGED
         }
 
@@ -321,16 +335,45 @@ object PointSourceStore {
         }
     }
 
-    fun reconstructedBounds(db: FabDataDb, sensorId: Long): LongRange? {
+    fun sourceBounds(db: FabDataDb, sensorId: Long, source: PointSource): LongRange? {
+        require(source != PointSource.MEASURED) { "Les mesures réelles ne passent jamais par sourceBounds calculé" }
         ensure(db.readableDatabase)
         db.readableDatabase.rawQuery(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM point_sources WHERE sensor_id=? AND source='reconstructed'",
-            arrayOf(sensorId.toString())
+            "SELECT MIN(timestamp), MAX(timestamp) FROM point_sources WHERE sensor_id=? AND source=?",
+            arrayOf(sensorId.toString(), source.dbValue)
         ).use { c ->
             if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
             return c.getLong(0)..c.getLong(1)
         }
     }
+
+    /** Supprime exclusivement une couche calculée. MEASURED est interdit par contrat. */
+    fun deleteBySource(db: FabDataDb, sensorId: Long, source: PointSource): Int {
+        require(source != PointSource.MEASURED) { "Une mesure réelle ne peut jamais être invalidée" }
+        ensure(db.writableDatabase)
+        val timestamps = mutableListOf<Long>()
+        db.readableDatabase.rawQuery(
+            "SELECT timestamp FROM point_sources WHERE sensor_id=? AND source=? ORDER BY timestamp",
+            arrayOf(sensorId.toString(), source.dbValue)
+        ).use { c -> while (c.moveToNext()) timestamps += c.getLong(0) }
+        if (timestamps.isEmpty()) return 0
+        db.inTransaction {
+            timestamps.forEach { ts ->
+                db.writableDatabase.delete(
+                    "samples", "sensor_id=? AND timestamp=?",
+                    arrayOf(sensorId.toString(), ts.toString())
+                )
+                db.writableDatabase.delete(
+                    "point_sources", "sensor_id=? AND timestamp=? AND source=?",
+                    arrayOf(sensorId.toString(), ts.toString(), source.dbValue)
+                )
+            }
+        }
+        return timestamps.size
+    }
+
+    fun reconstructedBounds(db: FabDataDb, sensorId: Long): LongRange? =
+        sourceBounds(db, sensorId, PointSource.RECONSTRUCTED)
 
     fun measuredCount(db: FabDataDb, sensorId: Long, from: Long, to: Long): Int {
         ensure(db.readableDatabase)

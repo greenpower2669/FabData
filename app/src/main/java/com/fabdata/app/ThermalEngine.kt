@@ -159,6 +159,7 @@ class ThermalEngine(
 ) {
     private val zone = ZoneId.of("Europe/Paris")
     private val inertiaEstimator = ThermalInertiaEstimator(db, referenceStore)
+    private val coherenceStore = ThermalCoherenceStore(db)
 
     fun status(reference: WeatherReference, selectedSensorId: Long? = null, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalStatus {
         val candidates = physicalSensors().map { sensor ->
@@ -342,15 +343,22 @@ class ThermalEngine(
                 return@forEach
             }
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
+            val fingerprint = coherenceStore.dependencyFingerprint(
+                reference, profile, sensor.id, PointSource.RECONSTRUCTED
+            )
 
             progress?.invoke(ThermalProgress("État initial · ${sensor.room}"))
-            val before = reconstructBeforeFirst(sensor, model, reference, first, startAt, outMap, profile, inertia, progress)
+            val before = reconstructBeforeFirst(
+                sensor, model, reference, first, startAt, outMap, profile, inertia, fingerprint, progress
+            )
             total += before.created
             raccords += before.raccords
             maxDrift = max(maxDrift, before.maxDrift)
             if (diagnostic == null && before.diagnostic != null) diagnostic = before.diagnostic
 
-            val gaps = fillInteriorGapsForward(sensor, model, reference, profile, inertia, progress)
+            val gaps = fillInteriorGapsForward(
+                sensor, model, reference, profile, inertia, fingerprint, progress
+            )
             total += gaps.created
             raccords += gaps.raccords
             maxDrift = max(maxDrift, gaps.maxDrift)
@@ -360,6 +368,44 @@ class ThermalEngine(
             diagnostic = "Aucun trou reconstruisible détecté sur la période choisie."
         }
         return ThermalWriteSummary(total, 0, skipped, raccords, maxDrift, diagnostic)
+    }
+
+    /**
+     * Reconstruit exactement le type d'étendue qui existait avant invalidation :
+     * historique avant la première vraie mesure, ou seulement trous intérieurs.
+     * Le moteur mathématique reste celui de reconstructHistory/fillInteriorGapsForward.
+     */
+    fun rebuildCalculatedExtent(
+        reference: WeatherReference,
+        profile: ThermalBuildingProfile,
+        sensorId: Long,
+        previousBounds: LongRange,
+        progress: ((ThermalProgress) -> Unit)? = null
+    ): ThermalWriteSummary {
+        val sensor = physicalSensors().firstOrNull { it.id == sensorId }
+            ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Sonde thermique introuvable")
+        val measured = measuredHourly(sensor.id)
+        val first = measured.firstOrNull()
+            ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Aucune mesure réelle")
+        if (previousBounds.first < first.timestamp) {
+            val span = (first.timestamp - previousBounds.first).coerceAtLeast(THERMAL_DAY_MS)
+            val days = ((span + THERMAL_DAY_MS - 1L) / THERMAL_DAY_MS).toInt()
+                .coerceIn(1, MAX_HISTORY_DAYS)
+            return reconstructHistory(reference, days, sensor.id, profile, progress = progress)
+        }
+
+        val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
+            ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Modèle non recalibrable")
+        if (!model.acceptableForHistory) {
+            return ThermalWriteSummary(0, 0, 1, diagnostic = "Modèle non validé pour l'historique")
+        }
+        val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
+            ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Inertie indisponible")
+        val fingerprint = coherenceStore.dependencyFingerprint(
+            reference, profile, sensor.id, PointSource.RECONSTRUCTED
+        )
+        val r = fillInteriorGapsForward(sensor, model, reference, profile, inertia, fingerprint, progress)
+        return ThermalWriteSummary(r.created, 0, 0, r.raccords, r.maxDrift, r.diagnostic)
     }
 
     /**
@@ -395,7 +441,10 @@ class ThermalEngine(
                 if (model == null || !model.acceptableForHistory) { skipped++; return@forEach }
                 val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
                     ?: run { skipped++; return@forEach }
-                val r = fillInteriorGapsForward(sensor, model, reference, profile, inertia)
+                val fingerprint = coherenceStore.dependencyFingerprint(
+                    reference, profile, sensor.id, PointSource.RECONSTRUCTED
+                )
+                val r = fillInteriorGapsForward(sensor, model, reference, profile, inertia, fingerprint)
                 total += r.created
                 raccords += r.raccords
                 maxDrift = max(maxDrift, r.maxDrift)
@@ -438,6 +487,9 @@ class ThermalEngine(
             val outside = referenceHourly(reference.key, from, to, includeForecast = true)
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
             if (outside.none { it.timestamp > latest.timestamp }) { skipped++; return@forEach }
+            val fingerprint = coherenceStore.dependencyFingerprint(
+                reference, profile, sensor.id, PointSource.FORECAST, mode
+            )
 
             val slopes = recent.zipWithNext().mapNotNull { (a, b) ->
                 val dt = (b.timestamp - a.timestamp).toDouble() / THERMAL_HOUR_MS.toDouble()
@@ -498,7 +550,7 @@ class ThermalEngine(
 
                 val result = PointSourceStore.upsertByPriority(
                     db, sensor.id, ts, round2(currentT), round2(currentH.coerceIn(0.0, 100.0)),
-                    provenance(model, reference, PointSource.FORECAST, confidence, sigma, analog.count)
+                    provenance(model, reference, PointSource.FORECAST, confidence, fingerprint, sigma, analog.count)
                 )
                 if (result == PriorityWriteResult.INSERTED || result == PriorityWriteResult.REPLACED) total++
                 furthest = max(furthest, horizon)
@@ -562,6 +614,7 @@ class ThermalEngine(
         outside: Map<Long, HourPoint>,
         profile: ThermalBuildingProfile,
         inertia: ThermalInertiaEstimate,
+        fingerprint: ThermalDependencyFingerprint,
         progress: ((ThermalProgress) -> Unit)? = null
     ): ForwardFillSummary {
         val start = hourBucket(startAt)
@@ -584,7 +637,7 @@ class ThermalEngine(
             val confidence = (model.confidence * (1.0 - 0.0065 * horizonDays)).coerceIn(0.20, model.confidence)
             writes += PriorityPointWrite(
                 sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
-                provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
+                provenance(model, reference, PointSource.RECONSTRUCTED, confidence, fingerprint)
             )
 
             val extTs = ts - model.lagHours * THERMAL_HOUR_MS
@@ -692,6 +745,7 @@ class ThermalEngine(
         reference: WeatherReference,
         profile: ThermalBuildingProfile,
         inertia: ThermalInertiaEstimate,
+        fingerprint: ThermalDependencyFingerprint,
         progress: ((ThermalProgress) -> Unit)? = null
     ): ForwardFillSummary {
         val measured = measuredHourly(sensor.id)
@@ -741,7 +795,7 @@ class ThermalEngine(
                 val confidence = (model.confidence * 0.82).coerceIn(0.20, 0.85)
                 writes += PriorityPointWrite(
                     sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
-                    provenance(model, reference, PointSource.RECONSTRUCTED, confidence)
+                    provenance(model, reference, PointSource.RECONSTRUCTED, confidence, fingerprint)
                 )
             }
 
@@ -943,6 +997,7 @@ class ThermalEngine(
         reference: WeatherReference,
         source: PointSource,
         confidence: Double,
+        fingerprint: ThermalDependencyFingerprint,
         sigmaC: Double? = null,
         analogCount: Int? = null
     ) = PointProvenance(
@@ -955,7 +1010,9 @@ class ThermalEngine(
         calibrationTo = model.calibrationTo,
         modelVersion = PointSourceStore.MODEL_VERSION,
         sigmaC = sigmaC,
-        analogCount = analogCount
+        analogCount = analogCount,
+        profileHash = fingerprint.profileHash,
+        dependencyHash = fingerprint.dependencyHash
     )
 
     private fun buildTrainingRows(

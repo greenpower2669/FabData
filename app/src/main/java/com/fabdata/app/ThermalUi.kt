@@ -53,6 +53,15 @@ private val THERMAL_HISTORY_CHOICES = listOf(
 private fun thermalHistoryLabel(days: Int): String =
     THERMAL_HISTORY_CHOICES.firstOrNull { it.days == days }?.label ?: "$days jours"
 
+private data class RationalizeResult(
+    val removed: Int,
+    val reconstructed: Int,
+    val forecasts: Int,
+    val skipped: Int,
+    val alreadyCoherent: Boolean,
+    val reason: String
+)
+
 @Composable
 fun ThermalReferenceCard(
     db: FabDataDb,
@@ -67,6 +76,7 @@ fun ThermalReferenceCard(
     val prefs = remember { WeatherReferencePrefs(context) }
     val manager = remember { WeatherReferenceManager(context, db, lyonLab, credentials) }
     val engine = remember { ThermalEngine(db, manager.store()) }
+    val coherenceStore = remember { ThermalCoherenceStore(db) }
     val profileStore = remember { ThermalProfileStore(context) }
     val modelSensorPrefs = remember {
         context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
@@ -95,6 +105,9 @@ fun ThermalReferenceCard(
     }
     var profileDialog by remember { mutableStateOf(false) }
     var measuredRevision by remember { mutableStateOf<String?>(null) }
+    var coherenceBaselineReady by remember { mutableStateOf(false) }
+    var observedReferenceKey by remember { mutableStateOf(selectedKey) }
+    var observedDataVersion by remember { mutableIntStateOf(dataVersion) }
 
     suspend fun refresh(
         allHistory: Boolean,
@@ -147,22 +160,146 @@ fun ThermalReferenceCard(
         busy = false
     }
 
-    // v0.12.1 : dataVersion peut aussi changer pour des écritures calculées ou l'UI.
-    // On ne recalcule le passé que si COUNT/MIN/MAX des vraies mesures a réellement changé.
+    suspend fun rationalizeCurves(
+        reason: String,
+        targetProfile: ThermalBuildingProfile = profile,
+        manual: Boolean = false
+    ) {
+        if (busy) return
+        busy = true
+        info = "Rationalisation · analyse des dépendances…"
+        val progressCallback: (ThermalProgress) -> Unit = { p ->
+            scope.launch {
+                info = if (p.total > 0) {
+                    val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
+                    "Rationalisation · ${p.stage} · $percent %"
+                } else "Rationalisation · ${p.stage}"
+            }
+        }
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val measuredBounds = db.physicalMeasuredBounds() ?: db.physicalSensorBounds()
+                    ?: error("Aucune donnée intérieure")
+                val hourMs = 60L * 60L * 1000L
+                val dayMs = 24L * hourMs
+
+                // En automatique on remet d'abord la petite fenêtre météo courante à jour.
+                // En manuel, on examine strictement l'état présent : une base déjà cohérente
+                // ne doit pas être rendue artificiellement périmée par un téléchargement.
+                if (!manual) {
+                    manager.ensureLocalCache(
+                        reference,
+                        measuredBounds.first - 18L * hourMs,
+                        maxOf(measuredBounds.last, System.currentTimeMillis() + (forecastMode.maxHours + 2L) * hourMs)
+                    )
+                }
+
+                fun reconStates() = coherenceStore.calculatedSensorIds().mapNotNull { id ->
+                    coherenceStore.inspect(reference, targetProfile, id, PointSource.RECONSTRUCTED)
+                }
+                fun forecastStates() = coherenceStore.calculatedSensorIds().mapNotNull { id ->
+                    coherenceStore.inspect(reference, targetProfile, id, PointSource.FORECAST, forecastMode)
+                }
+
+                var staleRecon = reconStates().filterNot { it.current }
+                var staleForecast = forecastStates().filterNot { it.current }
+
+                // Si une reconstruction ancienne est réellement périmée, préparer sa profondeur
+                // AVANT toute suppression. On garde ainsi les vraies mesures et les sources sûres
+                // tant que les dépendances nécessaires au recalcul ne sont pas prêtes.
+                val maxHistoryDays = staleRecon.mapNotNull { state ->
+                    val firstReal = coherenceStore.firstMeasuredTimestamp(state.sensorId) ?: return@mapNotNull null
+                    if (state.bounds.first >= firstReal) 0
+                    else (((firstReal - state.bounds.first) + dayMs - 1L) / dayMs).toInt().coerceIn(1, 1098)
+                }.maxOrNull() ?: 0
+                if (maxHistoryDays > 0) {
+                    info = "Rationalisation · préparation météo ${thermalHistoryLabel(maxHistoryDays)}…"
+                    val prepared = manager.prepareHistory(reference, maxHistoryDays)
+                    if (!prepared.coverage.ready) {
+                        error("Référence ${reference.city} incomplète : aucune courbe existante n'a été supprimée")
+                    }
+                    // La préparation peut elle-même avoir amélioré la référence : recalculer les hashes.
+                    staleRecon = reconStates().filterNot { it.current }
+                    staleForecast = forecastStates().filterNot { it.current }
+                }
+
+                if (staleRecon.isEmpty() && staleForecast.isEmpty()) {
+                    return@runCatching RationalizeResult(0, 0, 0, 0, true, reason)
+                }
+
+                var removed = 0
+                var reconstructed = 0
+                var forecasts = 0
+                var skipped = 0
+
+                staleRecon.forEach { state ->
+                    val previousBounds = state.bounds
+                    removed += PointSourceStore.deleteBySource(db, state.sensorId, PointSource.RECONSTRUCTED)
+                    val rebuilt = engine.rebuildCalculatedExtent(
+                        reference, targetProfile, state.sensorId, previousBounds, progressCallback
+                    )
+                    reconstructed += rebuilt.reconstructed
+                    skipped += rebuilt.skippedSensors
+                }
+
+                // Une reconstruction n'entre jamais dans l'apprentissage (MEASURED only), donc
+                // le hash du forecast ne dépend pas des points reconstruits. On peut traiter ensuite.
+                staleForecast.forEach { state ->
+                    removed += PointSourceStore.deleteBySource(db, state.sensorId, PointSource.FORECAST)
+                    val rebuilt = engine.refreshForecasts(reference, state.sensorId, targetProfile, forecastMode)
+                    forecasts += rebuilt.forecast
+                    skipped += rebuilt.skippedSensors
+                }
+
+                RationalizeResult(removed, reconstructed, forecasts, skipped, false, reason)
+            }
+        }
+        busy = false
+        result.fold(
+            onSuccess = { r ->
+                info = if (r.alreadyCoherent) {
+                    "Courbes déjà cohérentes · aucune donnée calculée supprimée"
+                } else {
+                    "Rationalisation terminée · ${r.removed} périmée(s) retirée(s) · ${r.reconstructed} historique(s) écrit(s) · ${r.forecasts} prévision(s) · ${r.skipped} refus"
+                }
+                suppressNextAuto = true
+                onDataChanged()
+            },
+            onFailure = { error ->
+                info = error.message ?: "Rationalisation impossible"
+            }
+        )
+    }
+
+    // v0.16 : le premier affichage ne détruit jamais une ancienne sauvegarde inconnue.
+    // Après cette baseline, mesure/référence changée = chaîne aval rationalisée.
     LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile, forecastMode) {
-        // Les rechargements progressifs du graphe ne doivent jamais lancer un second moteur.
         if (busy) return@LaunchedEffect
         val currentMeasuredRevision = withContext(Dispatchers.IO) { db.physicalMeasuredRevision() }
         val measuredChanged = measuredRevision != null && currentMeasuredRevision != measuredRevision
+        val referenceChanged = coherenceBaselineReady && selectedKey != observedReferenceKey
+        val dataChanged = coherenceBaselineReady && dataVersion != observedDataVersion
         measuredRevision = currentMeasuredRevision
-        if (suppressNextAuto) {
+        observedReferenceKey = selectedKey
+        observedDataVersion = dataVersion
+
+        if (!coherenceBaselineReady) {
+            coherenceBaselineReady = true
+            refresh(allHistory = false, triggerChartReload = true)
+        } else if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
-            refresh(
-                allHistory = false,
-                triggerChartReload = true,
-                rebuildHistoryFromNewMeasured = measuredChanged
-            )
+            val stamped = withContext(Dispatchers.IO) { coherenceStore.hasStampedCalculatedPoints() }
+            if (measuredChanged || referenceChanged || (dataChanged && stamped)) {
+                val why = when {
+                    measuredChanged -> "Nouvelles mesures réelles"
+                    referenceChanged -> "Référence météo modifiée"
+                    else -> "Données sources modifiées"
+                }
+                rationalizeCurves(why, profile, manual = false)
+            } else {
+                refresh(allHistory = false, triggerChartReload = true)
+            }
         }
     }
 
@@ -277,6 +414,17 @@ fun ThermalReferenceCard(
                 Text(s.message, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
+            Button(
+                onClick = { scope.launch { rationalizeCurves("Rationalisation manuelle", profile, manual = true) } },
+                enabled = !busy,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Rationaliser les courbes") }
+            Text(
+                "Vérifie les empreintes des calculs, conserve le réel et les résultats encore cohérents, puis ne reconstruit que ce qui est périmé ou incertain.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
             Card(shape = RoundedCornerShape(14.dp)) {
                 Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("Profil thermique du bâtiment", fontWeight = FontWeight.SemiBold)
@@ -361,13 +509,25 @@ fun ThermalReferenceCard(
             profile = profile,
             onDismiss = { profileDialog = false },
             onSave = { updated ->
-                profile = updated.normalized()
-                profileStore.save(profile)
+                val next = updated.normalized()
+                val changed = next != profile
+                profile = next
+                profileStore.save(next)
                 profileDialog = false
+                if (changed) {
+                    suppressNextAuto = true
+                    scope.launch { rationalizeCurves("Profil bâtiment modifié", next, manual = false) }
+                }
             },
             onReset = {
-                profile = profileStore.reset()
+                val next = profileStore.reset()
+                val changed = next != profile
+                profile = next
                 profileDialog = false
+                if (changed) {
+                    suppressNextAuto = true
+                    scope.launch { rationalizeCurves("Profil bâtiment réinitialisé", next, manual = false) }
+                }
             }
         )
     }

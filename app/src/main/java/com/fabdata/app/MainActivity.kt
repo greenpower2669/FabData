@@ -661,15 +661,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 ),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-            item {
-                TimeTabs(preset = preset, onSelect = {
-                    preset = it
-                    windowCenterTimestamp = selectedTimestamp
-                        ?: viewBounds?.let { b -> b.first + (b.last - b.first) / 2L }
-                    selectedAnnotation = null
-                })
-            }
-
             if (sensors.isEmpty()) {
                 item {
                     EmptyState {
@@ -677,6 +668,76 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                 }
             } else {
+                item {
+                    HistoryOverviewCard(
+                        sensors = chartSensors,
+                        sampleMap = chartOverviewSampleMap,
+                        historyBounds = globalBounds,
+                        viewBounds = viewBounds,
+                        selectedTimestamp = selectedTimestamp,
+                        onSelectTimestamp = { ts ->
+                            // Un simple tap ne modifie PAS la fenêtre principale.
+                            // Il déplace uniquement la sélection dans la mini-vue.
+                            selectedTimestamp = ts
+                            selectedAnnotation = null
+                        },
+                        onNavigate = { ts ->
+                            // Le double-tap recentre le graphe principal autour du point
+                            // en conservant le preset/zoom temporel actuellement choisi.
+                            windowCenterTimestamp = ts
+                            selectedTimestamp = ts
+                            selectedAnnotation = null
+                        }
+                    )
+                }
+
+                item {
+                    TimeTabs(preset = preset, onSelect = {
+                        preset = it
+                        windowCenterTimestamp = selectedTimestamp
+                            ?: viewBounds?.let { b -> b.first + (b.last - b.first) / 2L }
+                        selectedAnnotation = null
+                    })
+                }
+
+                item {
+                    ChartCard(
+                        sensors = chartSensors,
+                        sampleMap = chartSampleMap,
+                        showTemp = showTemp,
+                        showHumidity = showHumidity,
+                        annotations = annotations,
+                        bounds = viewBounds,
+                        prefs = prefs,
+                        curveStyles = activeCurveStyles,
+                        styleTick = styleTick,
+                        selectedTimestamp = selectedTimestamp,
+                        onSelectTimestamp = {
+                            selectedTimestamp = it
+                            selectedAnnotation = null
+                        },
+                        onAnnotationClick = {
+                            selectedAnnotation = it
+                            selectedTimestamp = it.timestamp
+                        },
+                        onAnnotationDoubleClick = {
+                            detailAnnotation = it
+                            selectedAnnotation = it
+                        },
+                        onRequestAnnotation = { ts ->
+                            editingAnnotation = null
+                            annotationTimestamp = ts
+                            selectedTimestamp = ts
+                        },
+                        onRequestZoom = { ts ->
+                            preset = TimePreset.TWO_DAYS
+                            windowCenterTimestamp = ts
+                            selectedTimestamp = ts
+                            selectedAnnotation = null
+                        }
+                    )
+                }
+
                 item {
                     SensorSourcesCard(
                         sensors = sensors,
@@ -733,6 +794,15 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
+                    SeriesSelector(
+                        sensors = chartSensors,
+                        showTemp = showTemp,
+                        showHumidity = showHumidity,
+                        onEdit = { if (it.id != LYON_RECONSTRUCTED_SENSOR_ID) editSensor = it }
+                    )
+                }
+
+                item {
                     ThermalReferenceCard(
                         db = db,
                         lyonLab = lyonLab,
@@ -753,79 +823,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
-                    SeriesSelector(
-                        sensors = chartSensors,
-                        showTemp = showTemp,
-                        showHumidity = showHumidity,
-                        onEdit = { if (it.id != LYON_RECONSTRUCTED_SENSOR_ID) editSensor = it }
-                    )
-                }
-
-                item {
                     CurvePersonalizationCard(
                         sensors = chartSensors.filter { it.id != THERMAL_INERTIA_SENSOR_ID },
                         onEdit = { key, label -> styleEditKey = key to label }
-                    )
-                }
-
-                item {
-                    HistoryOverviewCard(
-                        sensors = chartSensors,
-                        sampleMap = chartOverviewSampleMap,
-                        historyBounds = globalBounds,
-                        viewBounds = viewBounds,
-                        selectedTimestamp = selectedTimestamp,
-                        onSelectTimestamp = { ts ->
-                            // Un simple tap ne modifie PAS la fenêtre principale.
-                            // Il déplace uniquement la sélection dans la mini-vue.
-                            selectedTimestamp = ts
-                            selectedAnnotation = null
-                        },
-                        onNavigate = { ts ->
-                            // Le double-tap recentre le graphe principal autour du point
-                            // en conservant le preset/zoom temporel actuellement choisi.
-                            windowCenterTimestamp = ts
-                            selectedTimestamp = ts
-                            selectedAnnotation = null
-                        }
-                    )
-                }
-
-                item {
-                    ChartCard(
-                        sensors = chartSensors,
-                        sampleMap = chartSampleMap,
-                        showTemp = showTemp,
-                        showHumidity = showHumidity,
-                        annotations = annotations,
-                        bounds = viewBounds,
-                        prefs = prefs,
-                        curveStyles = activeCurveStyles,
-                        styleTick = styleTick,
-                        selectedTimestamp = selectedTimestamp,
-                        onSelectTimestamp = {
-                            selectedTimestamp = it
-                            selectedAnnotation = null
-                        },
-                        onAnnotationClick = {
-                            selectedAnnotation = it
-                            selectedTimestamp = it.timestamp
-                        },
-                        onAnnotationDoubleClick = {
-                            detailAnnotation = it
-                            selectedAnnotation = it
-                        },
-                        onRequestAnnotation = { ts ->
-                            editingAnnotation = null
-                            annotationTimestamp = ts
-                            selectedTimestamp = ts
-                        },
-                        onRequestZoom = { ts ->
-                            preset = TimePreset.TWO_DAYS
-                            windowCenterTimestamp = ts
-                            selectedTimestamp = ts
-                            selectedAnnotation = null
-                        }
                     )
                 }
 
