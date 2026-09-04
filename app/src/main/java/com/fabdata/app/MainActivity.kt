@@ -905,6 +905,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item { Spacer(Modifier.height(72.dp)) }
             }
+            }
 
             if (thermalBusy) {
                 ThermalBusyOverlay(
