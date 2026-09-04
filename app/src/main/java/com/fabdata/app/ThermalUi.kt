@@ -39,6 +39,20 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
+private data class ThermalHistoryChoice(val label: String, val days: Int)
+
+private val THERMAL_HISTORY_CHOICES = listOf(
+    ThermalHistoryChoice("30 j", 30),
+    ThermalHistoryChoice("90 j", 90),
+    ThermalHistoryChoice("6 mois", 183),
+    ThermalHistoryChoice("12 mois", 366),
+    ThermalHistoryChoice("24 mois", 732),
+    ThermalHistoryChoice("36 mois", 1098)
+)
+
+private fun thermalHistoryLabel(days: Int): String =
+    THERMAL_HISTORY_CHOICES.firstOrNull { it.days == days }?.label ?: "$days jours"
+
 @Composable
 fun ThermalReferenceCard(
     db: FabDataDb,
@@ -46,7 +60,8 @@ fun ThermalReferenceCard(
     credentials: MeteoFranceCredentialStore,
     dataVersion: Int,
     onDataChanged: () -> Unit,
-    onBusyChanged: (Boolean) -> Unit = {}
+    onBusyChanged: (Boolean) -> Unit = {},
+    onProgressChanged: (String?) -> Unit = {}
 ) {
     val context = LocalContext.current
     val prefs = remember { WeatherReferencePrefs(context) }
@@ -66,6 +81,7 @@ fun ThermalReferenceCard(
     LaunchedEffect(busy) { onBusyChanged(busy) }
     var status by remember { mutableStateOf<ThermalStatus?>(null) }
     var info by remember { mutableStateOf("Référence prête à être chargée") }
+    LaunchedEffect(busy, info) { onProgressChanged(if (busy) info else null) }
     var weatherHistoryDialog by remember { mutableStateOf(false) }
     var weatherHistoryDays by remember { mutableIntStateOf(30) }
     var historyDialog by remember { mutableStateOf(false) }
@@ -355,15 +371,19 @@ fun ThermalReferenceCard(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("FabData va préparer ${reference.label} avant le modèle thermique. La courbe affichée sera exactement la série donnée au moteur RC.")
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(30, 60, 90).forEach { d ->
-                            AssistChip(
-                                onClick = { weatherHistoryDays = d },
-                                label = { Text("$d jours") }
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        THERMAL_HISTORY_CHOICES.forEach { choice ->
+                            FilterChip(
+                                selected = weatherHistoryDays == choice.days,
+                                onClick = { weatherHistoryDays = choice.days },
+                                label = { Text(choice.label) }
                             )
                         }
                     }
-                    Text("Sélection : $weatherHistoryDays jours avant la première vraie mesure intérieure.", style = MaterialTheme.typography.bodySmall)
+                    Text("Sélection : ${thermalHistoryLabel(weatherHistoryDays)} avant la première vraie mesure intérieure.", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -371,6 +391,7 @@ fun ThermalReferenceCard(
                     weatherHistoryDialog = false
                     scope.launch {
                         busy = true
+                        info = "Historique météo · préparation ${thermalHistoryLabel(weatherHistoryDays)}…"
                         val result = withContext(Dispatchers.IO) {
                             runCatching { manager.prepareHistory(reference, weatherHistoryDays) }
                         }
@@ -399,15 +420,19 @@ fun ThermalReferenceCard(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("Des données antérieures semblent manquer. FabData peut estimer l'historique thermique du bâtiment avec le modèle validé.")
                     Text("Choisis une limite maximale :")
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(30, 60, 90).forEach { d ->
-                            AssistChip(
-                                onClick = { historyDays = d },
-                                label = { Text("$d jours") }
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        THERMAL_HISTORY_CHOICES.forEach { choice ->
+                            FilterChip(
+                                selected = historyDays == choice.days,
+                                onClick = { historyDays = choice.days },
+                                label = { Text(choice.label) }
                             )
                         }
                     }
-                    Text("Sélection : $historyDays jours · maximum 3 mois.", style = MaterialTheme.typography.bodySmall)
+                    Text("Sélection : ${thermalHistoryLabel(historyDays)} · maximum 36 mois.", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {

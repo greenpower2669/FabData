@@ -258,7 +258,8 @@ private data class LoadedData(
     val stats: Map<Long, SensorStats>,
     val annotations: List<AnnotationItem>,
     val allAnnotations: List<AnnotationItem>,
-    val lyonReconstructedSamples: List<SamplePoint>
+    val lyonReconstructedSamples: List<SamplePoint>,
+    val inertiaEstimate: ThermalInertiaEstimate?
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -272,6 +273,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val meteoCredentials = remember { MeteoFranceCredentialStore(context) }
     val meteoOfficial = remember { MeteoFranceOfficialClient(context, lyonLab, meteoCredentials) }
     val curveStyleStore = remember { CurveStyleStore(context) }
+    val weatherReferenceStore = remember { WeatherReferenceStore(db) }
+    val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
@@ -282,6 +285,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var sensors by remember { mutableStateOf<List<Sensor>>(emptyList()) }
     var sampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var lyonReconstructedSamples by remember { mutableStateOf<List<SamplePoint>>(emptyList()) }
+    var inertiaEstimate by remember { mutableStateOf<ThermalInertiaEstimate?>(null) }
     var statsMap by remember { mutableStateOf<Map<Long, SensorStats>>(emptyMap()) }
     var annotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
     var allAnnotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
@@ -294,6 +298,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var reloadToken by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var thermalBusy by remember { mutableStateOf(false) }
+    var thermalProgressText by remember { mutableStateOf<String?>(null) }
     var selectedTimestamp by remember { mutableStateOf<Long?>(null) }
     var selectedAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var detailAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
@@ -425,8 +430,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             // Les thermomètres physiques/importés définissent la période de navigation.
             // Lyon et les sondes HTTP complètent cette période sans pousser l'ancien hors écran.
             val physicalBounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
-            val selectedWeatherReference = WeatherReferenceCatalog.byKey(WeatherReferencePrefs(context).selectedKey())
-            val weatherReferenceStore = WeatherReferenceStore(db)
+            val selectedWeatherReference = WeatherReferencePrefs(context).selectedReference()
             val weatherBounds = weatherReferenceStore.historyBounds(selectedWeatherReference.key)
             val all = when {
                 physicalBounds == null -> weatherBounds
@@ -457,7 +461,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
             val allNotes = db.annotationsAll()
             if (chosen == null || all == null) {
-                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList())
+                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null)
             } else {
                 val samples = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
@@ -510,9 +514,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     value?.let { sensor.id to it }
                 }.toMap()
+                val inertia = runCatching { inertiaEstimator.estimate(selectedWeatherReference) }.getOrNull()
                 LoadedData(
                     s, all, chosen, samples, overviewWithReference, stat,
-                    db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed
+                    db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia
                 )
             }
         }
@@ -521,6 +526,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         viewBounds = loaded.viewBounds
         sampleMap = loaded.samples
         lyonReconstructedSamples = loaded.lyonReconstructedSamples
+        inertiaEstimate = loaded.inertiaEstimate
         overviewSampleMap = loaded.overviewSamples
         statsMap = loaded.stats
         annotations = loaded.annotations
@@ -548,6 +554,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (!showHumidity.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
             showHumidity[LYON_RECONSTRUCTED_SENSOR_ID] = false
         }
+        if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = true
+        showHumidity[THERMAL_INERTIA_SENSOR_ID] = false
         busy = false
     }
 
@@ -563,8 +571,21 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     // v0.10.2 : Lyon reconstruit redevient une couche visuelle comparative.
     // Il ne crée PAS une deuxième référence météo ni une deuxième série persistée :
     // le pseudo-capteur n'existe que pour Superposition / graphique / inspecteur.
-    val chartSensors = sensors + lyonReconstructedSensor
-    val chartSampleMap = sampleMap + (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples)
+    val inertiaVisible = viewBounds?.let { b -> inertiaEstimate?.window(b.first, b.last).orEmpty() }.orEmpty()
+    val inertiaOverview = globalBounds?.let { b -> inertiaEstimate?.window(b.first, b.last, 1200).orEmpty() }.orEmpty()
+    val inertiaSensor = Sensor(
+        id = THERMAL_INERTIA_SENSOR_ID,
+        stableKey = THERMAL_INERTIA_STABLE_KEY,
+        name = "Température inertielle estimée",
+        room = "Température inertielle estimée",
+        colorIndex = 4,
+        latestTimestamp = inertiaEstimate?.points?.lastOrNull()?.timestamp
+    )
+    val chartSensors = sensors + lyonReconstructedSensor + inertiaSensor
+    val chartSampleMap = sampleMap +
+        (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples) +
+        (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
+    val chartOverviewSampleMap = overviewSampleMap + (THERMAL_INERTIA_SENSOR_ID to inertiaOverview)
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
@@ -623,11 +644,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
         }
     ) { padding ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    start = 14.dp,
+                    top = 14.dp,
+                    end = 14.dp,
+                    bottom = if (thermalBusy) 176.dp else 14.dp
+                ),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
             item {
                 TimeTabs(preset = preset, onSelect = {
                     preset = it
@@ -706,8 +733,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         credentials = meteoCredentials,
                         dataVersion = reloadToken,
                         onDataChanged = { reloadToken++ },
-                        onBusyChanged = { thermalBusy = it }
+                        onBusyChanged = { thermalBusy = it },
+                        onProgressChanged = { thermalProgressText = it }
                     )
+                }
+
+                item {
+                    ThermalInertiaExperimentCard(inertiaEstimate)
                 }
 
                 item {
@@ -725,7 +757,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item {
                     CurvePersonalizationCard(
-                        sensors = chartSensors,
+                        sensors = chartSensors.filter { it.id != THERMAL_INERTIA_SENSOR_ID },
                         onEdit = { key, label -> styleEditKey = key to label }
                     )
                 }
@@ -733,7 +765,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 item {
                     HistoryOverviewCard(
                         sensors = chartSensors,
-                        sampleMap = overviewSampleMap,
+                        sampleMap = chartOverviewSampleMap,
                         historyBounds = globalBounds,
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
@@ -872,6 +904,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item { Spacer(Modifier.height(72.dp)) }
+            }
+
+            if (thermalBusy) {
+                ThermalBusyOverlay(
+                    progressText = thermalProgressText,
+                    sensors = chartSensors,
+                    sampleMap = chartSampleMap,
+                    showTemp = showTemp,
+                    bounds = viewBounds,
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(horizontal = 14.dp, vertical = 82.dp)
+                )
             }
         }
     }
@@ -1238,6 +1281,7 @@ private fun SeriesSelector(
                     Column(Modifier.weight(1f)) {
                         val displayRoom = when {
                             sensor.id == LYON_RECONSTRUCTED_SENSOR_ID -> "Lyon reconstruit"
+                            sensor.id == THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
                             sensor.stableKey == LyonWeatherSync.STABLE_KEY -> "Lyon brut · officiel/secours"
                             else -> sensor.room
                         }
@@ -1255,12 +1299,16 @@ private fun SeriesSelector(
                         checked = showTemp[sensor.id] == true,
                         onCheckedChange = { showTemp[sensor.id] = it }
                     )
-                    Text("%", style = MaterialTheme.typography.labelMedium)
-                    Checkbox(
-                        checked = showHumidity[sensor.id] == true,
-                        onCheckedChange = { showHumidity[sensor.id] = it }
-                    )
-                    if (sensor.id != LYON_RECONSTRUCTED_SENSOR_ID) {
+                    if (sensor.id != THERMAL_INERTIA_SENSOR_ID) {
+                        Text("%", style = MaterialTheme.typography.labelMedium)
+                        Checkbox(
+                            checked = showHumidity[sensor.id] == true,
+                            onCheckedChange = { showHumidity[sensor.id] = it }
+                        )
+                    } else {
+                        Spacer(Modifier.size(48.dp))
+                    }
+                    if (sensor.id != LYON_RECONSTRUCTED_SENSOR_ID && sensor.id != THERMAL_INERTIA_SENSOR_ID) {
                         IconButton(onClick = { onEdit(sensor) }) {
                             Icon(Icons.Default.Edit, contentDescription = "Modifier la pièce")
                         }
@@ -1790,8 +1838,9 @@ private fun InteractiveChart(
                 points.forEach { p ->
                     val prev = previous
                     if (prev != null) {
-                        val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
-                            p.timestamp - prev.timestamp > LYON_DETAIL_GAP_MS
+                        val breakHere = (
+                            sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == THERMAL_INERTIA_SENSOR_ID
+                        ) && p.timestamp - prev.timestamp > LYON_DETAIL_GAP_MS
                         if (!breakHere) {
                             val path = sourcePaths[p.source]!!
                             path.moveTo(mapX(prev.timestamp), mapTemp(prev.temperature))

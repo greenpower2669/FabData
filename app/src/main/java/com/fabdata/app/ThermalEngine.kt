@@ -15,7 +15,7 @@ import kotlin.math.sqrt
 private const val THERMAL_HOUR_MS = 60L * 60L * 1000L
 private const val THERMAL_DAY_MS = 24L * THERMAL_HOUR_MS
 private const val MIN_REAL_DAYS = 16
-private const val MAX_HISTORY_DAYS = 90
+private const val MAX_HISTORY_DAYS = 1098
 
 data class ThermalMetrics(
     val mae: Double,

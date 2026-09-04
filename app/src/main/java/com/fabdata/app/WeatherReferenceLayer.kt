@@ -312,7 +312,7 @@ class WeatherReferenceManager(
      * 18 h supplémentaires sont chargées en amont : retard RC max 12 h + moyenne 6 h.
      */
     fun prepareHistory(reference: WeatherReference, requestedDays: Int): WeatherReferencePreparation {
-        val days = requestedDays.coerceIn(1, 90)
+        val days = requestedDays.coerceIn(1, 1098)
         val indoor = db.physicalMeasuredBounds() ?: db.physicalSensorBounds() ?: db.globalTimeBounds()
             ?: error("Aucune donnée intérieure")
         val coreFrom = indoor.first - days.toLong() * 24L * hourMs
@@ -447,26 +447,35 @@ class WeatherReferenceManager(
         val startDate = Instant.ofEpochMilli(from).atZone(zone).toLocalDate()
         val endDate = Instant.ofEpochMilli(historyTo).atZone(zone).toLocalDate()
         if (startDate.isAfter(endDate)) return emptyList()
-        val url = "https://archive-api.open-meteo.com/v1/archive" +
-            "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
-            "&start_date=$startDate&end_date=$endDate" +
-            "&hourly=temperature_2m%2Crelative_humidity_2m&timezone=Europe%2FParis"
-        val raw = httpGetAnonymous(url)
-        val hourly = JSONObject(raw).getJSONObject("hourly")
-        val times = hourly.getJSONArray("time")
-        val temps = hourly.getJSONArray("temperature_2m")
-        val hums = hourly.getJSONArray("relative_humidity_2m")
+
+        // v0.14 : 36 mois représentent ~26 000 points horaires. On découpe volontairement
+        // l'archive en fenêtres de 180 jours : moins de mémoire, moins de risque de timeout,
+        // et exactement la même série finale après déduplication.
         val out = mutableListOf<WeatherReferencePoint>()
-        for (i in 0 until minOf(times.length(), temps.length(), hums.length())) {
-            val time = times.optString(i)
-            val temp = temps.optDouble(i, Double.NaN)
-            val hum = hums.optDouble(i, Double.NaN)
-            if (!temp.isFinite() || !hum.isFinite()) continue
-            val ts = runCatching {
-                LocalDateTime.parse(time).atZone(zone).toInstant().toEpochMilli()
-            }.getOrNull() ?: continue
-            if (ts !in from..historyTo || temp !in -60.0..65.0 || hum !in 0.0..100.0) continue
-            out += WeatherReferencePoint(ts, temp, hum, PointSource.RECONSTRUCTED, 0.68)
+        var cursor = startDate
+        while (!cursor.isAfter(endDate)) {
+            val chunkEnd = minOf(cursor.plusDays(179L), endDate)
+            val url = "https://archive-api.open-meteo.com/v1/archive" +
+                "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
+                "&start_date=$cursor&end_date=$chunkEnd" +
+                "&hourly=temperature_2m%2Crelative_humidity_2m&timezone=Europe%2FParis"
+            val raw = httpGetAnonymous(url)
+            val hourly = JSONObject(raw).getJSONObject("hourly")
+            val times = hourly.getJSONArray("time")
+            val temps = hourly.getJSONArray("temperature_2m")
+            val hums = hourly.getJSONArray("relative_humidity_2m")
+            for (i in 0 until minOf(times.length(), temps.length(), hums.length())) {
+                val time = times.optString(i)
+                val temp = temps.optDouble(i, Double.NaN)
+                val hum = hums.optDouble(i, Double.NaN)
+                if (!temp.isFinite() || !hum.isFinite()) continue
+                val ts = runCatching {
+                    LocalDateTime.parse(time).atZone(zone).toInstant().toEpochMilli()
+                }.getOrNull() ?: continue
+                if (ts !in from..historyTo || temp !in -60.0..65.0 || hum !in 0.0..100.0) continue
+                out += WeatherReferencePoint(ts, temp, hum, PointSource.RECONSTRUCTED, 0.68)
+            }
+            cursor = chunkEnd.plusDays(1L)
         }
         return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
     }
