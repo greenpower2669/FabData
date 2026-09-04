@@ -247,6 +247,7 @@ fun ThermalReferenceCard(
                                 if (selectable.isNotEmpty()) {
                                     val next = (index + 1) % selectable.size
                                     selectedSensorId = selectable[next].sensor.id
+                                    modelSensorPrefs.edit().putLong("selected_sensor_id", selectable[next].sensor.id).apply()
                                 }
                             },
                             enabled = !busy && selectable.size > 1

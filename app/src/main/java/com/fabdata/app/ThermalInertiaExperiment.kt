@@ -81,16 +81,17 @@ private data class InertiaCandidate(
 )
 
 /**
- * Expérience observationnelle v0.14.
+ * Estimateur inertiel couplé v0.15.
  *
- * - ne lit que les points intérieurs MEASURED ;
- * - peut lire la référence météo comme variable explicative ;
- * - ne persiste rien et n'appelle jamais PointSourceStore.upsert* ;
- * - n'est utilisée ni par reconstructHistory, ni par refreshForecasts.
+ * - les paramètres sont appris uniquement sur les points intérieurs MEASURED ;
+ * - les périodes perturbées/douteuses sont exclues par les masques mais restent visibles ;
+ * - la météo sert de variable explicative lente ;
+ * - l'estimateur ne persiste aucune donnée et ne modifie jamais les points MEASURED ;
+ * - T_mass devient une entrée obligatoire du modèle d'historique et de prévision.
  *
  * T_mass est un état latent lent. Plusieurs constantes de temps et couplages extérieurs
- * sont testés ; le choix est fait sur la capacité à expliquer dT_air/dt sur des périodes
- * non perturbées, avec un bonus de cohérence près des plateaux/tangentes.
+ * sont testés sur les seules mesures propres, puis ces paramètres peuvent être propagés
+ * sur l'historique sans réentraîner le modèle sur ses propres sorties.
  */
 class ThermalInertiaEstimator(
     private val db: FabDataDb,
@@ -225,7 +226,7 @@ class ThermalInertiaEstimator(
             val best = values.filter { it.source.priority == priority }
             SamplePoint(
                 sensorId, ts, best.map { it.temperature }.average(), best.map { it.humidity }.average(),
-                best.first().source, best.map { it.confidence }.average()
+                best.first().source, best.mapNotNull { it.confidence }.averageOr(1.0)
             )
         }.sortedBy { it.timestamp }
     }
