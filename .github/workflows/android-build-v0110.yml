@@ -1,4 +1,4 @@
-name: Android APK + AAB v0.14.0
+name: Android APK + AAB v0.15.0
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fabdata-v0140-${{ github.ref }}
+  group: fabdata-v0150-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,43 +24,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.14.0 inertial experiment
+      - name: Apply v0.15.0 coupled inertia history
         run: |
-          # La branche contient déjà le source généré v0.13.1/v0.14.0.
+          # La branche contient déjà le source généré v0.14.0.
           # Ne pas rejouer les anciens générateurs non idempotents.
-          python3 scripts/apply-v140-inertial-experiment.py
+          python3 scripts/apply-v150-coupled-inertia-history.py
 
-      - name: Apply v0.14.0 overlay scope fix
+      - name: Regression guard measured data and coupled history
         run: |
-          python3 scripts/apply-v140-ui-brace-fix.py
-
-      - name: Regression guard thermal core
-        run: |
-          if ! git diff --quiet -- \
-            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
-            app/src/main/java/com/fabdata/app/DataLayer.kt; then
-            echo "ERROR: v0.14.0 must not modify provenance or measured-data core"
-            git diff -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt app/src/main/java/com/fabdata/app/DataLayer.kt
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt; then
+            echo "ERROR: v0.15.0 must not modify measured-data storage"
+            git diff -- app/src/main/java/com/fabdata/app/DataLayer.kt
             exit 1
           fi
 
-          THERMAL_CHANGES="$(git diff --unified=0 -- app/src/main/java/com/fabdata/app/ThermalEngine.kt | grep -E '^[+-][^+-]' || true)"
-          echo "$THERMAL_CHANGES"
-          UNEXPECTED="$(printf '%s\n' "$THERMAL_CHANGES" | grep -vE '^[+-]private const val MAX_HISTORY_DAYS = (90|1098)$' || true)"
-          if [ -n "$UNEXPECTED" ]; then
-            echo "ERROR: ThermalEngine may only change MAX_HISTORY_DAYS in v0.14.0"
-            echo "$UNEXPECTED"
+          POINT_CHANGES="$(git diff --unified=0 -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt | grep -E '^[+-][^+-]' || true)"
+          echo "$POINT_CHANGES"
+          UNEXPECTED_POINT="$(printf '%s\n' "$POINT_CHANGES" | grep -vE '^[+-]    const val MODEL_VERSION = "thermal-rc-(mass-3|inertia-4)"$' || true)"
+          if [ -n "$UNEXPECTED_POINT" ]; then
+            echo "ERROR: v0.15.0 may only change PointSource MODEL_VERSION"
+            echo "$UNEXPECTED_POINT"
             exit 1
           fi
 
-          grep -q 'versionName = "0.14.0"' app/build.gradle.kts
-          grep -q 'MAX_HISTORY_DAYS = 1098' app/src/main/java/com/fabdata/app/ThermalEngine.kt
-          grep -q 'requestedDays.coerceIn(1, 1098)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
-          grep -q 'cursor.plusDays(179L)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
-          grep -q 'class ThermalInertiaEstimator' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
-          grep -q 'Température inertielle estimée' app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt
-          grep -q 'onProgressChanged' app/src/main/java/com/fabdata/app/ThermalUi.kt
-          echo "RC equations unchanged; only history depth extended; inertial experiment is read-only"
+          grep -q 'versionCode = 30' app/build.gradle.kts
+          grep -q 'versionName = "0.15.0"' app/build.gradle.kts
+          grep -q 'MODEL_VERSION = "thermal-rc-inertia-4"' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'mass - a.temperature' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'includeHistory = false' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'reconstruction refusée' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'outsideWeight = best.outsideWeight' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'private fun allHourly' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'Étendre historique météo + bâtiment' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'fabdata_thermal_model' app/src/main/java/com/fabdata/app/MainActivity.kt
+          echo "Measured data untouched; training is MEASURED-only; history requires weather + learned inertia"
 
       - name: Commit generated source
         if: github.event_name == 'push'
@@ -72,13 +69,13 @@ jobs:
             app/src/main/java/com/fabdata/app/MainActivity.kt \
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
             app/src/main/java/com/fabdata/app/ThermalEngine.kt \
-            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
             app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
-            app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt
+            app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt
           if git diff --cached --quiet; then
-            echo "v0.14.0 source already generated"
+            echo "v0.15.0 source already generated"
           else
-            git commit -m "Apply FabData v0.14.0 overlay scope fix"
+            git commit -m "Apply FabData v0.15.0 coupled inertia history"
             git push
           fi
 
@@ -128,18 +125,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.14.0-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.14.0-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.14.0-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.15.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.15.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.15.0-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.14.0-release
+          name: FabData-v0.15.0-release
           path: |
-            artifacts/FabData-v0.14.0-release.apk
-            artifacts/FabData-v0.14.0-release.aab
-            artifacts/FabData-v0.14.0-signing-mode.txt
+            artifacts/FabData-v0.15.0-release.apk
+            artifacts/FabData-v0.15.0-release.aab
+            artifacts/FabData-v0.15.0-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -147,11 +144,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.14.0-release.apk artifacts/FabData-v0.14.0-release.aab artifacts/FabData-v0.14.0-signing-mode.txt
+          git add artifacts/FabData-v0.15.0-release.apk artifacts/FabData-v0.15.0-release.aab artifacts/FabData-v0.15.0-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.14.0 APK + AAB"
+            git commit -m "Build FabData v0.15.0 APK + AAB"
             git push
           fi
 
@@ -159,16 +156,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.14.0
+          TAG: v0.15.0
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
-              --title "FabData v0.14.0" \
-              --notes "FabData v0.14.0 — expérimentation Température inertielle estimée. Nouvelle courbe observationnelle calculée uniquement à partir des mesures intérieures MEASURED et de la météo explicative, avec analyse des pentes, plateaux et flux masse↔air signés. Elle ne participe ni à la reconstruction ni à la prévision. Étendre historique météo et Estimer historique proposent désormais 6/12/24/36 mois (jusqu'à 1098 jours), avec archive météo découpée par blocs de 180 jours. Pendant les calculs longs, un engrenage tournant et une mini-courbe restent fixés à l'écran même pendant le scrolling. Les équations RC existantes sont inchangées ; seule la profondeur maximale de reconstruction est étendue."
+              --title "FabData v0.15.0" \
+              --notes "FabData v0.15.0 — historique couplé météo + inertie bâtiment. L’apprentissage utilise uniquement les points intérieurs MEASURED propres : périodes clim/fenêtre probable, variations brutales, humidité atypique ou données douteuses restent visibles mais sont exclues de l’entraînement. Le modèle apprend désormais explicitement le terme T_mass−T_air en plus de la météo. Étendre l’historique prépare automatiquement la météo, exige l’inertie apprise, puis reconstruit l’air intérieur sur la même profondeur : pas de courbe historique intérieure sans inertie. Le tourniquet de sonde pilote aussi la courbe inertielle affichée. La profondeur 6/12/24/36 mois et l’overlay de calcul de v0.14 sont conservés."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.14.0-release.apk \
-            artifacts/FabData-v0.14.0-release.aab \
-            artifacts/FabData-v0.14.0-signing-mode.txt \
+            artifacts/FabData-v0.15.0-release.apk \
+            artifacts/FabData-v0.15.0-release.aab \
+            artifacts/FabData-v0.15.0-signing-mode.txt \
             --clobber
