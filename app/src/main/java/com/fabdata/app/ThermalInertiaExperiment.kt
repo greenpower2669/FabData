@@ -17,6 +17,7 @@ data class ThermalInertiaDiagnostics(
     val trendCPerDay: Double,
     val tauHours: Double,
     val couplingPerHour: Double,
+    val outsideWeight: Double,
     val confidence: Double,
     val cleanHours: Int,
     val plateauHours: Int,
@@ -98,14 +99,15 @@ class ThermalInertiaEstimator(
     private var cachedKey: String? = null
     private var cached: ThermalInertiaEstimate? = null
 
-    fun estimate(reference: WeatherReference): ThermalInertiaEstimate? {
+    fun estimate(reference: WeatherReference, sensorId: Long? = null, includeHistory: Boolean = true): ThermalInertiaEstimate? {
         val measuredRevision = db.physicalMeasuredRevision() ?: return null
         val weatherSignature = weatherSignature(reference.key) ?: return null
-        val key = "$measuredRevision|${reference.key}|$weatherSignature"
+        val key = "$measuredRevision|${reference.key}|$weatherSignature|${sensorId ?: -1L}|$includeHistory"
         if (key == cachedKey) return cached
 
         val sensors = db.sensors().filter { s ->
-            s.id >= 0L && !s.stableKey.startsWith("meteo-") && !s.stableKey.startsWith("http-get-")
+            (sensorId == null || s.id == sensorId) &&
+                s.id >= 0L && !s.stableKey.startsWith("meteo-") && !s.stableKey.startsWith("http-get-")
         }
         val measuredBySensor = sensors.mapNotNull { sensor ->
             val pts = measuredHourly(sensor.id)
@@ -133,11 +135,42 @@ class ThermalInertiaEstimator(
 
         val best = search(hours) ?: fallback(hours)
         val confidence = confidence(best)
-        val points = hours.mapIndexed { index, h ->
+
+        // Les paramètres (tau, couplages, poids extérieur) viennent EXCLUSIVEMENT
+        // des heures MEASURED propres ci-dessus. Pour l'affichage historique, on
+        // peut ensuite propager cet état lent sur la chronologie intérieure déjà
+        // reconstruite : cela ne réentraîne jamais le modèle sur ses propres sorties.
+        val outputHours: List<InertiaHour>
+        val outputMass: DoubleArray
+        if (includeHistory) {
+            val fullIndoor = allHourly(sensor.id)
+            val fullFrom = max(fullIndoor.firstOrNull()?.timestamp ?: from, weatherBounds.first)
+            val fullTo = min(fullIndoor.lastOrNull()?.timestamp ?: to, weatherBounds.last)
+            val fullOutside = outsideHourly(reference.key, fullFrom - 3L * INERTIA_HOUR_MS, fullTo)
+            val fullOutMap = fullOutside.associateBy { it.first }
+            val inRange = fullIndoor.filter { it.timestamp in fullFrom..fullTo }
+            val fullSmooth = smoothAir(inRange.map { it.temperature })
+            val built = inRange.mapIndexedNotNull { index, p ->
+                val outsideT = outsideAt(fullOutMap, p.timestamp) ?: return@mapIndexedNotNull null
+                InertiaHour(p.timestamp, p.temperature, p.humidity, outsideT, fullSmooth[index])
+            }
+            if (built.size >= 120) {
+                outputHours = built
+                outputMass = propagateDisplay(built, best.tauHours, best.outsideWeight)
+            } else {
+                outputHours = hours
+                outputMass = best.mass
+            }
+        } else {
+            outputHours = hours
+            outputMass = best.mass
+        }
+
+        val points = outputHours.mapIndexed { index, h ->
             SamplePoint(
                 sensorId = THERMAL_INERTIA_SENSOR_ID,
                 timestamp = h.timestamp,
-                temperature = round2(best.mass[index]),
+                temperature = round2(outputMass[index]),
                 humidity = h.humidity,
                 source = PointSource.RECONSTRUCTED,
                 confidence = confidence
@@ -145,9 +178,9 @@ class ThermalInertiaEstimator(
         }
         if (points.isEmpty()) return null
 
-        val trend = trendPerDay(hours, best.mass)
-        val currentAir = hours.last().smoothAir
-        val currentFlux = best.kMass * (best.mass.last() - currentAir)
+        val trend = trendPerDay(outputHours, outputMass)
+        val currentAir = outputHours.last().smoothAir
+        val currentFlux = best.kMass * (outputMass.last() - currentAir)
         val diagnostics = ThermalInertiaDiagnostics(
             sourceSensorId = sensor.id,
             sourceRoom = sensor.room,
@@ -155,6 +188,7 @@ class ThermalInertiaEstimator(
             trendCPerDay = trend,
             tauHours = best.tauHours,
             couplingPerHour = best.kMass,
+            outsideWeight = best.outsideWeight,
             confidence = confidence,
             cleanHours = best.cleanHours,
             plateauHours = best.plateauHours,
@@ -165,6 +199,35 @@ class ThermalInertiaEstimator(
             cachedKey = key
             cached = it
         }
+    }
+
+
+    private fun allHourly(sensorId: Long): List<SamplePoint> {
+        PointSourceStore.ensure(db.readableDatabase)
+        val raw = mutableListOf<SamplePoint>()
+        db.readableDatabase.rawQuery(
+            """
+            SELECT p.timestamp, p.temperature, p.humidity, ps.source
+            FROM samples p
+            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+            WHERE p.sensor_id=? AND (ps.source IS NULL OR ps.source<>'forecast')
+            ORDER BY p.timestamp
+            """.trimIndent(),
+            arrayOf(sensorId.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                val source = PointSource.fromDb(if (c.isNull(3)) null else c.getString(3))
+                raw += SamplePoint(sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2), source, 1.0)
+            }
+        }
+        return raw.groupBy { bucket(it.timestamp) }.map { (ts, values) ->
+            val priority = values.maxOf { it.source.priority }
+            val best = values.filter { it.source.priority == priority }
+            SamplePoint(
+                sensorId, ts, best.map { it.temperature }.average(), best.map { it.humidity }.average(),
+                best.first().source, best.map { it.confidence }.average()
+            )
+        }.sortedBy { it.timestamp }
     }
 
     private fun measuredHourly(sensorId: Long): List<SamplePoint> {
@@ -317,6 +380,25 @@ class ThermalInertiaEstimator(
                 next += observationGain * (hours[i].smoothAir - next)
             }
             mass[i] = next.coerceIn(-5.0, 50.0)
+        }
+        return mass
+    }
+
+
+    private fun propagateDisplay(
+        hours: List<InertiaHour>,
+        tauHours: Double,
+        outsideWeight: Double
+    ): DoubleArray {
+        val mass = DoubleArray(hours.size)
+        mass[0] = hours[0].smoothAir * 0.78 + hours[0].outside * 0.22
+        for (i in 1 until hours.size) {
+            val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
+                .coerceIn(0.5, 24.0)
+            val target = hours[i - 1].smoothAir * (1.0 - outsideWeight) +
+                hours[i - 1].outside * outsideWeight
+            val alpha = 1.0 - exp(-dt / tauHours.coerceAtLeast(24.0))
+            mass[i] = (mass[i - 1] + alpha * (target - mass[i - 1])).coerceIn(-5.0, 50.0)
         }
         return mass
     }

@@ -132,6 +132,7 @@ private data class TrainingRow(
     val nextTin: Double,
     val tout: Double,
     val toutAvg6: Double,
+    val mass: Double,
     val hourOfDay: Int,
     val features: DoubleArray,
     val delta: Double
@@ -157,6 +158,7 @@ class ThermalEngine(
     private val referenceStore: WeatherReferenceStore
 ) {
     private val zone = ZoneId.of("Europe/Paris")
+    private val inertiaEstimator = ThermalInertiaEstimator(db, referenceStore)
 
     fun status(reference: WeatherReference, selectedSensorId: Long? = null, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalStatus {
         val candidates = physicalSensors().map { sensor ->
@@ -218,20 +220,25 @@ class ThermalEngine(
             "Référence météo extérieure incomplète : reconstruire/compléter ${reference.city} avant de calibrer le bâtiment"
         }
         val outMap = outside.associateBy { hourBucket(it.timestamp) }
+        val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
+            ?: error("Température inertielle estimée indisponible pour ${sensor.room}")
+        val inertiaMap = inertia.points.associateBy { hourBucket(it.timestamp) }
         val medianDeltas = buildingMedianDeltaByHour(measured.first().timestamp, measured.last().timestamp)
 
         var best: ThermalModel? = null
         for (lag in 0..12) {
-            val rows = buildTrainingRows(measured, outMap, medianDeltas, lag)
+            val rows = buildTrainingRows(measured, outMap, inertiaMap, medianDeltas, lag)
             if (rows.size < 120) continue
             val split = (rows.size * 0.80).toInt().coerceIn(80, rows.size - 24)
             val train = rows.take(split)
             val valid = rows.drop(split)
             val coeff = ridgeRegression(train) ?: continue
             val metrics = validate(coeff, valid)
-            val driftRmse = validateLongHorizon(coeff, valid, profile)
+            val driftRmse = validateLongHorizon(coeff, valid, profile, inertia.diagnostics)
             val exchange = coeff[0] + coeff[1]
+            val massCoupling = coeff.getOrNull(2) ?: Double.NaN
             if (!exchange.isFinite() || exchange <= 0.002 || exchange >= 0.65) continue
+            if (!massCoupling.isFinite() || massCoupling !in 0.001..0.25) continue
             val tau = (1.0 / exchange).coerceIn(1.0, 500.0)
             val dataFactor = min(1.0, realDays / 35.0) * min(1.0, rows.size / 500.0)
             val errorFactor = (1.0 - metrics.rmse / 2.8).coerceIn(0.0, 1.0)
@@ -288,6 +295,12 @@ class ThermalEngine(
                 if (diagnostic == null) diagnostic = "Modèle de ${sensor.room} non validé pour la reconstruction."
                 return@forEach
             }
+            val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
+            if (inertia == null) {
+                skipped++
+                if (diagnostic == null) diagnostic = "Température inertielle de ${sensor.room} indisponible : reconstruction refusée."
+                return@forEach
+            }
             val measured = measuredHourly(sensor.id)
             if (measured.isEmpty()) {
                 skipped++
@@ -331,13 +344,13 @@ class ThermalEngine(
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
 
             progress?.invoke(ThermalProgress("État initial · ${sensor.room}"))
-            val before = reconstructBeforeFirst(sensor, model, reference, first, startAt, outMap, profile, progress)
+            val before = reconstructBeforeFirst(sensor, model, reference, first, startAt, outMap, profile, inertia, progress)
             total += before.created
             raccords += before.raccords
             maxDrift = max(maxDrift, before.maxDrift)
             if (diagnostic == null && before.diagnostic != null) diagnostic = before.diagnostic
 
-            val gaps = fillInteriorGapsForward(sensor, model, reference, profile, progress)
+            val gaps = fillInteriorGapsForward(sensor, model, reference, profile, inertia, progress)
             total += gaps.created
             raccords += gaps.raccords
             maxDrift = max(maxDrift, gaps.maxDrift)
@@ -380,7 +393,9 @@ class ThermalEngine(
             } else {
                 val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
                 if (model == null || !model.acceptableForHistory) { skipped++; return@forEach }
-                val r = fillInteriorGapsForward(sensor, model, reference, profile)
+                val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
+                    ?: run { skipped++; return@forEach }
+                val r = fillInteriorGapsForward(sensor, model, reference, profile, inertia)
                 total += r.created
                 raccords += r.raccords
                 maxDrift = max(maxDrift, r.maxDrift)
@@ -411,6 +426,8 @@ class ThermalEngine(
         physicalSensors().filter { sensorId == null || it.id == sensorId }.forEach { sensor ->
             val model = runCatching { calibrate(sensor, reference, profile, preferLongHorizon = true) }.getOrNull()
             if (model == null || !model.acceptableForForecast) { skipped++; return@forEach }
+            val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
+                ?: run { skipped++; return@forEach }
             val measured = measuredHourly(sensor.id)
             val latest = measured.lastOrNull() ?: run { skipped++; return@forEach }
             val recent = measured.takeLast(5)
@@ -431,7 +448,8 @@ class ThermalEngine(
 
             var currentT = latest.temperature
             var currentH = latest.humidity
-            var currentMass = estimateCurrentMass(profile, measured, outMap)
+            var currentMass = inertia.points.minByOrNull { abs(it.timestamp - latest.timestamp) }
+                ?.temperature ?: inertia.diagnostics.currentC
 
             for (horizon in 1..mode.maxHours) {
                 val ts = hourBucket(latest.timestamp) + horizon * THERMAL_HOUR_MS
@@ -470,7 +488,7 @@ class ThermalEngine(
                 // Trois heures minimum pour un modèle validé ; ensuite arrêt honnête si l'incertitude explose.
                 if (horizon > 3 && sigma > 1.50) break
 
-                val nextMass = advanceMass(profile, currentT, currentMass, avg6)
+                val nextMass = advanceInertiaMass(inertia.diagnostics, currentT, currentMass, avg6)
                 currentT += delta
                 currentMass = nextMass
                 currentH += 0.08 * (outHum - currentH)
@@ -543,13 +561,14 @@ class ThermalEngine(
         startAt: Long,
         outside: Map<Long, HourPoint>,
         profile: ThermalBuildingProfile,
+        inertia: ThermalInertiaEstimate,
         progress: ((ThermalProgress) -> Unit)? = null
     ): ForwardFillSummary {
         val start = hourBucket(startAt)
         val firstHour = hourBucket(first.timestamp)
         if (start >= firstHour) return ForwardFillSummary(diagnostic = "Période historique vide.")
 
-        val initial = estimateInitialStateForward(model, first, start, firstHour, outside, profile)
+        val initial = estimateInitialStateForward(model, first, start, firstHour, outside, profile, inertia)
             ?: return ForwardFillSummary(diagnostic = "Impossible d'initialiser un état air/masse thermique plausible avec ${reference.city}.")
 
         var current = initial.first
@@ -583,7 +602,7 @@ class ThermalEngine(
                 stopDiagnostic = "Propagation arrêtée avant dérive physique abusive (${round2(next)} °C)."
                 break
             }
-            val nextMass = advanceMass(profile, current, currentMass, extAvg6)
+            val nextMass = advanceInertiaMass(inertia.diagnostics, current, currentMass, extAvg6)
             val outHum = outside[hourBucket(ts)]?.humidity ?: currentH
             currentH += 0.08 * (outHum - currentH)
             current = next
@@ -601,7 +620,7 @@ class ThermalEngine(
         val drift = abs(current - first.temperature)
         return ForwardFillSummary(
             created, 1, drift,
-            "État masse initiale ${round2(initial.third)} °C · ${profile.summary()}"
+            "État inertiel initial ${round2(initial.third)} °C · τ ${round2(inertia.diagnostics.tauHours)} h · couplage appris"
         )
     }
 
@@ -611,9 +630,11 @@ class ThermalEngine(
         start: Long,
         firstHour: Long,
         outside: Map<Long, HourPoint>,
-        profile: ThermalBuildingProfile
+        profile: ThermalBuildingProfile,
+        inertia: ThermalInertiaEstimate
     ): Triple<Double, Double, Double>? {
         val initialMass = initialMassTemperature(profile, start, firstHour, outside) ?: return null
+        val targetMassAtFirst = inertia.points.minByOrNull { abs(it.timestamp - firstHour) }?.temperature
         val low = (initialMass - 7.0).coerceAtLeast(5.0)
         val high = (initialMass + 7.0).coerceAtMost(42.0)
         var candidate = low
@@ -641,7 +662,7 @@ class ThermalEngine(
                     valid = false
                     break
                 }
-                val nextMass = advanceMass(profile, current, mass, avg6)
+                val nextMass = advanceInertiaMass(inertia.diagnostics, current, mass, avg6)
                 current = next
                 mass = nextMass
                 ts += THERMAL_HOUR_MS
@@ -649,7 +670,9 @@ class ThermalEngine(
             if (valid && ts >= firstHour) {
                 // Le premier vrai point juge le départ, mais une petite pénalité évite
                 // de choisir une température d'air initiale artificiellement éloignée de la masse.
-                val error = abs(current - first.temperature) + 0.035 * abs(candidate - initialMass)
+                val massError = targetMassAtFirst?.let { abs(mass - it) } ?: 0.0
+                val error = abs(current - first.temperature) +
+                    0.20 * massError + 0.035 * abs(candidate - initialMass)
                 if (error < bestError) {
                     bestError = error
                     bestStart = candidate
@@ -668,6 +691,7 @@ class ThermalEngine(
         model: ThermalModel,
         reference: WeatherReference,
         profile: ThermalBuildingProfile,
+        inertia: ThermalInertiaEstimate,
         progress: ((ThermalProgress) -> Unit)? = null
     ): ForwardFillSummary {
         val measured = measuredHourly(sensor.id)
@@ -688,7 +712,10 @@ class ThermalEngine(
             if (gapHours !in 2..(14 * 24)) return@forEach
             var current = left.temperature
             var currentH = left.humidity
-            var currentMass = left.temperature
+            var currentMass = inertia.points
+                .minByOrNull { abs(it.timestamp - left.timestamp) }
+                ?.takeIf { abs(it.timestamp - left.timestamp) <= 3L * THERMAL_HOUR_MS }
+                ?.temperature ?: left.temperature
             var completed = true
 
             for (step in 1 until gapHours) {
@@ -706,7 +733,7 @@ class ThermalEngine(
                     .coerceIn(-1.2, 1.2)
                 val predicted = current + delta
                 if (!plausibleIndoor(predicted)) { completed = false; break }
-                val nextMass = advanceMass(profile, current, currentMass, avg6)
+                val nextMass = advanceInertiaMass(inertia.diagnostics, current, currentMass, avg6)
                 current = predicted
                 currentMass = nextMass
                 val outHum = outMap[hourBucket(ts)]?.humidity ?: currentH
@@ -745,12 +772,13 @@ class ThermalEngine(
     private fun validateLongHorizon(
         coeff: DoubleArray,
         rows: List<TrainingRow>,
-        profile: ThermalBuildingProfile
+        profile: ThermalBuildingProfile,
+        inertia: ThermalInertiaDiagnostics
     ): Double {
         if (rows.size < 12) return 99.0
         val selected = rows.takeLast(120)
         var current = selected.first().tin
-        var mass = current
+        var mass = selected.first().mass
         var previousTimestamp = selected.first().timestamp - THERMAL_HOUR_MS
         val errors = mutableListOf<Double>()
 
@@ -759,14 +787,14 @@ class ThermalEngine(
                 (45L * 60L * 1000L)..(90L * 60L * 1000L)
             if (!contiguous) {
                 current = row.tin
-                mass = row.tin
+                mass = row.mass
             }
             val delta = massAwareDelta(coeff, current, mass, row.tout, row.toutAvg6, row.hourOfDay, profile)
                 .coerceIn(-1.2, 1.2)
             val predicted = current + delta
             if (!plausibleIndoor(predicted)) return 99.0
             errors += predicted - row.nextTin
-            val nextMass = advanceMass(profile, current, mass, row.toutAvg6)
+            val nextMass = advanceInertiaMass(inertia, current, mass, row.toutAvg6)
             current = predicted
             mass = nextMass
             previousTimestamp = row.timestamp
@@ -833,6 +861,19 @@ class ThermalEngine(
         return mass + (target - mass) / profile.massTauHours()
     }
 
+
+    private fun advanceInertiaMass(
+        diagnostics: ThermalInertiaDiagnostics,
+        indoor: Double,
+        mass: Double,
+        outsideAvg: Double
+    ): Double {
+        val w = diagnostics.outsideWeight.coerceIn(0.02, 0.45)
+        val tau = diagnostics.tauHours.coerceIn(24.0, 1440.0)
+        val target = indoor * (1.0 - w) + outsideAvg * w
+        return mass + (target - mass) / tau
+    }
+
     private fun massAwareDelta(
         coeff: DoubleArray,
         indoor: Double,
@@ -842,7 +883,8 @@ class ThermalEngine(
         hour: Int,
         profile: ThermalBuildingProfile
     ): Double {
-        val learned = predictDelta(coeff, indoor, outside, outsideAvg6, hour)
+        val learned = predictDelta(coeff, indoor, mass, outside, outsideAvg6, hour)
+        if (coeff.size >= 6) return learned
         val slowMemory = profile.massCoupling() * (mass - indoor)
         return learned + slowMemory
     }
@@ -865,8 +907,12 @@ class ThermalEngine(
     private fun equilibriumTemperature(coeff: DoubleArray, tout: Double, avg6: Double, hour: Int): Double? {
         val exchange = coeff[0] + coeff[1]
         if (!exchange.isFinite() || abs(exchange) < 0.002) return null
-        val seasonal = coeff[2] * sin(2.0 * PI * hour / 24.0) +
-            coeff[3] * cos(2.0 * PI * hour / 24.0) + coeff[4]
+        val sinIndex = if (coeff.size >= 6) 3 else 2
+        val cosIndex = if (coeff.size >= 6) 4 else 3
+        val biasIndex = if (coeff.size >= 6) 5 else 4
+        // À l'équilibre air≈masse : le terme appris (T_mass-T_air) s'annule.
+        val seasonal = coeff[sinIndex] * sin(2.0 * PI * hour / 24.0) +
+            coeff[cosIndex] * cos(2.0 * PI * hour / 24.0) + coeff[biasIndex]
         val value = (coeff[0] * tout + coeff[1] * avg6 + seasonal) / exchange
         return value.takeIf { it.isFinite() }
     }
@@ -915,6 +961,7 @@ class ThermalEngine(
     private fun buildTrainingRows(
         indoor: List<HourPoint>,
         outside: Map<Long, HourPoint>,
+        inertia: Map<Long, SamplePoint>,
         medianDeltas: Map<Long, Double>,
         lagHours: Int
     ): List<TrainingRow> {
@@ -932,21 +979,23 @@ class ThermalEngine(
             val extTs = hourBucket(a.timestamp) - lagHours * THERMAL_HOUR_MS
             val tout = outsideAt(outside, extTs) ?: return@forEach
             val avg6 = outsideAverage(outside, extTs, 6) ?: return@forEach
+            val mass = inertia[hourBucket(a.timestamp)]?.temperature ?: return@forEach
             val hour = Instant.ofEpochMilli(a.timestamp).atZone(zone).hour
             val features = doubleArrayOf(
                 tout - a.temperature,
                 avg6 - a.temperature,
+                mass - a.temperature,
                 sin(2.0 * PI * hour / 24.0),
                 cos(2.0 * PI * hour / 24.0),
                 1.0
             )
-            rows += TrainingRow(a.timestamp, a.temperature, b.temperature, tout, avg6, hour, features, dTin)
+            rows += TrainingRow(a.timestamp, a.temperature, b.temperature, tout, avg6, mass, hour, features, dTin)
         }
         return rows
     }
 
     private fun ridgeRegression(rows: List<TrainingRow>): DoubleArray? {
-        val n = 5
+        val n = rows.firstOrNull()?.features?.size ?: return null
         val a = Array(n) { DoubleArray(n) }
         val b = DoubleArray(n)
         rows.forEach { row ->
@@ -973,14 +1022,32 @@ class ThermalEngine(
         return ThermalMetrics(mae, rmse, bias, maxErr, errors.size)
     }
 
-    private fun predictDelta(coeff: DoubleArray, tin: Double, tout: Double, toutAvg6: Double, hour: Int): Double {
-        val f = doubleArrayOf(
-            tout - tin,
-            toutAvg6 - tin,
-            sin(2.0 * PI * hour / 24.0),
-            cos(2.0 * PI * hour / 24.0),
-            1.0
-        )
+    private fun predictDelta(
+        coeff: DoubleArray,
+        tin: Double,
+        mass: Double,
+        tout: Double,
+        toutAvg6: Double,
+        hour: Int
+    ): Double {
+        val f = if (coeff.size >= 6) {
+            doubleArrayOf(
+                tout - tin,
+                toutAvg6 - tin,
+                mass - tin,
+                sin(2.0 * PI * hour / 24.0),
+                cos(2.0 * PI * hour / 24.0),
+                1.0
+            )
+        } else {
+            doubleArrayOf(
+                tout - tin,
+                toutAvg6 - tin,
+                sin(2.0 * PI * hour / 24.0),
+                cos(2.0 * PI * hour / 24.0),
+                1.0
+            )
+        }
         return dot(coeff, f)
     }
 

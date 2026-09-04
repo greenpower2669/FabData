@@ -514,7 +514,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     value?.let { sensor.id to it }
                 }.toMap()
-                val inertia = runCatching { inertiaEstimator.estimate(selectedWeatherReference) }.getOrNull()
+                val modelSensorId = context
+                    .getSharedPreferences("fabdata_thermal_model", Context.MODE_PRIVATE)
+                    .getLong("selected_sensor_id", -1L)
+                    .takeIf { it >= 0L }
+                val inertia = runCatching {
+                    inertiaEstimator.estimate(selectedWeatherReference, modelSensorId, includeHistory = true)
+                }.getOrNull()
                 LoadedData(
                     s, all, chosen, samples, overviewWithReference, stat,
                     db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia

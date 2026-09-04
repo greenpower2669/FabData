@@ -68,6 +68,9 @@ fun ThermalReferenceCard(
     val manager = remember { WeatherReferenceManager(context, db, lyonLab, credentials) }
     val engine = remember { ThermalEngine(db, manager.store()) }
     val profileStore = remember { ThermalProfileStore(context) }
+    val modelSensorPrefs = remember {
+        context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
+    }
     var profile by remember { mutableStateOf(profileStore.load()) }
     var forecastMode by remember { mutableStateOf(profileStore.forecastMode()) }
     val scope = rememberCoroutineScope()
@@ -87,7 +90,9 @@ fun ThermalReferenceCard(
     var historyDialog by remember { mutableStateOf(false) }
     var historyDays by remember { mutableIntStateOf(30) }
     var suppressNextAuto by remember { mutableStateOf(false) }
-    var selectedSensorId by remember { mutableStateOf<Long?>(null) }
+    var selectedSensorId by remember {
+        mutableStateOf(modelSensorPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L })
+    }
     var profileDialog by remember { mutableStateOf(false) }
     var measuredRevision by remember { mutableStateOf<String?>(null) }
 
@@ -123,6 +128,7 @@ fun ThermalReferenceCard(
                 status = thermalStatus
                 if (selectedSensorId == null || thermalStatus.sensors.none { it.sensor.id == selectedSensorId }) {
                     selectedSensorId = thermalStatus.preferred?.sensor?.id
+                    selectedSensorId?.let { modelSensorPrefs.edit().putLong("selected_sensor_id", it).apply() }
                 }
                 val horizon = forecast.forecastHorizonHours.takeIf { it > 0 }?.let { "H+$it" } ?: "—"
                 val sigma = forecast.maxForecastSigma.takeIf { it > 0.0 }?.let { " · σ max ${fmt(it)} °C" }.orEmpty()
@@ -219,6 +225,7 @@ fun ThermalReferenceCard(
                                 if (selectable.isNotEmpty()) {
                                     val next = (index - 1 + selectable.size) % selectable.size
                                     selectedSensorId = selectable[next].sensor.id
+                                    modelSensorPrefs.edit().putLong("selected_sensor_id", selectable[next].sensor.id).apply()
                                 }
                             },
                             enabled = !busy && selectable.size > 1
@@ -311,7 +318,7 @@ fun ThermalReferenceCard(
                 onClick = { weatherHistoryDialog = true },
                 enabled = !busy,
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("Étendre historique météo") }
+            ) { Text("Étendre historique météo + bâtiment") }
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
@@ -327,7 +334,7 @@ fun ThermalReferenceCard(
             }
 
             Text(
-                "Garde-fou : moins de 16 jours réels = aucune reconstruction historique. Au-delà, toutes les données réelles propres disponibles sont utilisées.",
+                "Garde-fou : apprentissage uniquement sur MEASURED propres. Clim probable, fenêtre, saut brutal ou donnée douteuse restent visibles mais sont exclues de l’apprentissage. Météo + inertie sont obligatoires pour prolonger le passé.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -367,10 +374,10 @@ fun ThermalReferenceCard(
     if (weatherHistoryDialog) {
         AlertDialog(
             onDismissRequest = { weatherHistoryDialog = false },
-            title = { Text("Étendre la référence météo ?") },
+            title = { Text("Étendre l’historique complet ?") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("FabData va préparer ${reference.label} avant le modèle thermique. La courbe affichée sera exactement la série donnée au moteur RC.")
+                    Text("FabData prépare automatiquement les deux petits loups : météo extérieure + inertie bâtiment, puis reconstruit l’air intérieur sur la même profondeur. Pas de courbe historique intérieure sans inertie.")
                     Row(
                         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -393,17 +400,46 @@ fun ThermalReferenceCard(
                         busy = true
                         info = "Historique météo · préparation ${thermalHistoryLabel(weatherHistoryDays)}…"
                         val result = withContext(Dispatchers.IO) {
-                            runCatching { manager.prepareHistory(reference, weatherHistoryDays) }
+                            runCatching {
+                                val prepared = manager.prepareHistory(reference, weatherHistoryDays)
+                                if (!prepared.coverage.ready) {
+                                    error("${reference.city} incomplet : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
+                                }
+                                val checked = engine.status(reference, selectedSensorId, profile)
+                                if (!checked.canReconstruct) error(checked.message)
+                                val activeId = selectedSensorId ?: checked.preferred?.sensor?.id
+                                val activeModel = checked.preferred?.model?.takeIf { it.sensorId == activeId }
+                                val summary = engine.reconstructHistory(
+                                    reference = reference,
+                                    requestedDays = weatherHistoryDays,
+                                    sensorId = activeId,
+                                    profile = profile,
+                                    precalibratedModel = activeModel
+                                ) { p ->
+                                    scope.launch {
+                                        info = if (p.total > 0) {
+                                            val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
+                                            "${p.stage} · $percent % · ${p.changed} point(s) écrit(s)"
+                                        } else p.stage
+                                        if (p.total > 0 && p.processed > 0) {
+                                            suppressNextAuto = true
+                                            onDataChanged()
+                                        }
+                                    }
+                                }
+                                prepared to summary
+                            }
                         }
                         busy = false
                         result.fold(
-                            onSuccess = { prepared ->
+                            onSuccess = { (prepared, summary) ->
                                 val c = prepared.coverage
-                                info = "${prepared.sync.label} · historique ${prepared.days} j · couverture ${(c.coverage * 100).toInt()} % · trou max ${c.maxGapHours} h · ${c.measuredHours} h réelles · ${c.reconstructedHours} h reconstruites"
+                                val detail = summary.diagnostic?.let { d -> " · $d" }.orEmpty()
+                                info = "Deux petits loups prêts · météo ${prepared.days} j ${(c.coverage * 100).toInt()} % · bâtiment ${summary.reconstructed} point(s) · ${summary.raccords} raccord(s)$detail"
                                 suppressNextAuto = true
                                 onDataChanged()
                             },
-                            onFailure = { info = it.message ?: "Extension météo impossible" }
+                            onFailure = { info = it.message ?: "Extension météo + bâtiment impossible" }
                         )
                     }
                 }) { Text("Étendre") }
@@ -418,7 +454,7 @@ fun ThermalReferenceCard(
             title = { Text("Estimer l'historique thermique ?") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Des données antérieures semblent manquer. FabData peut estimer l'historique thermique du bâtiment avec le modèle validé.")
+                    Text("FabData prolonge ensemble la météo, l’état inertiel du bâtiment puis l’air intérieur. Les paramètres sont appris uniquement sur les mesures réelles propres.")
                     Text("Choisis une limite maximale :")
                     Row(
                         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),

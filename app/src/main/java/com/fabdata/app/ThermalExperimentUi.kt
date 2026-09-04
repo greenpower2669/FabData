@@ -45,7 +45,7 @@ fun ThermalInertiaExperimentCard(estimate: ThermalInertiaEstimate?) {
         ) {
             Text("Température inertielle estimée · expérimental", fontWeight = FontWeight.Bold)
             Text(
-                "Observation uniquement : mesures intérieures réelles + météo explicative. Cette courbe ne participe ni à la reconstruction ni à la prévision.",
+                "Apprise uniquement sur les points MEASURED propres. Clim, fenêtres probables et données douteuses restent visibles mais ne forment pas le modèle. Cette inertie accompagne désormais la météo pour prolonger l’historique.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -59,7 +59,7 @@ fun ThermalInertiaExperimentCard(estimate: ThermalInertiaEstimate?) {
                 Text(String.format(Locale.FRANCE, "État inertiel actuel : %.1f °C", d.currentC), fontWeight = FontWeight.SemiBold)
                 Text("Tendance : ${d.trendLabel}", style = MaterialTheme.typography.bodySmall)
                 Text(
-                    "τ ≈ ${formatTau(d.tauHours)} · couplage air ↔ masse ${d.couplingLabel} · confiance ${d.confidenceLabel} ${(d.confidence * 100).toInt()} %",
+                    "τ ≈ ${formatTau(d.tauHours)} · extérieur inertiel ${(d.outsideWeight * 100).toInt()} % · couplage air ↔ masse ${d.couplingLabel} · confiance ${d.confidenceLabel} ${(d.confidence * 100).toInt()} %",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
