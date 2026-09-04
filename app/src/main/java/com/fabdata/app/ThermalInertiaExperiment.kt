@@ -232,34 +232,6 @@ class ThermalInertiaEstimator(
     }
 
 
-    private fun allHourly(sensorId: Long): List<SamplePoint> {
-        PointSourceStore.ensure(db.readableDatabase)
-        val raw = mutableListOf<SamplePoint>()
-        db.readableDatabase.rawQuery(
-            """
-            SELECT p.timestamp, p.temperature, p.humidity, ps.source
-            FROM samples p
-            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
-            WHERE p.sensor_id=? AND (ps.source IS NULL OR ps.source<>'forecast')
-            ORDER BY p.timestamp
-            """.trimIndent(),
-            arrayOf(sensorId.toString())
-        ).use { c ->
-            while (c.moveToNext()) {
-                val source = PointSource.fromDb(if (c.isNull(3)) null else c.getString(3))
-                raw += SamplePoint(sensorId, c.getLong(0), c.getDouble(1), c.getDouble(2), source, 1.0)
-            }
-        }
-        return raw.groupBy { bucket(it.timestamp) }.map { (ts, values) ->
-            val priority = values.maxOf { it.source.priority }
-            val best = values.filter { it.source.priority == priority }
-            SamplePoint(
-                sensorId, ts, best.map { it.temperature }.average(), best.map { it.humidity }.average(),
-                best.first().source, best.map { it.confidence }.average()
-            )
-        }.sortedBy { it.timestamp }
-    }
-
     private fun measuredHourly(sensorId: Long): List<SamplePoint> {
         PointSourceStore.ensure(db.readableDatabase)
         val out = mutableListOf<SamplePoint>()
