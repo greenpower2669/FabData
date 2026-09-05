@@ -10,6 +10,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -279,6 +280,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val weatherReferenceStore = remember { WeatherReferenceStore(db) }
     val weatherReferenceManager = remember { WeatherReferenceManager(context, db, lyonLab, meteoCredentials) }
     val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
+    val thermalTrainingMaskStore = remember { ThermalTrainingMaskStore(db) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
@@ -298,6 +300,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
     var preset by rememberSaveable { mutableStateOf(TimePreset.TWO_DAYS) }
     var windowCenterTimestamp by remember { mutableStateOf<Long?>(null) }
+    var customViewSpanMs by remember { mutableStateOf<Long?>(null) }
     var showAllAnnotations by rememberSaveable { mutableStateOf(true) }
     var reloadToken by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
@@ -431,7 +434,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    LaunchedEffect(reloadToken, preset, windowCenterTimestamp) {
+    LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs) {
         busy = true
         val loaded = withContext(Dispatchers.IO) {
             val s = db.sensors()
@@ -448,7 +451,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
             val chosen = all?.let { bounds ->
                 val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
-                val requested = minOf(preset.spanMs, fullSpan)
+                val requested = minOf(customViewSpanMs ?: preset.spanMs, fullSpan)
                 if (requested >= fullSpan) {
                     bounds
                 } else {
@@ -726,12 +729,61 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             windowCenterTimestamp = ts
                             selectedTimestamp = ts
                             selectedAnnotation = null
+                        },
+                        onUseForInertia = { range ->
+                            val sensorId = inertiaEstimate?.diagnostics?.sourceSensorId
+                            if (sensorId == null) {
+                                scope.launch { snackbar.showSnackbar("Modèle d'inertie indisponible : aucune sonde physique active") }
+                            } else {
+                                scope.launch {
+                                    busy = true
+                                    val changed = withContext(Dispatchers.IO) {
+                                        thermalTrainingMaskStore.includeRange(sensorId, range.first, range.last)
+                                    }
+                                    reloadToken++
+                                    busy = false
+                                    snackbar.showSnackbar(
+                                        if (changed > 0) "Zone réintégrée à l'entraînement inertiel"
+                                        else "Zone déjà utilisée pour l'entraînement inertiel"
+                                    )
+                                }
+                            }
+                        },
+                        onExcludeFromInertia = { range ->
+                            val sensorId = inertiaEstimate?.diagnostics?.sourceSensorId
+                            if (sensorId == null) {
+                                scope.launch { snackbar.showSnackbar("Modèle d'inertie indisponible : aucune sonde physique active") }
+                            } else {
+                                scope.launch {
+                                    busy = true
+                                    withContext(Dispatchers.IO) {
+                                        thermalTrainingMaskStore.addMerged(
+                                            sensorId,
+                                            range.first,
+                                            range.last,
+                                            "Sélection bandeau global"
+                                        )
+                                    }
+                                    reloadToken++
+                                    busy = false
+                                    snackbar.showSnackbar("Zone exclue de l'entraînement inertiel · RAW conservées")
+                                }
+                            }
+                        },
+                        onZoomRange = { range ->
+                            val span = (range.last - range.first).coerceAtLeast(60L * 60L * 1000L)
+                            val center = range.first + span / 2L
+                            customViewSpanMs = span
+                            windowCenterTimestamp = center
+                            selectedTimestamp = center
+                            selectedAnnotation = null
                         }
                     )
                 }
 
                 item {
                     TimeTabs(preset = preset, onSelect = {
+                        customViewSpanMs = null
                         preset = it
                         windowCenterTimestamp = selectedTimestamp
                             ?: viewBounds?.let { b -> b.first + (b.last - b.first) / 2L }
@@ -769,6 +821,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             selectedTimestamp = ts
                         },
                         onRequestZoom = { ts ->
+                            customViewSpanMs = null
                             preset = TimePreset.TWO_DAYS
                             windowCenterTimestamp = ts
                             selectedTimestamp = ts
@@ -1393,7 +1446,10 @@ private fun HistoryOverviewCard(
     viewBounds: LongRange?,
     selectedTimestamp: Long?,
     onSelectTimestamp: (Long) -> Unit,
-    onNavigate: (Long) -> Unit
+    onNavigate: (Long) -> Unit,
+    onUseForInertia: (LongRange) -> Unit,
+    onExcludeFromInertia: (LongRange) -> Unit,
+    onZoomRange: (LongRange) -> Unit
 ) {
     Card(shape = RoundedCornerShape(18.dp)) {
         Column(
@@ -1402,7 +1458,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Tap = sélectionner · double tap = ouvrir · glisse = déplacer la prévisu · pince = élargir/rétrécir",
+                "Tap = viser · double tap = ouvrir · Sélection = choisir une période · pince/glisse = prévisu",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1419,6 +1475,10 @@ private fun HistoryOverviewCard(
                             ?: (bounds.first + (bounds.last - bounds.first) / 2L)
                     )
                 }
+                var rangeSelectionMode by rememberSaveable { mutableStateOf(false) }
+                var rangeStart by remember { mutableStateOf<Long?>(null) }
+                var rangeEnd by remember { mutableStateOf<Long?>(null) }
+                var rangeMenuOpen by remember { mutableStateOf(false) }
 
                 Row(
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
@@ -1443,6 +1503,27 @@ private fun HistoryOverviewCard(
                             )
                         }
                     }
+                }
+
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    AssistChip(
+                        onClick = {
+                            rangeSelectionMode = !rangeSelectionMode
+                            rangeMenuOpen = false
+                            rangeStart = null
+                            rangeEnd = null
+                        },
+                        label = {
+                            Text(if (rangeSelectionMode) "✓ Sélection active" else "Sélectionner une période")
+                        }
+                    )
+                }
+                if (rangeSelectionMode) {
+                    Text(
+                        "Glisse horizontalement dans le bandeau puis choisis l'action. Tu peux recommencer pour plusieurs zones.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
 
                 val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
@@ -1480,8 +1561,8 @@ private fun HistoryOverviewCard(
                         .fillMaxWidth()
                         .height(92.dp)
                         .background(surface, RoundedCornerShape(12.dp))
-                        .pointerInput(bounds, previewPreset) {
-                            detectTransformGestures { centroid, pan, zoomChange, _ ->
+                        .pointerInput(bounds, previewPreset, rangeSelectionMode) {
+                            if (!rangeSelectionMode) detectTransformGestures { centroid, pan, zoomChange, _ ->
                                 val oldMaxSpan = minOf(previewPreset.spanMs, fullSpan).coerceAtLeast(1L)
                                 val oldMainSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
                                     ?: (24L * 60L * 60L * 1000L)
@@ -1510,19 +1591,54 @@ private fun HistoryOverviewCard(
                                 previewCenter = clampCenter(zoomAnchoredCenter + panShift, newSpan)
                             }
                         }
-                        .pointerInput(previewFrom, previewTo) {
-                            detectTapGestures(
-                                onDoubleTap = { p ->
-                                    val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                                    val ts = previewFrom + (previewSpan * frac).toLong()
-                                    onSelectTimestamp(ts)
-                                    onNavigate(ts)
-                                },
-                                onTap = { p ->
-                                    val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
-                                    onSelectTimestamp(previewFrom + (previewSpan * frac).toLong())
-                                }
-                            )
+                        .pointerInput(previewFrom, previewTo, rangeSelectionMode) {
+                            if (!rangeSelectionMode) {
+                                detectTapGestures(
+                                    onDoubleTap = { p ->
+                                        val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                        val ts = previewFrom + (previewSpan * frac).toLong()
+                                        onSelectTimestamp(ts)
+                                        onNavigate(ts)
+                                    },
+                                    onTap = { p ->
+                                        val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                        onSelectTimestamp(previewFrom + (previewSpan * frac).toLong())
+                                    }
+                                )
+                            }
+                        }
+                        .pointerInput(previewFrom, previewTo, rangeSelectionMode) {
+                            if (rangeSelectionMode) {
+                                detectDragGestures(
+                                    onDragStart = { p ->
+                                        val frac = (p.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                        val ts = previewFrom + (previewSpan * frac).toLong()
+                                        rangeStart = ts
+                                        rangeEnd = ts
+                                        rangeMenuOpen = false
+                                    },
+                                    onDrag = { change, _ ->
+                                        val frac = (change.position.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                        rangeEnd = previewFrom + (previewSpan * frac).toLong()
+                                        change.consume()
+                                    },
+                                    onDragEnd = {
+                                        val a = rangeStart
+                                        val b = rangeEnd
+                                        if (a != null && b != null && kotlin.math.abs(b - a) >= 60L * 60L * 1000L) {
+                                            rangeMenuOpen = true
+                                        } else {
+                                            rangeStart = null
+                                            rangeEnd = null
+                                        }
+                                    },
+                                    onDragCancel = {
+                                        rangeStart = null
+                                        rangeEnd = null
+                                        rangeMenuOpen = false
+                                    }
+                                )
+                            }
                         }
                 ) {
                     if (visiblePoints.isNotEmpty()) {
@@ -1577,6 +1693,30 @@ private fun HistoryOverviewCard(
                         }
                     }
 
+                    if (rangeSelectionMode) {
+                        val a = rangeStart
+                        val b = rangeEnd
+                        if (a != null && b != null) {
+                            val start = maxOf(minOf(a, b), previewFrom)
+                            val end = minOf(maxOf(a, b), previewTo)
+                            if (end > start) {
+                                val left = (((start - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
+                                    .coerceIn(0f, size.width)
+                                val right = (((end - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
+                                    .coerceIn(0f, size.width)
+                                drawRect(
+                                    selectionColor.copy(alpha = 0.24f),
+                                    topLeft = Offset(left, 0f),
+                                    size = androidx.compose.ui.geometry.Size(right - left, size.height)
+                                )
+                                drawLine(selectionColor, Offset(left, 0f), Offset(left, size.height), 2.dp.toPx())
+                                drawLine(selectionColor, Offset(right, 0f), Offset(right, size.height), 2.dp.toPx())
+                                drawCircle(selectionColor, 5.dp.toPx(), Offset(left, size.height / 2f))
+                                drawCircle(selectionColor, 5.dp.toPx(), Offset(right, size.height / 2f))
+                            }
+                        }
+                    }
+
                     selectedTimestamp?.takeIf { it in previewWindow }?.let { selected ->
                         val x = (((selected - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
                             .coerceIn(0f, size.width)
@@ -1587,6 +1727,61 @@ private fun HistoryOverviewCard(
                             2.dp.toPx()
                         )
                         drawCircle(selectionColor, 4.dp.toPx(), Offset(x, size.height / 2f))
+                    }
+                }
+
+                val pendingRange = rangeStart?.let { a ->
+                    rangeEnd?.let { b -> minOf(a, b)..maxOf(a, b) }
+                }
+                Box(Modifier.fillMaxWidth()) {
+                    Box(Modifier.align(Alignment.TopEnd)) {
+                        DropdownMenu(
+                            expanded = rangeMenuOpen && pendingRange != null,
+                            onDismissRequest = {
+                                rangeMenuOpen = false
+                                rangeStart = null
+                                rangeEnd = null
+                            }
+                        ) {
+                            pendingRange?.let { selectedRange ->
+                                DropdownMenuItem(
+                                    text = { Text("Utiliser cette zone pour entraîner l'inertie") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onUseForInertia(selectedRange)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Exclure cette zone du modèle d'inertie") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onExcludeFromInertia(selectedRange)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Utiliser cette zone comme nouveau zoom") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        rangeSelectionMode = false
+                                        onZoomRange(selectedRange)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Annuler") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
 
