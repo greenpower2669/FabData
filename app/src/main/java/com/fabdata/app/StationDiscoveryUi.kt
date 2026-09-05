@@ -119,14 +119,14 @@ fun StationDiscoveryDialog(
     }
 
     LaunchedEffect(Unit) {
-        savedSector?.let { memory -> runScan { memory.anchor() } }
+        savedSector?.let { memory -> runScan(anchorProvider = { memory.anchor() }) }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         if (grants.values.any { it }) {
-            runScan { discovery.gpsAnchor() }
+            runScan(anchorProvider = { discovery.gpsAnchor() })
         } else {
             info = "Permission GPS refusée · utilise adresse, code postal, ville, coordonnées ou la carte."
         }
@@ -154,7 +154,7 @@ fun StationDiscoveryDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Button(
-                    onClick = { runScan { discovery.geocode(query) } },
+                    onClick = { runScan(anchorProvider = { discovery.geocode(query) }) },
                     enabled = !busy && query.trim().length >= 2,
                     modifier = Modifier.fillMaxWidth()
                 ) { Text(if (busy) "Recherche…" else "Chercher autour de ce lieu") }
@@ -164,7 +164,7 @@ fun StationDiscoveryDialog(
                         val fine = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
                         val coarse = context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
                         if (fine || coarse) {
-                            runScan { discovery.gpsAnchor() }
+                            runScan(anchorProvider = { discovery.gpsAnchor() })
                         } else {
                             permissionLauncher.launch(
                                 arrayOf(
@@ -205,7 +205,7 @@ fun StationDiscoveryDialog(
                         if (lat == null || lon == null) {
                             info = "Coordonnées invalides"
                         } else {
-                            runScan { discovery.reverse(lat, lon) }
+                            runScan(anchorProvider = { discovery.reverse(lat, lon) })
                         }
                     },
                     enabled = !busy,
@@ -219,7 +219,7 @@ fun StationDiscoveryDialog(
                             selected = radiusKm == km,
                             onClick = {
                                 radiusKm = km
-                                result?.anchor?.let { anchor -> runScan { anchor } }
+                                result?.anchor?.let { anchor -> runScan(anchorProvider = { anchor }) }
                             },
                             label = { Text("$km km") },
                             enabled = !busy
@@ -236,17 +236,20 @@ fun StationDiscoveryDialog(
                             val lat = latitudeText.trim().replace(',', '.').toDoubleOrNull()
                             val lon = longitudeText.trim().replace(',', '.').toDoubleOrNull()
                             when {
-                                lat != null && lon != null -> runScan(openMapWhenReady = true) { discovery.reverse(lat, lon) }
-                                query.trim().length >= 2 -> runScan(openMapWhenReady = true) { discovery.geocode(query) }
-                                savedSector != null -> runScan(openMapWhenReady = true) { savedSector.anchor() }
-                                else -> runScan(openMapWhenReady = true) {
-                                    StationSearchAnchor(
-                                        "Autour de ${currentReference.label}",
-                                        currentReference.latitude,
-                                        currentReference.longitude,
-                                        currentReference.departmentId
-                                    )
-                                }
+                                lat != null && lon != null -> runScan(openMapWhenReady = true, anchorProvider = { discovery.reverse(lat, lon) })
+                                query.trim().length >= 2 -> runScan(openMapWhenReady = true, anchorProvider = { discovery.geocode(query) })
+                                savedSector != null -> runScan(openMapWhenReady = true, anchorProvider = { savedSector.anchor() })
+                                else -> runScan(
+                                    openMapWhenReady = true,
+                                    anchorProvider = {
+                                        StationSearchAnchor(
+                                            "Autour de ${currentReference.label}",
+                                            currentReference.latitude,
+                                            currentReference.longitude,
+                                            currentReference.departmentId
+                                        )
+                                    }
+                                )
                             }
                         }
                     },
