@@ -342,7 +342,9 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         PointSourceStore.ensure(readableDatabase)
         readableDatabase.rawQuery(
             """
-            SELECT COUNT(*), MIN(p.timestamp), MAX(p.timestamp)
+            SELECT COUNT(*), MIN(p.timestamp), MAX(p.timestamp),
+                   COALESCE(SUM(CAST(ROUND(p.temperature * 1000.0) AS INTEGER)), 0),
+                   COALESCE(SUM(CAST(ROUND(p.humidity * 1000.0) AS INTEGER)), 0)
             FROM samples p
             JOIN sensors s ON s.id = p.sensor_id
             LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
@@ -352,7 +354,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             """.trimIndent(), null
         ).use { c ->
             if (!c.moveToFirst() || c.getLong(0) <= 0L || c.isNull(1) || c.isNull(2)) return null
-            return "${c.getLong(0)}:${c.getLong(1)}:${c.getLong(2)}"
+            return "${c.getLong(0)}:${c.getLong(1)}:${c.getLong(2)}:${c.getLong(3)}:${c.getLong(4)}"
         }
     }
 

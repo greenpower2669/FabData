@@ -155,9 +155,63 @@ object PointSourceStore {
             "sensor_id=? AND timestamp=?",
             arrayOf(sensorId.toString(), timestamp.toString())
         )
+        // v0.17 : une mesure réelle domine également les points CALCULÉS du même
+        // bucket horaire. Les mesures réelles voisines sont intouchables.
+        pruneCalculatedInMeasuredHour(db, sensorId, timestamp)
+
         // Une vraie mesure change l'état connu : tout forecast situé après elle
         // appartient désormais à un ancien état du monde et doit disparaître.
         invalidateForecastsAfterMeasured(db, sensorId, timestamp)
+    }
+
+    private fun pruneCalculatedInMeasuredHour(db: FabDataDb, sensorId: Long, timestamp: Long): Int {
+        ensure(db.writableDatabase)
+        val hourMs = 60L * 60L * 1000L
+        val from = (timestamp / hourMs) * hourMs
+        val to = from + hourMs - 1L
+        val stale = mutableListOf<Long>()
+        db.readableDatabase.rawQuery(
+            "SELECT timestamp FROM point_sources WHERE sensor_id=? AND timestamp BETWEEN ? AND ? AND source<>'measured'",
+            arrayOf(sensorId.toString(), from.toString(), to.toString())
+        ).use { c -> while (c.moveToNext()) stale += c.getLong(0) }
+        stale.forEach { ts ->
+            db.writableDatabase.delete("samples", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
+            db.writableDatabase.delete("point_sources", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
+        }
+        return stale.size
+    }
+
+    /**
+     * Nettoyage conservateur pour les bases héritées : si un bucket horaire contient
+     * au moins une vraie mesure, seules les lignes calculées de ce même bucket sont
+     * retirées. Aucune mesure réelle ne peut apparaître dans la liste de suppression.
+     */
+    fun reconcileMeasuredDominance(db: FabDataDb): Int {
+        ensure(db.writableDatabase)
+        val stale = mutableListOf<Pair<Long, Long>>()
+        db.readableDatabase.rawQuery(
+            """
+            SELECT c.sensor_id, c.timestamp
+            FROM point_sources c
+            WHERE c.source<>'measured'
+              AND EXISTS (
+                SELECT 1
+                FROM samples m
+                LEFT JOIN point_sources mp ON mp.sensor_id=m.sensor_id AND mp.timestamp=m.timestamp
+                WHERE m.sensor_id=c.sensor_id
+                  AND (m.timestamp / 3600000)=(c.timestamp / 3600000)
+                  AND (mp.source IS NULL OR mp.source='measured')
+              )
+            """.trimIndent(), null
+        ).use { c -> while (c.moveToNext()) stale += c.getLong(0) to c.getLong(1) }
+        if (stale.isEmpty()) return 0
+        db.inTransaction {
+            stale.forEach { (sensorId, ts) ->
+                db.writableDatabase.delete("samples", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
+                db.writableDatabase.delete("point_sources", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
+            }
+        }
+        return stale.size
     }
 
     private fun invalidateForecastsAfterMeasured(db: FabDataDb, sensorId: Long, timestamp: Long) {

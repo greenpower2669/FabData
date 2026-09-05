@@ -317,6 +317,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val showHumidity = remember { mutableStateMapOf<Long, Boolean>() }
     var initialHandled by remember { mutableStateOf(false) }
 
+    // v0.17 : cet orchestrateur reste composé même quand les réglages thermiques
+    // sont loin sous le viewport du LazyColumn.
+    FabLiveUpdateCoordinator(
+        db = db,
+        lyonLab = lyonLab,
+        credentials = meteoCredentials,
+        dataVersion = reloadToken,
+        onDataChanged = { reloadToken++ }
+    )
+
     val activeCurveStyles = remember(sensors, styleVersion) {
         buildMap {
             sensors.forEach { sensor -> put(sensor.id, curveStyleStore.load("sensor:${sensor.stableKey}")) }
@@ -378,15 +388,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    // v0.9.2 : Lyon est une sonde système permanente.
-    // Officiel si possible, secours automatique sinon. Le token n'agit jamais sur la visibilité.
-    LaunchedEffect(Unit) {
-        val result = runCatching { syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
-        reloadToken++
-        result.exceptionOrNull()?.let { error ->
-            snackbar.showSnackbar("Lyon non actualisé : ${error.message ?: "source indisponible"}")
-        }
-    }
+    // v0.17 : la météo live est désormais pilotée par FabLiveUpdateCoordinator
+    // à l'ouverture, au retour au focus et ensuite toutes les 60 secondes.
 
     // Les sondes HTTP ajoutées une fois restent automatiques ensuite.
     LaunchedEffect(Unit) {
@@ -676,9 +679,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
                         onSelectTimestamp = { ts ->
-                            // Un simple tap ne modifie PAS la fenêtre principale.
-                            // Il déplace uniquement la sélection dans la mini-vue.
+                            // v0.17 : une sélection depuis le bandeau place la visée
+                            // au centre de la fenêtre détaillée tout en gardant son zoom.
                             selectedTimestamp = ts
+                            windowCenterTimestamp = ts
                             selectedAnnotation = null
                         },
                         onNavigate = { ts ->
@@ -1657,14 +1661,30 @@ private fun InteractiveChart(
     Canvas(
         modifier = modifier
             .background(surfaceColor, RoundedCornerShape(16.dp))
-            .pointerInput(from, to, resetKey) {
-                detectTransformGestures { _, pan, zoomChange, _ ->
-                    val oldVisible = 1f / zoom
-                    val newZoom = (zoom * zoomChange).coerceIn(1f, 720f)
-                    zoom = newZoom
-                    val visible = 1f / zoom
-                    center = (center - (pan.x / size.width.toFloat()) * oldVisible)
-                        .coerceIn(visible / 2f, 1f - visible / 2f)
+            .pointerInput(from, to, resetKey, selectedTimestamp) {
+                detectTransformGestures { centroid, pan, zoomChange, _ ->
+                    val window = visibleWindow()
+                    val span = (window.last - window.first).coerceAtLeast(1L)
+                    val leftPx = 52.dp.toPx()
+                    val rightPx = size.width - 44.dp.toPx()
+                    val selectedX = selectedTimestamp
+                        ?.takeIf { it in window }
+                        ?.let { leftPx + ((it - window.first).toDouble() / span.toDouble()).toFloat() * (rightPx - leftPx) }
+                    val grabsSight = selectedX != null &&
+                        kotlin.math.abs(centroid.x - selectedX) <= 30.dp.toPx() &&
+                        zoomChange in 0.97f..1.03f
+
+                    if (grabsSight && centroid.x in leftPx..rightPx) {
+                        val frac = ((centroid.x - leftPx) / (rightPx - leftPx)).coerceIn(0f, 1f)
+                        onSelectTimestamp(window.first + (span * frac).toLong())
+                    } else {
+                        val oldVisible = 1f / zoom
+                        val newZoom = (zoom * zoomChange).coerceIn(1f, 720f)
+                        zoom = newZoom
+                        val visible = 1f / zoom
+                        center = (center - (pan.x / size.width.toFloat()) * oldVisible)
+                            .coerceIn(visible / 2f, 1f - visible / 2f)
+                    }
                 }
             }
             .pointerInput(from, to, resetKey, zoom, center, annotations) {
@@ -1846,7 +1866,8 @@ private fun InteractiveChart(
                     val prev = previous
                     if (prev != null) {
                         val breakHere = (
-                            sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == THERMAL_INERTIA_SENSOR_ID
+                            sensor.stableKey == LyonWeatherSync.STABLE_KEY ||
+                            sensor.id == LYON_RECONSTRUCTED_SENSOR_ID || sensor.id == THERMAL_INERTIA_SENSOR_ID
                         ) && p.timestamp - prev.timestamp > LYON_DETAIL_GAP_MS
                         if (!breakHere) {
                             val path = sourcePaths[p.source]!!
@@ -1908,7 +1929,7 @@ private fun InteractiveChart(
                 points.forEach { p ->
                     val prev = previous
                     if (prev != null) {
-                        val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                        val breakHere = (sensor.stableKey == LyonWeatherSync.STABLE_KEY || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) &&
                             p.timestamp - prev.timestamp > LYON_DETAIL_GAP_MS
                         if (!breakHere) {
                             val path = sourcePaths[p.source]!!
@@ -1978,6 +1999,38 @@ private fun InteractiveChart(
         selectedTimestamp?.takeIf { it in visibleFrom..visibleTo }?.let { ts ->
             val x = mapX(ts)
             drawLine(selectColor, Offset(x, top), Offset(x, bottom), strokeWidth = 2f)
+
+            // Heure directement sur la visée.
+            val sightPaint = android.graphics.Paint(centerPaint).apply {
+                color = selectColor.toArgbCompat()
+                textSize = 9.dp.toPx()
+                isFakeBoldText = true
+            }
+            drawContext.canvas.nativeCanvas.drawText(
+                formatDateTime(ts),
+                x.coerceIn(left + 54.dp.toPx(), right - 54.dp.toPx()),
+                top + 10.dp.toPx(),
+                sightPaint
+            )
+
+            // Petit trait horizontal + valeur colorée à la hauteur de chaque sonde.
+            sensors.filter { showTemp[it.id] == true }.forEach { sensor ->
+                val point = nearestForSensor(sensor, sampleMap[sensor.id].orEmpty(), ts) ?: return@forEach
+                val y = mapTemp(point.temperature)
+                if (y !in top..bottom) return@forEach
+                val markerColor = palette[sensor.colorIndex % palette.size]
+                drawLine(markerColor, Offset(x - 13.dp.toPx(), y), Offset(x + 13.dp.toPx(), y), strokeWidth = 2.2.dp.toPx())
+                drawCircle(markerColor, 3.2.dp.toPx(), Offset(x, y))
+                val valuePaint = android.graphics.Paint(paint).apply {
+                    color = markerColor.toArgbCompat()
+                    textSize = 9.dp.toPx()
+                    isFakeBoldText = true
+                }
+                val label = String.format(Locale.FRANCE, "%.1f°", point.temperature)
+                val width = valuePaint.measureText(label)
+                val tx = if (x + 18.dp.toPx() + width <= right) x + 18.dp.toPx() else x - 18.dp.toPx() - width
+                drawContext.canvas.nativeCanvas.drawText(label, tx, y - 4.dp.toPx(), valuePaint)
+            }
         }
     }
 }

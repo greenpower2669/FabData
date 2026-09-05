@@ -160,6 +160,52 @@ class WeatherReferenceStore(private val db: FabDataDb) {
         db.writableDatabase.insertWithOnConflict(
             "weather_reference_samples", null, values, SQLiteDatabase.CONFLICT_REPLACE
         )
+        if (point.source == PointSource.MEASURED) {
+            pruneCalculatedInMeasuredHour(referenceKey, point.timestamp)
+        }
+    }
+
+    private fun pruneCalculatedInMeasuredHour(referenceKey: String, timestamp: Long): Int {
+        val hourMs = 60L * 60L * 1000L
+        val from = (timestamp / hourMs) * hourMs
+        val to = from + hourMs - 1L
+        val stale = mutableListOf<Long>()
+        db.readableDatabase.rawQuery(
+            "SELECT timestamp FROM weather_reference_samples WHERE reference_key=? AND timestamp BETWEEN ? AND ? AND source<>'measured'",
+            arrayOf(referenceKey, from.toString(), to.toString())
+        ).use { c -> while (c.moveToNext()) stale += c.getLong(0) }
+        stale.forEach { ts ->
+            db.writableDatabase.delete(
+                "weather_reference_samples",
+                "reference_key=? AND timestamp=? AND source<>'measured'",
+                arrayOf(referenceKey, ts.toString())
+            )
+        }
+        return stale.size
+    }
+
+    fun reconcileMeasuredDominance(referenceKey: String): Int {
+        val stale = mutableListOf<Long>()
+        db.readableDatabase.rawQuery(
+            """
+            SELECT c.timestamp
+            FROM weather_reference_samples c
+            WHERE c.reference_key=? AND c.source<>'measured'
+              AND EXISTS (
+                SELECT 1 FROM weather_reference_samples m
+                WHERE m.reference_key=c.reference_key AND m.source='measured'
+                  AND (m.timestamp / 3600000)=(c.timestamp / 3600000)
+              )
+            """.trimIndent(), arrayOf(referenceKey)
+        ).use { c -> while (c.moveToNext()) stale += c.getLong(0) }
+        stale.forEach { ts ->
+            db.writableDatabase.delete(
+                "weather_reference_samples",
+                "reference_key=? AND timestamp=? AND source<>'measured'",
+                arrayOf(referenceKey, ts.toString())
+            )
+        }
+        return stale.size
     }
 
     fun query(referenceKey: String, from: Long, to: Long): List<WeatherReferencePoint> {
@@ -180,7 +226,11 @@ class WeatherReferenceStore(private val db: FabDataDb) {
                 )
             }
         }
-        return out
+        val measuredHours = out.asSequence()
+            .filter { it.source == PointSource.MEASURED }
+            .map { it.timestamp / 3600000L }
+            .toSet()
+        return out.filter { it.source == PointSource.MEASURED || (it.timestamp / 3600000L) !in measuredHours }
     }
 
     fun bounds(referenceKey: String): LongRange? {
@@ -243,6 +293,7 @@ class WeatherReferenceManager(
     private val store = WeatherReferenceStore(db)
     private val zone = ZoneId.of("Europe/Paris")
     private val hourMs = 60L * 60L * 1000L
+    private var lastOfficialRecentAt = 0L
 
     fun store(): WeatherReferenceStore = store
 
@@ -297,6 +348,7 @@ class WeatherReferenceManager(
             reconstructShortGaps(reference.key, from, to)
         }
 
+        store.reconcileMeasuredDominance(reference.key)
         val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
         val actual = store.query(reference.key, from, minOf(to, System.currentTimeMillis()))
         return WeatherReferenceSyncResult(
@@ -373,6 +425,54 @@ class WeatherReferenceManager(
         return forecast.size
     }
 
+    /**
+     * Rafraîchissement live léger : jamais d'archive longue. Il est conçu pour être
+     * appelé au focus puis toutes les 60 s sans relancer une reconstruction historique.
+     */
+    fun refreshRecent(reference: WeatherReference): WeatherReferenceSyncResult {
+        store.keepOnly(reference.key)
+        val now = System.currentTimeMillis()
+        val from = now - 36L * hourMs
+        val to = now + 8L * hourMs
+
+        runCatching { fetchOpenMeteoRecentPast(reference, from, now) }
+            .getOrDefault(emptyList())
+            .forEach { store.upsert(reference.key, it) }
+
+        if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
+            val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+            db.querySamples(sensor.id, from, now, maxPoints = 12_000).forEach { p ->
+                val source = PointSourceStore.sourceFor(db, sensor.id, p.timestamp)
+                store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, source))
+            }
+            lyonLab.queryOfficial(LyonSeriesKind.HOURLY, from, now).forEach { p ->
+                store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.MEASURED))
+            }
+            lyonLab.queryOfficial(LyonSeriesKind.SIX_MIN, from, now).forEach { p ->
+                store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.MEASURED))
+            }
+        } else if (credentials.hasCredential() && now - lastOfficialRecentAt >= 15L * 60L * 1000L) {
+            // Les observations horaires officielles ne changent pas toutes les minutes :
+            // on vérifie l'archive récente au plus toutes les 15 min, tandis que le
+            // fallback coordonné + forecast peut être rafraîchi chaque minute.
+            runCatching { fetchOfficialHourly(reference, from, now) }
+                .getOrDefault(emptyList())
+                .forEach { store.upsert(reference.key, it) }
+            lastOfficialRecentAt = now
+        }
+
+        reconstructShortGaps(reference.key, from, now)
+        store.reconcileMeasuredDominance(reference.key)
+        val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
+        val actual = store.query(reference.key, from, now)
+        return WeatherReferenceSyncResult(
+            measured = actual.count { it.source == PointSource.MEASURED },
+            reconstructed = actual.count { it.source == PointSource.RECONSTRUCTED },
+            forecast = forecast,
+            label = reference.label
+        )
+    }
+
     fun ensureLocalCache(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
         store.keepOnly(reference.key)
         val existing = store.query(reference.key, from, to)
@@ -385,8 +485,7 @@ class WeatherReferenceManager(
         return if (needsHistory) {
             refreshSelected(reference, from, to)
         } else {
-            val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
-            WeatherReferenceSyncResult(measured, reconstructed, forecast, reference.label)
+            refreshRecent(reference)
         }
     }
 

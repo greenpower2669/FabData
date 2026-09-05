@@ -289,16 +289,17 @@ fun ThermalReferenceCard(
         } else if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
-            val stamped = withContext(Dispatchers.IO) { coherenceStore.hasStampedCalculatedPoints() }
-            if (measuredChanged || referenceChanged || (dataChanged && stamped)) {
-                val why = when {
-                    measuredChanged -> "Nouvelles mesures réelles"
-                    referenceChanged -> "Référence météo modifiée"
-                    else -> "Données sources modifiées"
+            when {
+                referenceChanged -> rationalizeCurves("Référence météo modifiée", profile, manual = false)
+                measuredChanged -> {
+                    // Le coordinateur global, toujours composé, traite la chaîne lourde.
+                    // Cette carte ne lance pas un second recalcul concurrent.
+                    info = "Nouvelle mesure réelle détectée · synchronisation globale en cours…"
                 }
-                rationalizeCurves(why, profile, manual = false)
-            } else {
-                refresh(allHistory = false, triggerChartReload = true)
+                dataChanged -> {
+                    status = withContext(Dispatchers.IO) { runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull() }
+                }
+                else -> refresh(allHistory = false, triggerChartReload = true)
             }
         }
     }

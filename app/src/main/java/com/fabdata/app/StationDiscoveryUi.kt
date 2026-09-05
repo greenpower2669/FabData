@@ -60,6 +60,7 @@ fun StationDiscoveryDialog(
     var info by remember { mutableStateOf("Choisis un lieu puis FabData cherchera les stations du secteur.") }
     var result by remember { mutableStateOf<StationDiscoveryResult?>(null) }
     var selectedIndex by remember { mutableIntStateOf(0) }
+    var mapOpen by remember { mutableStateOf(false) }
 
     fun runScan(anchorProvider: () -> StationSearchAnchor) {
         if (busy) return
@@ -79,7 +80,8 @@ fun StationDiscoveryDialog(
                         found.candidates.indexOfFirst { it.reference.key == auto.reference.key }
                     }?.coerceAtLeast(0) ?: 0
                     val warm = found.candidates.count { it.heat != null }
-                    info = "${found.anchor.label} · ${found.candidates.size} station(s) à ≤ ${found.radiusKm} km · $warm classée(s) sur ${found.historyLabel}"
+                    val catalogue = if (credentials.hasCredential()) "index Météo-France" else "catalogue public élargi"
+                    info = "${found.anchor.label} · ${found.candidates.size} station(s) à ≤ ${found.radiusKm} km · $warm classée(s) · $catalogue · ${found.historyLabel}"
                 },
                 onFailure = { error ->
                     info = error.message ?: "Recherche des stations impossible"
@@ -230,6 +232,12 @@ fun StationDiscoveryDialog(
                         ) { Text("▶") }
                     }
 
+                    OutlinedButton(
+                        onClick = { mapOpen = true },
+                        enabled = !busy && found.candidates.isNotEmpty(),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("🗺 Choisir sur la carte") }
+
                     Button(
                         onClick = { auto?.let { onSelect(it.reference, true) } },
                         enabled = !busy && auto != null,
@@ -255,6 +263,20 @@ fun StationDiscoveryDialog(
             TextButton(onClick = onDismiss, enabled = !busy) { Text("Fermer") }
         }
     )
+
+    val mapped = result
+    if (mapOpen && mapped != null && mapped.candidates.isNotEmpty()) {
+        StationMapDialog(
+            result = mapped,
+            initialIndex = selectedIndex,
+            onDismiss = { mapOpen = false },
+            onSelectIndex = { index ->
+                selectedIndex = index.coerceIn(0, mapped.candidates.lastIndex)
+                mapOpen = false
+                onSelect(mapped.candidates[selectedIndex].reference, false)
+            }
+        )
+    }
 }
 
 private fun candidateLine(candidate: StationCandidate): String {

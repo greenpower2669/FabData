@@ -105,7 +105,6 @@ class WeatherStationDiscovery(
             }
             .filter { it.distanceKm <= radius.toDouble() }
             .sortedBy { it.distanceKm }
-            .take(24)
             .toList()
 
         if (stations.isEmpty()) {
@@ -141,20 +140,21 @@ class WeatherStationDiscovery(
 
     private fun fetchObservationStationIndex(): String {
         val credential = credentials.get().trim()
+        val publicFallback = "https://www.infoclimat.fr/opendata/stations_xhr.php?format=geojson"
         if (credential.isBlank()) {
-            error("Token Météo-France requis pour découvrir toutes les stations")
+            // Sans compte Météo-France : catalogue public open-data élargi
+            // (stations nationales ouvertes + réseau StatIC).
+            return httpGet(publicFallback, null)
         }
         val endpoints = listOf(
             "https://public-api.meteofrance.fr/public/DPObs/v1/liste-stations",
             "https://public-api.meteofrance.fr/public/DPObs/liste-stations"
         )
-        var last: Throwable? = null
         endpoints.forEach { endpoint ->
-            runCatching { httpGet(endpoint, credential) }
-                .onSuccess { return it }
-                .onFailure { last = it }
+            runCatching { httpGet(endpoint, credential) }.onSuccess { return it }
         }
-        throw last ?: IllegalStateException("Index des stations Météo-France indisponible")
+        // Une panne de l'index officiel ne doit plus réduire l'UI aux 7 stations bootstrap.
+        return httpGet(publicFallback, null)
     }
 
     private fun parseObservationStations(raw: String): List<WeatherReference> {
@@ -176,8 +176,8 @@ class WeatherStationDiscovery(
             val geometry = raw.optJSONObject("geometry")
             val coords = geometry?.optJSONArray("coordinates")
 
-            val id = firstString(props, "id", "geo_id_insee", "num_poste", "id_station") ?: continue
-            val name = firstString(props, "nom", "nom_usuel", "name", "station") ?: "Station $id"
+            val id = firstString(props, "id", "geo_id_insee", "num_poste", "id_station", "station_id", "code", "code_station", "numer_sta") ?: continue
+            val name = firstString(props, "nom", "nom_usuel", "name", "station", "libelle", "libelle_station", "lieu") ?: "Station $id"
             val lon = firstDouble(props, "lon", "longitude")
                 ?: coords?.optDouble(0, Double.NaN)?.takeIf { it.isFinite() }
                 ?: continue
