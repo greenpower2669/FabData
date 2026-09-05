@@ -1,0 +1,37 @@
+name: FabData v0.18.1 source hotfix
+
+on:
+  push:
+    branches:
+      - 'agent/v0.18.1-station-discovery-fix'
+    paths-ignore:
+      - 'artifacts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix station scan callback syntax
+        run: python3 scripts/fix-v0181-runscan.py
+      - name: Validate source markers
+        run: |
+          grep -q 'fun runScan(openMapWhenReady: Boolean = false, anchorProvider: suspend () -> StationSearchAnchor)' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'runScan(openMapWhenReady = true) { discovery.geocode(query) }' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'Tourniquet · toutes les stations locales' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'suspend fun gpsAnchor' app/src/main/java/com/fabdata/app/StationDiscovery.kt
+      - name: Commit hotfix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt scripts/apply-v0181-station-discovery-fix.py
+          if git diff --cached --quiet; then
+            echo "Hotfix already applied"
+          else
+            git commit -m "Fix v0.18.1 station discovery compilation"
+            git push
+          fi
