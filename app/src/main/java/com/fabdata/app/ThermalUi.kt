@@ -63,6 +63,21 @@ private data class RationalizeResult(
     val reason: String
 )
 
+/**
+ * Runtime thermique construit hors du thread UI.
+ *
+ * La carte thermique vit dans un LazyColumn : elle n'est composée qu'au moment où
+ * l'utilisateur descend dessus. Avant v0.19.3, cette première composition construisait
+ * plusieurs objets qui ouvrent/initialisent SQLite dans leurs constructeurs. Sur une base
+ * réelle occupée par un recalcul/sync, le thread UI pouvait attendre le verrou SQLite et
+ * Android proposait de fermer l'application (ANR).
+ */
+private data class ThermalUiRuntime(
+    val manager: WeatherReferenceManager,
+    val engine: ThermalEngine,
+    val coherenceStore: ThermalCoherenceStore
+)
+
 @Composable
 fun ThermalReferenceCard(
     db: FabDataDb,
@@ -75,9 +90,6 @@ fun ThermalReferenceCard(
 ) {
     val context = LocalContext.current
     val prefs = remember { WeatherReferencePrefs(context) }
-    val manager = remember { WeatherReferenceManager(context, db, lyonLab, credentials) }
-    val engine = remember { ThermalEngine(db, manager.store()) }
-    val coherenceStore = remember { ThermalCoherenceStore(db) }
     val profileStore = remember { ThermalProfileStore(context) }
     val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
     val modelSensorPrefs = remember {
@@ -86,6 +98,52 @@ fun ThermalReferenceCard(
     var profile by remember { mutableStateOf(profileStore.load()) }
     var forecastMode by remember { mutableStateOf(profileStore.forecastMode()) }
     val scope = rememberCoroutineScope()
+
+    // IMPORTANT v0.19.3 : aucun constructeur DB-bound n'est exécuté pendant la
+    // composition de cette carte LazyColumn. Le premier scroll ne peut donc plus
+    // bloquer le thread UI sur un verrou/PRAGMA/CREATE TABLE SQLite.
+    var runtime by remember(db) { mutableStateOf<ThermalUiRuntime?>(null) }
+    var runtimeError by remember(db) { mutableStateOf<String?>(null) }
+    LaunchedEffect(db) {
+        val built = withContext(Dispatchers.IO) {
+            runCatching {
+                val manager = WeatherReferenceManager(context, db, lyonLab, credentials)
+                val engine = ThermalEngine(db, manager.store())
+                val coherenceStore = ThermalCoherenceStore(db)
+                ThermalUiRuntime(manager, engine, coherenceStore)
+            }
+        }
+        built.fold(
+            onSuccess = {
+                runtime = it
+                runtimeError = null
+            },
+            onFailure = {
+                runtimeError = it.message ?: "Initialisation thermique impossible"
+            }
+        )
+    }
+
+    val readyRuntime = runtime
+    if (readyRuntime == null) {
+        Card(shape = RoundedCornerShape(20.dp)) {
+            Column(
+                Modifier.fillMaxWidth().padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text("Référence météo & moteur thermique", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    runtimeError ?: "Initialisation thermique en arrière-plan…",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (runtimeError == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error
+                )
+            }
+        }
+        return
+    }
+    val manager = readyRuntime.manager
+    val engine = readyRuntime.engine
+    val coherenceStore = readyRuntime.coherenceStore
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
     val reference = remember(selectedKey) { prefs.selectedReference() }
@@ -244,7 +302,10 @@ fun ThermalReferenceCard(
                 }
             },
             onFailure = { error ->
-                status = runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull()
+                // Même le fallback d'état peut recalibrer/hacher beaucoup de points : jamais sur UI.
+                status = withContext(Dispatchers.IO) {
+                    runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull()
+                }
                 info = error.message ?: "Référence météo indisponible"
             }
         )
@@ -488,7 +549,9 @@ fun ThermalReferenceCard(
                                 continuationWork = null
                                 processNextHistoryChunk()
                             } else {
-                                val firstReal = coherenceStore.firstMeasuredTimestamp(debt.sensorId)
+                                val firstReal = withContext(Dispatchers.IO) {
+                                    coherenceStore.firstMeasuredTimestamp(debt.sensorId)
+                                }
                                 val days = firstReal?.let { (((it - debt.from).coerceAtLeast(24L * 60L * 60L * 1000L)) / (24L * 60L * 60L * 1000L)).toInt() }
                                     ?: debt.pendingDays
                                 beginHistoryWork(days, debt.reason)
