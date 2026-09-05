@@ -1,0 +1,91 @@
+name: FabData v0.19.2 ANR main-thread DB fix
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.2-anr-main-thread-db-fix'
+    paths:
+      - 'scripts/apply-v0192-anr-main-thread-db-fix.py'
+      - '.github/workflows/v0192-anr-fix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0192-anr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply ANR fix patch
+        run: python3 scripts/apply-v0192-anr-main-thread-db-fix.py
+
+      - name: Regression guards
+        run: |
+          git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt
+
+          grep -q 'versionCode = 38' app/build.gradle.kts
+          grep -q 'versionName = "0.19.2"' app/build.gradle.kts
+          ! grep -q 'val thermalTrainingMaskStore = remember' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'ThermalTrainingMaskStore(db).includeRange' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'ThermalTrainingMaskStore(db).addMerged' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q '? Aide' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q '! Astuce du jour' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'RangeSelectionHelpDemo' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'preset = TimePreset.TWO_DAYS' app/src/main/java/com/fabdata/app/MainActivity.kt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
+          assert 'val thermalTrainingMaskStore = remember' not in p
+          i = p.index('ThermalTrainingMaskStore(db).includeRange')
+          assert 'withContext(Dispatchers.IO)' in p[max(0, i-500):i]
+          j = p.index('ThermalTrainingMaskStore(db).addMerged')
+          assert 'withContext(Dispatchers.IO)' in p[max(0, j-500):j]
+          print('ANR guard OK: training-mask SQLite initialization cannot happen during UI composition')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug
+        run: gradle --no-daemon :app:compileDebugKotlin --stacktrace
+
+      - name: Commit compiled v0.19.2 source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "v0.19.2 ANR fix already applied"
+          else
+            git commit -m "Fix FabData v0.19.2 startup ANR from main-thread SQLite init"
+            git push
+          fi
