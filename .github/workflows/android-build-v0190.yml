@@ -1,0 +1,166 @@
+name: Android APK + AAB v0.19.0
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19-inertia-tangent-context-mask-help'
+    paths-ignore:
+      - 'artifacts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0190-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: v0.19.0 regression guards
+        run: |
+          grep -q 'versionCode = 36' app/build.gradle.kts
+          grep -q 'versionName = "0.19.0"' app/build.gradle.kts
+          grep -q 'private fun tangentPenalty' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'private fun regimeConfidence' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'val effectiveTau = tauHours / (1.0 + 0.55 \* regime)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'val trainingMaskStore = ThermalTrainingMaskStore(db)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'CREATE TABLE IF NOT EXISTS thermal_training_exclusions' app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt
+          grep -q 'source = PointSource.RECONSTRUCTED' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'WHERE p.sensor_id=? AND (ps.source IS NULL OR ps.source=.measured.)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+
+          git fetch origin tag v0.18.1 --force || true
+          if git rev-parse v0.18.1 >/dev/null 2>&1; then
+            for f in \
+              app/src/main/java/com/fabdata/app/BackupLayer.kt \
+              app/src/main/java/com/fabdata/app/DataLayer.kt \
+              app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+              app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+              app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt; do
+              if ! git diff --quiet v0.18.1 -- "$f"; then
+                echo "ERROR: protected v0.18.1 file changed: $f"
+                git diff -- v0.18.1 -- "$f"
+                exit 1
+              fi
+            done
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt').read_text()
+          assert '(mass[i] - mass[i - 1]) / dt' in p
+          assert 'regimeConfidence(hours, i - 1)' in p
+          assert 'tangentPenalty(hours, mass, clean)' in p
+          assert 'ThermalTrainingMaskStore(db)' in p
+          m = Path('app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt').read_text()
+          assert 'thermal_training_exclusions' in m
+          assert 'fun signature' in m
+          print('v0.19.0 guards OK: tangent Δt, regime persistence, manual training mask, RAW/protected layers unchanged')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug first
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore Google Play upload key when configured
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK and Android App Bundle
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify generated packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage named APK and AAB
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.19.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.19.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.19.0-signing-mode.txt
+          sha256sum artifacts/FabData-v0.19.0-release.apk artifacts/FabData-v0.19.0-release.aab > artifacts/FabData-v0.19.0-sha256.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.19.0-release
+          path: |
+            artifacts/FabData-v0.19.0-release.apk
+            artifacts/FabData-v0.19.0-release.aab
+            artifacts/FabData-v0.19.0-signing-mode.txt
+            artifacts/FabData-v0.19.0-sha256.txt
+          if-no-files-found: error
+
+      - name: Publish APK and AAB on branch
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add artifacts/FabData-v0.19.0-release.apk artifacts/FabData-v0.19.0-release.aab artifacts/FabData-v0.19.0-signing-mode.txt artifacts/FabData-v0.19.0-sha256.txt
+          if git diff --cached --quiet; then
+            echo "Packages unchanged"
+          else
+            git commit -m "Build FabData v0.19.0 APK + AAB"
+            git push
+          fi
+
+      - name: Publish GitHub Release with APK and AAB
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.19.0
+        run: |
+          NOTES='FabData v0.19.0 — évolution ciblée du cœur inertiel. La tangente de la masse thermique est désormais évaluée en ΔT/Δt réel, avec une pénalité tangentielle dédiée et une détection multi-échelle des changements persistants de régime. La valeur inertielle reste continue : seule sa vitesse de convergence peut s adapter progressivement lorsque le changement énergétique dure. Ajout également du stockage des futures zones utilisateur exclues de l apprentissage : les RAW ne sont jamais supprimées et l état physique continue de se propager à travers ces périodes. Les couches Backup, Data, PointSource, moteur RC principal et références météo restent protégées et inchangées par cette évolution.'
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$(git rev-parse HEAD)" \
+              --title "FabData v0.19.0" \
+              --notes "$NOTES"
+          fi
+          gh release upload "$TAG" \
+            artifacts/FabData-v0.19.0-release.apk \
+            artifacts/FabData-v0.19.0-release.aab \
+            artifacts/FabData-v0.19.0-signing-mode.txt \
+            artifacts/FabData-v0.19.0-sha256.txt \
+            --clobber
