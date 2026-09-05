@@ -1,0 +1,184 @@
+name: Android APK + AAB v0.19.6 ground-visible final
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.6-ground-visible-hidden-mass'
+    paths:
+      - '.github/workflows/android-build-v0196-ground-visible-final.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0196-ground-final-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.19.6 correction
+        run: python3 scripts/apply-v0196-ground-visible-hidden-mass.py
+
+      - name: Fixed-string physics guards
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          build = Path('app/build.gradle.kts').read_text()
+          main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
+          engine = Path('app/src/main/java/com/fabdata/app/ThermalEngine.kt').read_text()
+          inertia = Path('app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt').read_text()
+          ui = Path('app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt').read_text()
+          point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
+
+          required = {
+              'version code': ('versionCode = 42', build),
+              'version name': ('versionName = "0.19.6"', build),
+              'surface projection': ('val target = mass + k * (tout - mass)', engine),
+              'global factor fit': ('private fun fitProjectionFactor', engine),
+              'v0.19.5 model marker': ('thermal-zero-bimass-6', point),
+              'two-mass propagator': ('private fun propagateTwoMass', inertia),
+              'surface/deep coupling': ('val surfaceTarget = 0.82 * forcing + 0.18 * deep', inertia),
+              'deep propagation': ('val nextDeep = deep + alphaDeep * (nextSurface - deep)', inertia),
+              'hidden chart state': ('showTemp[THERMAL_INERTIA_SENSOR_ID] = false', main),
+              'surface wording': ('surface / le sol équivalent', ui),
+              'hidden building wording': ('État thermique bâtiment (caché)', ui),
+              'period selector': ('Sélectionner une période', main),
+              'help': ('? Aide', main),
+              'tip': ('! Astuce du jour', main),
+              'ANR background init': ('Initialisation thermique en arrière-plan', main),
+          }
+          for name, (needle, haystack) in required.items():
+              assert needle in haystack, f'missing guard: {name}: {needle}'
+
+          forbidden = [
+              'physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + inertiaSensor',
+              'THERMAL_INERTIA_SENSOR_ID to inertiaVisible',
+              'THERMAL_INERTIA_SENSOR_ID to inertiaOverview',
+          ]
+          for needle in forbidden:
+              assert needle not in main, f'internal mass still visible: {needle}'
+
+          def ground(tb, tout, k):
+              return tb + k * (tout - tb)
+          assert ground(28.0, 28.0, 0.2) == 28.0
+          assert 28.0 < ground(28.0, 34.0, 0.2) < 34.0
+          assert 22.0 < ground(28.0, 22.0, 0.2) < 28.0
+          print('v0.19.6 fixed-string + physics guards OK')
+          PY
+
+          git fetch origin tag v0.19.5 --force || true
+          for f in \
+            app/src/main/java/com/fabdata/app/BackupLayer.kt \
+            app/src/main/java/com/fabdata/app/DataLayer.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt; do
+            git diff --quiet v0.19.5 -- "$f" || { echo "ERROR protected/physics file changed: $f"; exit 1; }
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug first
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore Google Play upload key when configured
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage v0.19.6 packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.19.6-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.19.6-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.19.6-signing-mode.txt
+          sha256sum artifacts/FabData-v0.19.6-release.apk artifacts/FabData-v0.19.6-release.aab > artifacts/FabData-v0.19.6-sha256.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.19.6-release
+          path: |
+            artifacts/FabData-v0.19.6-release.apk
+            artifacts/FabData-v0.19.6-release.aab
+            artifacts/FabData-v0.19.6-signing-mode.txt
+            artifacts/FabData-v0.19.6-sha256.txt
+          if-no-files-found: error
+
+      - name: Commit v0.19.6 correction and packages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/MainActivity.kt \
+            app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt \
+            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
+            artifacts/FabData-v0.19.6-release.apk \
+            artifacts/FabData-v0.19.6-release.aab \
+            artifacts/FabData-v0.19.6-signing-mode.txt \
+            artifacts/FabData-v0.19.6-sha256.txt
+          git commit -m "Release FabData v0.19.6 surface visible building mass hidden"
+          git push
+
+      - name: Publish GitHub Release v0.19.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.19.6
+        run: |
+          NOTES='FabData v0.19.6 — correction de lecture physique sans modifier les équations validées en v0.19.5. La reconstruction visible est la température de surface / sol équivalente. La masse thermique bi-masse du bâtiment devient un état interne caché et n est plus superposée au graphe principal ; ses paramètres restent disponibles dans le diagnostic, en attendant une future vue Topo. Le facteur k, le retard Δ, le RC bi-masse, les RAW, la sélection/exclusion, les aides et le correctif ANR restent inchangés.'
+          gh release create "$TAG" \
+            --target "$(git rev-parse HEAD)" \
+            --title "FabData v0.19.6" \
+            --notes "$NOTES" \
+            artifacts/FabData-v0.19.6-release.apk \
+            artifacts/FabData-v0.19.6-release.aab \
+            artifacts/FabData-v0.19.6-signing-mode.txt \
+            artifacts/FabData-v0.19.6-sha256.txt
