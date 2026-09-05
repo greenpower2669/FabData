@@ -69,6 +69,114 @@ class ThermalTrainingMaskStore(private val db: FabDataDb) {
         return db.writableDatabase.insertOrThrow("thermal_training_exclusions", null, values)
     }
 
+    /**
+     * Ajoute une exclusion manuelle en fusionnant les exclusions actives qui se chevauchent.
+     * Cela évite d'empiler des masques identiques quand l'utilisateur sélectionne plusieurs fois
+     * des périodes qui se recouvrent.
+     */
+    fun addMerged(sensorId: Long, from: Long, to: Long, reason: String = "Sélection utilisateur"): Long {
+        require(sensorId >= 0L) { "Une exclusion d'apprentissage doit viser une sonde physique." }
+        var start = minOf(from, to)
+        var end = maxOf(from, to)
+        val overlapping = query(sensorId, start, end, enabledOnly = true)
+        if (overlapping.isEmpty()) return add(sensorId, start, end, reason)
+
+        overlapping.forEach { zone ->
+            start = minOf(start, zone.from)
+            end = maxOf(end, zone.to)
+        }
+
+        val sql = db.writableDatabase
+        sql.beginTransaction()
+        try {
+            overlapping.forEach { zone ->
+                sql.delete("thermal_training_exclusions", "id=?", arrayOf(zone.id.toString()))
+            }
+            val now = System.currentTimeMillis()
+            val values = ContentValues().apply {
+                put("sensor_id", sensorId)
+                put("start_ts", start)
+                put("end_ts", end)
+                put("reason", reason.trim())
+                put("enabled", 1)
+                put("created_at", now)
+                put("updated_at", now)
+            }
+            val id = sql.insertOrThrow("thermal_training_exclusions", null, values)
+            sql.setTransactionSuccessful()
+            return id
+        } finally {
+            sql.endTransaction()
+        }
+    }
+
+    /**
+     * Garantit qu'une période redevient utilisable pour l'entraînement.
+     *
+     * Une sélection positive ne détruit jamais de RAW : elle retire seulement cette tranche
+     * des exclusions existantes. Si elle coupe une exclusion en son milieu, celle-ci est scindée
+     * en deux afin de ne réintégrer QUE la zone demandée.
+     *
+     * Retourne le nombre d'exclusions qui ont été modifiées.
+     */
+    fun includeRange(sensorId: Long, from: Long, to: Long): Int {
+        require(sensorId >= 0L) { "Une zone d'apprentissage doit viser une sonde physique." }
+        val start = minOf(from, to)
+        val end = maxOf(from, to)
+        val overlapping = query(sensorId, start, end, enabledOnly = true)
+        if (overlapping.isEmpty()) return 0
+
+        val sql = db.writableDatabase
+        val now = System.currentTimeMillis()
+        sql.beginTransaction()
+        try {
+            overlapping.forEach { zone ->
+                when {
+                    start <= zone.from && end >= zone.to -> {
+                        sql.delete("thermal_training_exclusions", "id=?", arrayOf(zone.id.toString()))
+                    }
+                    start <= zone.from -> {
+                        val values = ContentValues().apply {
+                            put("start_ts", end + 1L)
+                            put("updated_at", now)
+                        }
+                        sql.update("thermal_training_exclusions", values, "id=?", arrayOf(zone.id.toString()))
+                    }
+                    end >= zone.to -> {
+                        val values = ContentValues().apply {
+                            put("end_ts", start - 1L)
+                            put("updated_at", now)
+                        }
+                        sql.update("thermal_training_exclusions", values, "id=?", arrayOf(zone.id.toString()))
+                    }
+                    else -> {
+                        // La période incluse est au milieu d'une exclusion : conserver les deux côtés.
+                        val left = ContentValues().apply {
+                            put("end_ts", start - 1L)
+                            put("updated_at", now)
+                        }
+                        sql.update("thermal_training_exclusions", left, "id=?", arrayOf(zone.id.toString()))
+
+                        val right = ContentValues().apply {
+                            put("sensor_id", sensorId)
+                            put("start_ts", end + 1L)
+                            put("end_ts", zone.to)
+                            put("reason", zone.reason)
+                            put("enabled", 1)
+                            put("created_at", zone.createdAt)
+                            put("updated_at", now)
+                        }
+                        sql.insertOrThrow("thermal_training_exclusions", null, right)
+                    }
+                }
+            }
+            sql.setTransactionSuccessful()
+        } finally {
+            sql.endTransaction()
+        }
+        return overlapping.size
+    }
+
     fun update(id: Long, from: Long, to: Long, reason: String, enabled: Boolean = true): Boolean {
         val start = minOf(from, to)
         val end = maxOf(from, to)
