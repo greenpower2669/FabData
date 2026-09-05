@@ -51,7 +51,7 @@ jobs:
           grep -q 'val nextDeep = deep + alphaDeep \* (nextSurface - deep)' "$INERTIA"
 
           # Mais l'état bâtiment n'est plus une série du graphe principal.
-          grep -q 'showTemp\[THERMAL_INERTIA_SENSOR_ID\] = false' "$MAIN"
+          grep -Fq 'showTemp[THERMAL_INERTIA_SENSOR_ID] = false' "$MAIN"
           ! grep -q 'physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + inertiaSensor' "$MAIN"
           ! grep -q 'THERMAL_INERTIA_SENSOR_ID to inertiaVisible' "$MAIN"
           ! grep -q 'THERMAL_INERTIA_SENSOR_ID to inertiaOverview' "$MAIN"
