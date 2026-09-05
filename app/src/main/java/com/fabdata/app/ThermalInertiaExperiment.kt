@@ -103,11 +103,12 @@ private data class InertiaCandidate(
  * - l'estimateur ne persiste aucune donnée et ne modifie jamais les points MEASURED ;
  * - T_mass devient une entrée obligatoire du modèle d'historique et de prévision.
  *
- * T_mass affichée est la moyenne énergétique de deux états latents : une couche
- * superficielle réactive (murs/mobilier/cloisons) et une masse profonde lente.
- * Un changement extérieur modifie donc immédiatement la dérivée de la couche de surface
- * sans faire sauter aucune température ; si le forçage persiste, il se transmet ensuite
- * à la masse profonde. Les paramètres sont appris uniquement sur les vraies mesures.
+ * T_mass est la moyenne énergétique interne de deux états latents : une couche
+ * superficielle réactive et une masse profonde lente du bâtiment. Depuis v0.19.6 cet
+ * état n'est plus tracé sur le graphe principal : le moteur l'utilise comme référence
+ * cachée pour reconstruire la température de surface / sol équivalente observable.
+ * Un changement extérieur modifie immédiatement la dérivée de la couche de surface
+ * sans faire sauter aucune température ; s'il persiste, il se transmet à la masse profonde.
  */
 class ThermalInertiaEstimator(
     private val db: FabDataDb,

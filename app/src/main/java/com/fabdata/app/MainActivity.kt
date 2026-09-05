@@ -573,7 +573,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (!showHumidity.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
             showHumidity[LYON_RECONSTRUCTED_SENSOR_ID] = false
         }
-        if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = true
+        // v0.19.6: la masse thermique du bâtiment reste un état caché du modèle.
+        // La courbe reconstruite de la sonde représente la surface/sol équivalent ;
+        // on ne superpose donc plus l'état profond sur le graphe principal.
+        showTemp[THERMAL_INERTIA_SENSOR_ID] = false
         showHumidity[THERMAL_INERTIA_SENSOR_ID] = false
         busy = false
     }
@@ -603,27 +606,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     )
     // Les deux pseudo-capteurs météo sont uniquement des vues de la référence sélectionnée.
     // Aucun doublon n'est persisté et les anciennes clés internes restent compatibles.
-    val inertiaVisible = viewBounds?.let { b -> inertiaEstimate?.window(b.first, b.last).orEmpty() }.orEmpty()
-    val inertiaOverview = globalBounds?.let { b -> inertiaEstimate?.window(b.first, b.last, 1200).orEmpty() }.orEmpty()
-    val inertiaSensor = Sensor(
-        id = THERMAL_INERTIA_SENSOR_ID,
-        stableKey = THERMAL_INERTIA_STABLE_KEY,
-        name = "Température inertielle estimée",
-        room = "Température inertielle estimée",
-        colorIndex = 4,
-        latestTimestamp = inertiaEstimate?.points?.lastOrNull()?.timestamp
-    )
+    // v0.19.6 : ThermalInertiaEstimate reste consommé par le moteur thermique mais n'est
+    // plus exposé comme pseudo-capteur. La masse bâtiment sera réservée à une future vue Topo.
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
-    val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + inertiaSensor
+    val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor
     val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
         (WEATHER_OFFICIAL_SENSOR_ID to weatherOfficialSamples) +
-        (LYON_RECONSTRUCTED_SENSOR_ID to weatherReconstructedSamples) +
-        (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
+        (LYON_RECONSTRUCTED_SENSOR_ID to weatherReconstructedSamples)
     val overviewReference = overviewSampleMap[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty()
     val chartOverviewSampleMap = overviewSampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
         (WEATHER_OFFICIAL_SENSOR_ID to overviewReference.filter { it.source == PointSource.MEASURED }.map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }) +
-        (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference.filter { it.source == PointSource.RECONSTRUCTED }) +
-        (THERMAL_INERTIA_SENSOR_ID to inertiaOverview)
+        (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference.filter { it.source == PointSource.RECONSTRUCTED })
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },

@@ -43,9 +43,9 @@ fun ThermalInertiaExperimentCard(estimate: ThermalInertiaEstimate?) {
             Modifier.fillMaxWidth().padding(13.dp),
             verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            Text("Température inertielle estimée · expérimental", fontWeight = FontWeight.Bold)
+            Text("Modèle thermique interne · expérimental", fontWeight = FontWeight.Bold)
             Text(
-                "Apprise uniquement sur les points MEASURED propres. Clim, fenêtres probables et données douteuses restent visibles mais ne forment pas le modèle. Cette inertie accompagne désormais la météo pour prolonger l’historique.",
+                "La courbe reconstruite visible représente la surface / le sol équivalent. La masse thermique du bâtiment reste un état caché appris uniquement sur les points MEASURED propres ; elle sert au calcul mais n’est plus tracée sur le graphe principal.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -56,10 +56,10 @@ fun ThermalInertiaExperimentCard(estimate: ThermalInertiaEstimate?) {
                     style = MaterialTheme.typography.bodySmall
                 )
             } else {
-                Text(String.format(Locale.FRANCE, "État inertiel actuel : %.1f °C", d.currentC), fontWeight = FontWeight.SemiBold)
+                Text(String.format(Locale.FRANCE, "État thermique bâtiment (caché) : %.1f °C", d.currentC), fontWeight = FontWeight.SemiBold)
                 Text("Tendance : ${d.trendLabel}", style = MaterialTheme.typography.bodySmall)
                 Text(
-                    "τ ≈ ${formatTau(d.tauHours)} · extérieur inertiel ${(d.outsideWeight * 100).toInt()} % · couplage air ↔ masse ${d.couplingLabel} · confiance ${d.confidenceLabel} ${(d.confidence * 100).toInt()} %",
+                    "surface τ ≈ ${formatTau(d.surfaceTauHours)} · profondeur τ ≈ ${formatTau(d.deepTauHours)} · part profonde ${(d.deepShare * 100).toInt()} % · confiance ${d.confidenceLabel} ${(d.confidence * 100).toInt()} %",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
