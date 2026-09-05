@@ -44,6 +44,8 @@ fun FabLiveUpdateCoordinator(
     }
     val lyonWeather = remember { LyonWeatherSync(db) }
     val meteoOfficial = remember { MeteoFranceOfficialClient(context, lyonLab, credentials) }
+    val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
+    val coherenceStore = remember { ThermalCoherenceStore(db) }
 
     var foreground by remember {
         mutableStateOf(activity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true)
@@ -90,7 +92,20 @@ fun FabLiveUpdateCoordinator(
                 val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
 
                 if (rebuildFromMeasured) {
-                    engine.refreshExistingReconstructions(reference, profile, selectedSensorId)
+                    selectedSensorId?.let { id ->
+                        val firstReal = coherenceStore.firstMeasuredTimestamp(id)
+                        val existing = PointSourceStore.reconstructedBounds(db, id)
+                        if (firstReal != null && existing != null) {
+                            val recentStart = firstReal - 366L * 24L * 60L * 60L * 1000L
+                            if (existing.first < recentStart) {
+                                historyDebtStore.recordDebt(
+                                    reference.key, id, existing.first, recentStart,
+                                    "Nouvelle mesure réelle : historique antérieur aux 12 derniers mois à remettre à jour"
+                                )
+                            }
+                        }
+                    }
+                    engine.refreshExistingReconstructions(reference, profile, selectedSensorId, maxHistoryDays = 366)
                 }
                 engine.refreshForecasts(reference, selectedSensorId, profile, mode)
             }

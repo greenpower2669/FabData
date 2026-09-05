@@ -777,7 +777,12 @@ fun CurveStyleDialog(
             }
         },
         confirmButton = { Button(onClick = { onSave(value) }) { Text("Enregistrer") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } }
+        dismissButton = {
+            Row {
+                TextButton(onClick = { onSave(CurveVisualPrefs()) }) { Text("Réinitialiser") }
+                TextButton(onClick = onDismiss) { Text("Annuler") }
+            }
+        }
     )
 }
 

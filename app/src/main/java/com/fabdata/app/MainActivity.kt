@@ -134,6 +134,8 @@ private enum class PreviewPreset(val label: String, val spanMs: Long) {
 
 private const val LYON_DETAIL_GAP_MS = 90L * 60L * 1000L
 private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
+private const val WEATHER_OFFICIAL_SENSOR_ID = -6902900102L
+private const val WEATHER_OFFICIAL_STABLE_KEY = "weather-reference-official"
 private const val LYON_RECONSTRUCTED_SENSOR_ID = -6902900103L
 private const val LYON_RECONSTRUCTED_STABLE_KEY = "lyon-reconstructed"
 
@@ -275,6 +277,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val meteoOfficial = remember { MeteoFranceOfficialClient(context, lyonLab, meteoCredentials) }
     val curveStyleStore = remember { CurveStyleStore(context) }
     val weatherReferenceStore = remember { WeatherReferenceStore(db) }
+    val weatherReferenceManager = remember { WeatherReferenceManager(context, db, lyonLab, meteoCredentials) }
     val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
@@ -331,7 +334,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val activeCurveStyles = remember(sensors, styleVersion) {
         buildMap {
             sensors.forEach { sensor -> put(sensor.id, curveStyleStore.load("sensor:${sensor.stableKey}")) }
+            put(WEATHER_OFFICIAL_SENSOR_ID, curveStyleStore.load("weather:official"))
             put(LYON_RECONSTRUCTED_SENSOR_ID, curveStyleStore.load("lyon:reconstructed"))
+            put(THERMAL_INERTIA_SENSOR_ID, curveStyleStore.load("thermal:inertia"))
         }
     }
 
@@ -390,7 +395,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     // v0.17 : la météo live est désormais pilotée par FabLiveUpdateCoordinator
-    // à l'ouverture, au retour au focus et ensuite toutes les 60 secondes.
+    // à l'ouverture, au retour au focus et ensuite toutes les 5 minutes au premier plan.
 
     // Les sondes HTTP ajoutées une fois restent automatiques ensuite.
     LaunchedEffect(Unit) {
@@ -557,6 +562,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
             if (!showHumidity.containsKey(sensor.id)) showHumidity[sensor.id] = false
         }
+        if (!showTemp.containsKey(WEATHER_OFFICIAL_SENSOR_ID)) showTemp[WEATHER_OFFICIAL_SENSOR_ID] = true
+        if (!showHumidity.containsKey(WEATHER_OFFICIAL_SENSOR_ID)) showHumidity[WEATHER_OFFICIAL_SENSOR_ID] = false
         if (!showTemp.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
             // Always checked: if data arrives later the curve appears without another user action.
             showTemp[LYON_RECONSTRUCTED_SENSOR_ID] = true
@@ -570,17 +577,30 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     val visualReference = WeatherReferencePrefs(context).selectedReference()
+    val weatherOfficialSamples = lyonReconstructedSamples
+        .filter { it.source == PointSource.MEASURED }
+        .map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }
+    val weatherReconstructedSamples = lyonReconstructedSamples
+        .filter { it.source == PointSource.RECONSTRUCTED }
+        .map { it.copy(sensorId = LYON_RECONSTRUCTED_SENSOR_ID) }
+    val weatherOfficialSensor = Sensor(
+        id = WEATHER_OFFICIAL_SENSOR_ID,
+        stableKey = WEATHER_OFFICIAL_STABLE_KEY,
+        name = "Station météo officielle",
+        room = visualReference.label,
+        colorIndex = 2,
+        latestTimestamp = weatherOfficialSamples.lastOrNull()?.timestamp
+    )
     val lyonReconstructedSensor = Sensor(
         id = LYON_RECONSTRUCTED_SENSOR_ID,
         stableKey = LYON_RECONSTRUCTED_STABLE_KEY,
-        name = "${visualReference.city} reconstruit",
-        room = "${visualReference.city} reconstruit",
+        name = "Station météo reconstruite",
+        room = visualReference.label,
         colorIndex = 3,
-        latestTimestamp = lyonReconstructedSamples.lastOrNull()?.timestamp
+        latestTimestamp = weatherReconstructedSamples.lastOrNull()?.timestamp
     )
-    // v0.10.2 : Lyon reconstruit redevient une couche visuelle comparative.
-    // Il ne crée PAS une deuxième référence météo ni une deuxième série persistée :
-    // le pseudo-capteur n'existe que pour Superposition / graphique / inspecteur.
+    // Les deux pseudo-capteurs météo sont uniquement des vues de la référence sélectionnée.
+    // Aucun doublon n'est persisté et les anciennes clés internes restent compatibles.
     val inertiaVisible = viewBounds?.let { b -> inertiaEstimate?.window(b.first, b.last).orEmpty() }.orEmpty()
     val inertiaOverview = globalBounds?.let { b -> inertiaEstimate?.window(b.first, b.last, 1200).orEmpty() }.orEmpty()
     val inertiaSensor = Sensor(
@@ -591,11 +611,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         colorIndex = 4,
         latestTimestamp = inertiaEstimate?.points?.lastOrNull()?.timestamp
     )
-    val chartSensors = sensors + lyonReconstructedSensor + inertiaSensor
-    val chartSampleMap = sampleMap +
-        (LYON_RECONSTRUCTED_SENSOR_ID to lyonReconstructedSamples) +
+    val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
+    val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + inertiaSensor
+    val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
+        (WEATHER_OFFICIAL_SENSOR_ID to weatherOfficialSamples) +
+        (LYON_RECONSTRUCTED_SENSOR_ID to weatherReconstructedSamples) +
         (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
-    val chartOverviewSampleMap = overviewSampleMap + (THERMAL_INERTIA_SENSOR_ID to inertiaOverview)
+    val overviewReference = overviewSampleMap[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty()
+    val chartOverviewSampleMap = overviewSampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
+        (WEATHER_OFFICIAL_SENSOR_ID to overviewReference.filter { it.source == PointSource.MEASURED }.map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }) +
+        (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference.filter { it.source == PointSource.RECONSTRUCTED }) +
+        (THERMAL_INERTIA_SENSOR_ID to inertiaOverview)
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
@@ -623,13 +649,21 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     IconButton(onClick = {
                         scope.launch {
                             busy = true
-                            val result = runCatching { syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
+                            val selected = WeatherReferencePrefs(context).selectedReference()
+                            val result = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    if (selected.key == WeatherReferenceCatalog.DEFAULT_KEY) {
+                                        syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials)
+                                    }
+                                    weatherReferenceManager.refreshRecent(selected)
+                                }
+                            }
                             busy = false
                             reloadToken++
                             snackbar.showSnackbar(
                                 result.fold(
-                                    onSuccess = { "${it.label} : ${it.received} reçue(s) · ${it.stored} stockée(s)" },
-                                    onFailure = { "Lyon non actualisé : ${it.message ?: "réseau ou source indisponible"}" }
+                                    onSuccess = { "${it.label} · ${it.measured} réel(s) · ${it.reconstructed} reconstruit(s)" },
+                                    onFailure = { "Station météo non actualisée : ${it.message ?: "réseau ou source indisponible"}" }
                                 )
                             )
                         }
@@ -747,17 +781,26 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     SensorSourcesCard(
                         sensors = sensors,
                         remoteConfigs = remoteConfigs,
+                        showLyonSpecificTools = visualReference.key == WeatherReferenceCatalog.DEFAULT_KEY,
                         onOpenLyon = { lyonDetailOpen = true },
                         onSyncLyon = {
                             scope.launch {
                                 busy = true
-                                val result = runCatching { syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
+                                val selected = WeatherReferencePrefs(context).selectedReference()
+                                val result = withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        if (selected.key == WeatherReferenceCatalog.DEFAULT_KEY) {
+                                            syncLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials)
+                                        }
+                                        weatherReferenceManager.refreshRecent(selected)
+                                    }
+                                }
                                 busy = false
                                 reloadToken++
                                 snackbar.showSnackbar(
                                     result.fold(
-                                        onSuccess = { "${it.label} : ${it.received} reçue(s) · ${it.stored} stockée(s)" },
-                                        onFailure = { "Lyon : ${it.message ?: "source indisponible"}" }
+                                        onSuccess = { "${it.label} · ${it.measured} réel(s) · ${it.reconstructed} reconstruit(s)" },
+                                        onFailure = { "Station météo : ${it.message ?: "source indisponible"}" }
                                     )
                                 )
                             }
@@ -803,7 +846,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         sensors = chartSensors,
                         showTemp = showTemp,
                         showHumidity = showHumidity,
-                        onEdit = { if (it.id != LYON_RECONSTRUCTED_SENSOR_ID) editSensor = it }
+                        onEditSensor = { sensor -> if (sensor.id >= 0L) editSensor = sensor },
+                        onStyleEdit = { sensor ->
+                            val key = when (sensor.id) {
+                                WEATHER_OFFICIAL_SENSOR_ID -> "weather:official"
+                                LYON_RECONSTRUCTED_SENSOR_ID -> "lyon:reconstructed"
+                                THERMAL_INERTIA_SENSOR_ID -> "thermal:inertia"
+                                else -> "sensor:${sensor.stableKey}"
+                            }
+                            styleEditKey = key to sensor.name
+                        }
                     )
                 }
 
@@ -825,13 +877,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item {
                     SourceAwareExportCard(db)
-                }
-
-                item {
-                    CurvePersonalizationCard(
-                        sensors = chartSensors.filter { it.id != THERMAL_INERTIA_SENSOR_ID },
-                        onEdit = { key, label -> styleEditKey = key to label }
-                    )
                 }
 
                 selectedAnnotation?.let { note ->
@@ -1082,6 +1127,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 private fun SensorSourcesCard(
     sensors: List<Sensor>,
     remoteConfigs: List<RemoteSensorConfig>,
+    showLyonSpecificTools: Boolean,
     onOpenLyon: () -> Unit,
     onSyncLyon: () -> Unit,
     onCompleteLyon: () -> Unit,
@@ -1092,24 +1138,26 @@ private fun SensorSourcesCard(
     val lyon = sensors.firstOrNull { it.stableKey == LyonWeatherSync.STABLE_KEY }
     Card(shape = RoundedCornerShape(20.dp)) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Sondes / stations météo", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text("Sources & synchronisation", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Lyon-Bron permanent : officiel 6 min prioritaire, secours auto sans token. Reconstruit reste toujours disponible.",
+                "La station météo active est choisie dans Référence météo & moteur thermique. Ici on synchronise les sources sans dupliquer les noms des courbes.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Lyon", fontWeight = FontWeight.SemiBold)
+                    Text("Source météo", fontWeight = FontWeight.SemiBold)
                     Text(
-                        if (lyon?.latestTimestamp != null) "Station météo · active" else "Station météo · en attente de mesure",
+                        if (lyon?.latestTimestamp != null) "Synchronisation disponible" else "En attente de données",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                TextButton(onClick = onOpenLyon) { Text("Détail") }
-                TextButton(onClick = onCompleteLyon) { Text("《 Compléter 》") }
+                if (showLyonSpecificTools) {
+                    TextButton(onClick = onOpenLyon) { Text("Détail") }
+                    TextButton(onClick = onCompleteLyon) { Text("《 Compléter 》") }
+                }
                 OutlinedButton(onClick = onSyncLyon) { Text("Actualiser") }
             }
 
@@ -1273,7 +1321,8 @@ private fun SeriesSelector(
     sensors: List<Sensor>,
     showTemp: MutableMap<Long, Boolean>,
     showHumidity: MutableMap<Long, Boolean>,
-    onEdit: (Sensor) -> Unit
+    onEditSensor: (Sensor) -> Unit,
+    onStyleEdit: (Sensor) -> Unit
 ) {
     Card(shape = RoundedCornerShape(20.dp)) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1291,14 +1340,16 @@ private fun SeriesSelector(
                     )
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
-                        val displayRoom = when {
-                            sensor.id == LYON_RECONSTRUCTED_SENSOR_ID -> "Lyon reconstruit"
-                            sensor.id == THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
-                            sensor.stableKey == LyonWeatherSync.STABLE_KEY -> "Lyon brut · officiel/secours"
+                        val displayRoom = when (sensor.id) {
+                            WEATHER_OFFICIAL_SENSOR_ID -> "Station météo officielle"
+                            LYON_RECONSTRUCTED_SENSOR_ID -> "Station météo reconstruite"
+                            THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
                             else -> sensor.room
                         }
                         Text(displayRoom, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (sensor.name != sensor.room && sensor.id != LYON_RECONSTRUCTED_SENSOR_ID) {
+                        if (sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) {
+                            Text(sensor.room, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else if (sensor.name != sensor.room && sensor.id != THERMAL_INERTIA_SENSOR_ID) {
                             Text(
                                 sensor.name,
                                 style = MaterialTheme.typography.labelSmall,
@@ -1320,12 +1371,13 @@ private fun SeriesSelector(
                     } else {
                         Spacer(Modifier.size(48.dp))
                     }
-                    if (sensor.id != LYON_RECONSTRUCTED_SENSOR_ID && sensor.id != THERMAL_INERTIA_SENSOR_ID) {
-                        IconButton(onClick = { onEdit(sensor) }) {
-                            Icon(Icons.Default.Edit, contentDescription = "Modifier la pièce")
+                    IconButton(onClick = { onStyleEdit(sensor) }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Personnaliser la courbe")
+                    }
+                    if (sensor.id >= 0L) {
+                        IconButton(onClick = { onEditSensor(sensor) }) {
+                            Icon(Icons.Default.Edit, contentDescription = "Modifier la sonde")
                         }
-                    } else {
-                        Spacer(Modifier.size(48.dp))
                     }
                 }
             }

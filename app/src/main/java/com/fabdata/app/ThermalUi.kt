@@ -47,7 +47,8 @@ private val THERMAL_HISTORY_CHOICES = listOf(
     ThermalHistoryChoice("6 mois", 183),
     ThermalHistoryChoice("12 mois", 366),
     ThermalHistoryChoice("24 mois", 732),
-    ThermalHistoryChoice("36 mois", 1098)
+    ThermalHistoryChoice("36 mois", 1098),
+    ThermalHistoryChoice("48 mois", 1464)
 )
 
 private fun thermalHistoryLabel(days: Int): String =
@@ -78,6 +79,7 @@ fun ThermalReferenceCard(
     val engine = remember { ThermalEngine(db, manager.store()) }
     val coherenceStore = remember { ThermalCoherenceStore(db) }
     val profileStore = remember { ThermalProfileStore(context) }
+    val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
     val modelSensorPrefs = remember {
         context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
     }
@@ -108,6 +110,95 @@ fun ThermalReferenceCard(
     var coherenceBaselineReady by remember { mutableStateOf(false) }
     var observedReferenceKey by remember { mutableStateOf(selectedKey) }
     var observedDataVersion by remember { mutableIntStateOf(dataVersion) }
+    var debtSnapshot by remember { mutableStateOf(historyDebtStore.loadDebt()) }
+    var continuationWork by remember { mutableStateOf<ThermalHistoryWork?>(null) }
+
+    fun refreshDebtState() { debtSnapshot = historyDebtStore.loadDebt() }
+
+    suspend fun processNextHistoryChunk() {
+        val work = historyDebtStore.loadWork() ?: return
+        historyDebtStore.resumeWork()
+        val range = work.nextRange() ?: return
+        busy = true
+        info = "Historique · mois ${work.nextChunk + 1}/${work.totalChunks} · préparation météo…"
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val prepared = manager.prepareHistoryRange(reference, range.first, range.last)
+                if (!prepared.coverage.ready) {
+                    error("${reference.city} incomplet sur ce mois : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
+                }
+                val advanced = historyDebtStore.advanceWork() ?: error("Session historique perdue")
+                if (advanced.nextChunk >= advanced.totalChunks) {
+                    val checked = engine.status(reference, advanced.sensorId, profile)
+                    if (!checked.canReconstruct) error(checked.message)
+                    val activeModel = checked.preferred?.model?.takeIf { it.sensorId == advanced.sensorId }
+                    val summary = engine.reconstructHistory(
+                        reference = reference,
+                        requestedDays = advanced.requestedDays,
+                        sensorId = advanced.sensorId,
+                        profile = profile,
+                        precalibratedModel = activeModel
+                    ) { p ->
+                        scope.launch {
+                            info = if (p.total > 0) {
+                                val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
+                                "${p.stage} · $percent % · ${p.changed} point(s)"
+                            } else p.stage
+                            if (p.total > 0 && p.processed > 0) {
+                                suppressNextAuto = true
+                                onDataChanged()
+                            }
+                        }
+                    }
+                    historyDebtStore.clearWork()
+                    historyDebtStore.clearDebt()
+                    Triple(prepared, summary, null)
+                } else {
+                    Triple(prepared, null, advanced)
+                }
+            }
+        }
+        busy = false
+        result.fold(
+            onSuccess = { (_, summary, next) ->
+                refreshDebtState()
+                if (summary != null) {
+                    continuationWork = null
+                    val detail = summary.diagnostic?.let { " · $it" }.orEmpty()
+                    info = "Historique terminé · ${summary.reconstructed} point(s) · ${summary.raccords} raccord(s)$detail"
+                    suppressNextAuto = true
+                    onDataChanged()
+                } else if (next != null) {
+                    continuationWork = next
+                    info = "Mois ${next.nextChunk}/${next.totalChunks} validé · choisir Continuer, Pause ou Annuler"
+                }
+            },
+            onFailure = { error ->
+                historyDebtStore.pauseWork()
+                historyDebtStore.setDebtState(HistoricalDebtState.PAUSED)
+                refreshDebtState()
+                continuationWork = null
+                info = error.message ?: "Morceau historique impossible · session mise en pause"
+            }
+        )
+    }
+
+    suspend fun beginHistoryWork(days: Int, reason: String) {
+        val checked = withContext(Dispatchers.IO) { engine.status(reference, selectedSensorId, profile) }
+        if (!checked.canReconstruct) { info = checked.message; return }
+        val activeId = selectedSensorId ?: checked.preferred?.sensor?.id ?: run { info = "Aucune sonde modèle"; return }
+        val firstReal = withContext(Dispatchers.IO) { coherenceStore.firstMeasuredTimestamp(activeId) }
+            ?: run { info = "Aucune vraie mesure pour initialiser l'historique"; return }
+        val boundedDays = days.coerceIn(1, 1464)
+        historyDebtStore.beginWork(reference.key, activeId, boundedDays, firstReal, reason)
+        historyDebtStore.recordDebt(
+            reference.key, activeId,
+            firstReal - boundedDays.toLong() * 24L * 60L * 60L * 1000L,
+            firstReal, reason, HistoricalDebtState.PENDING
+        )
+        refreshDebtState()
+        processNextHistoryChunk()
+    }
 
     suspend fun refresh(
         allHistory: Boolean,
@@ -207,13 +298,26 @@ fun ThermalReferenceCard(
                 // Si une reconstruction ancienne est réellement périmée, préparer sa profondeur
                 // AVANT toute suppression. On garde ainsi les vraies mesures et les sources sûres
                 // tant que les dépendances nécessaires au recalcul ne sont pas prêtes.
-                val maxHistoryDays = staleRecon.mapNotNull { state ->
+                val fullHistoryDays = staleRecon.mapNotNull { state ->
                     val firstReal = coherenceStore.firstMeasuredTimestamp(state.sensorId) ?: return@mapNotNull null
                     if (state.bounds.first >= firstReal) 0
-                    else (((firstReal - state.bounds.first) + dayMs - 1L) / dayMs).toInt().coerceIn(1, 1098)
+                    else (((firstReal - state.bounds.first) + dayMs - 1L) / dayMs).toInt().coerceIn(1, 1464)
                 }.maxOrNull() ?: 0
+                val maxHistoryDays = minOf(fullHistoryDays, 366)
+                if (fullHistoryDays > 366) {
+                    staleRecon.forEach { state ->
+                        val firstReal = coherenceStore.firstMeasuredTimestamp(state.sensorId) ?: return@forEach
+                        val recentStart = firstReal - 366L * dayMs
+                        if (state.bounds.first < recentStart) {
+                            historyDebtStore.recordDebt(
+                                reference.key, state.sensorId, state.bounds.first, recentStart, reason,
+                                HistoricalDebtState.PENDING
+                            )
+                        }
+                    }
+                }
                 if (maxHistoryDays > 0) {
-                    info = "Rationalisation · préparation météo ${thermalHistoryLabel(maxHistoryDays)}…"
+                    info = "Rationalisation · 12 mois max automatiques · préparation ${thermalHistoryLabel(maxHistoryDays)}…"
                     val prepared = manager.prepareHistory(reference, maxHistoryDays)
                     if (!prepared.coverage.ready) {
                         error("Référence ${reference.city} incomplète : aucune courbe existante n'a été supprimée")
@@ -234,9 +338,13 @@ fun ThermalReferenceCard(
 
                 staleRecon.forEach { state ->
                     val previousBounds = state.bounds
-                    removed += PointSourceStore.deleteBySource(db, state.sensorId, PointSource.RECONSTRUCTED)
+                    val firstReal = coherenceStore.firstMeasuredTimestamp(state.sensorId)
+                    val recentStart = firstReal?.let { maxOf(previousBounds.first, it - 366L * dayMs) } ?: previousBounds.first
+                    removed += PointSourceStore.deleteBySourceRange(
+                        db, state.sensorId, PointSource.RECONSTRUCTED, recentStart, previousBounds.last
+                    )
                     val rebuilt = engine.rebuildCalculatedExtent(
-                        reference, targetProfile, state.sensorId, previousBounds, progressCallback
+                        reference, targetProfile, state.sensorId, recentStart..previousBounds.last, progressCallback
                     )
                     reconstructed += rebuilt.reconstructed
                     skipped += rebuilt.skippedSensors
@@ -262,6 +370,7 @@ fun ThermalReferenceCard(
                 } else {
                     "Rationalisation terminée · ${r.removed} périmée(s) retirée(s) · ${r.reconstructed} historique(s) écrit(s) · ${r.forecasts} prévision(s) · ${r.skipped} refus"
                 }
+                refreshDebtState()
                 suppressNextAuto = true
                 onDataChanged()
             },
@@ -340,11 +449,48 @@ fun ThermalReferenceCard(
                 }
             }
 
-            OutlinedButton(
-                onClick = { stationDiscoveryOpen = true },
-                enabled = !busy,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("Sondes proches · Auto protection") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { stationDiscoveryOpen = true },
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f)
+                ) { Text("Sondes proches · Auto") }
+                TextButton(
+                    onClick = {
+                        prefs.setAutoProtection(false)
+                        prefs.select(WeatherReferenceCatalog.DEFAULT_KEY)
+                        selectedKey = WeatherReferenceCatalog.DEFAULT_KEY
+                    },
+                    enabled = !busy
+                ) { Text("Réinitialiser") }
+            }
+
+            debtSnapshot?.let { debt ->
+                Text(
+                    "◐ Historique ancien en attente · ~${debt.pendingDays} j · ${debt.reason}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.tertiary
+                )
+                val savedWork = historyDebtStore.loadWork()
+                Button(
+                    onClick = {
+                        scope.launch {
+                            if (savedWork != null) {
+                                historyDebtStore.resumeWork()
+                                continuationWork = null
+                                processNextHistoryChunk()
+                            } else {
+                                val firstReal = coherenceStore.firstMeasuredTimestamp(debt.sensorId)
+                                val days = firstReal?.let { (((it - debt.from).coerceAtLeast(24L * 60L * 60L * 1000L)) / (24L * 60L * 60L * 1000L)).toInt() }
+                                    ?: debt.pendingDays
+                                beginHistoryWork(days, debt.reason)
+                            }
+                        }
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (savedWork != null) "Reprendre l'historique" else "Mettre à jour l'historique ancien") }
+            }
 
             Text(info, style = MaterialTheme.typography.bodySmall)
 
@@ -558,55 +704,44 @@ fun ThermalReferenceCard(
             confirmButton = {
                 Button(onClick = {
                     weatherHistoryDialog = false
-                    scope.launch {
-                        busy = true
-                        info = "Historique météo · préparation ${thermalHistoryLabel(weatherHistoryDays)}…"
-                        val result = withContext(Dispatchers.IO) {
-                            runCatching {
-                                val prepared = manager.prepareHistory(reference, weatherHistoryDays)
-                                if (!prepared.coverage.ready) {
-                                    error("${reference.city} incomplet : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
-                                }
-                                val checked = engine.status(reference, selectedSensorId, profile)
-                                if (!checked.canReconstruct) error(checked.message)
-                                val activeId = selectedSensorId ?: checked.preferred?.sensor?.id
-                                val activeModel = checked.preferred?.model?.takeIf { it.sensorId == activeId }
-                                val summary = engine.reconstructHistory(
-                                    reference = reference,
-                                    requestedDays = weatherHistoryDays,
-                                    sensorId = activeId,
-                                    profile = profile,
-                                    precalibratedModel = activeModel
-                                ) { p ->
-                                    scope.launch {
-                                        info = if (p.total > 0) {
-                                            val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
-                                            "${p.stage} · $percent % · ${p.changed} point(s) écrit(s)"
-                                        } else p.stage
-                                        if (p.total > 0 && p.processed > 0) {
-                                            suppressNextAuto = true
-                                            onDataChanged()
-                                        }
-                                    }
-                                }
-                                prepared to summary
-                            }
-                        }
-                        busy = false
-                        result.fold(
-                            onSuccess = { (prepared, summary) ->
-                                val c = prepared.coverage
-                                val detail = summary.diagnostic?.let { d -> " · $d" }.orEmpty()
-                                info = "Deux petits loups prêts · météo ${prepared.days} j ${(c.coverage * 100).toInt()} % · bâtiment ${summary.reconstructed} point(s) · ${summary.raccords} raccord(s)$detail"
-                                suppressNextAuto = true
-                                onDataChanged()
-                            },
-                            onFailure = { info = it.message ?: "Extension météo + bâtiment impossible" }
-                        )
-                    }
+                    scope.launch { beginHistoryWork(weatherHistoryDays, "Extension historique demandée") }
                 }) { Text("Étendre") }
             },
             dismissButton = { TextButton(onClick = { weatherHistoryDialog = false }) { Text("Annuler") } }
+        )
+    }
+
+    continuationWork?.let { work ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Morceau historique terminé") },
+            text = {
+                Text("${work.nextChunk}/${work.totalChunks} mois préparé(s). La suite reste strictement du plus ancien vers le présent.")
+            },
+            confirmButton = {
+                Button(onClick = {
+                    continuationWork = null
+                    scope.launch { processNextHistoryChunk() }
+                }) { Text("Continuer") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        historyDebtStore.pauseWork()
+                        historyDebtStore.setDebtState(HistoricalDebtState.PAUSED)
+                        refreshDebtState()
+                        continuationWork = null
+                        info = "Historique mis en pause · reprise mémorisée"
+                    }) { Text("Mettre en pause") }
+                    TextButton(onClick = {
+                        historyDebtStore.clearWork()
+                        historyDebtStore.setDebtState(HistoricalDebtState.CANCELLED)
+                        refreshDebtState()
+                        continuationWork = null
+                        info = "Traitement annulé · historique non traité conservé dans la liste des mises à jour"
+                    }) { Text("Annuler") }
+                }
+            }
         )
     }
 
@@ -630,61 +765,13 @@ fun ThermalReferenceCard(
                             )
                         }
                     }
-                    Text("Sélection : ${thermalHistoryLabel(historyDays)} · maximum 36 mois.", style = MaterialTheme.typography.bodySmall)
+                    Text("Sélection : ${thermalHistoryLabel(historyDays)} · maximum 48 mois.", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
                 Button(onClick = {
                     historyDialog = false
-                    scope.launch {
-                        busy = true
-                        info = "Reconstruction · préparation météo…"
-                        val result = withContext(Dispatchers.IO) {
-                            runCatching {
-                                // Ordre strict v0.10.3 : la référence visible/RC est préparée AVANT tout.
-                                val prepared = manager.prepareHistory(reference, historyDays)
-                                if (!prepared.coverage.ready) {
-                                    error("${reference.city} incomplet : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
-                                }
-                                val checked = engine.status(reference, selectedSensorId, profile)
-                                if (!checked.canReconstruct) error(checked.message)
-                                val activeId = selectedSensorId ?: checked.preferred?.sensor?.id
-                                val activeModel = checked.preferred?.model?.takeIf { it.sensorId == activeId }
-                                engine.reconstructHistory(
-                                    reference = reference,
-                                    requestedDays = historyDays,
-                                    sensorId = activeId,
-                                    profile = profile,
-                                    precalibratedModel = activeModel
-                                ) { p ->
-                                    scope.launch {
-                                        info = if (p.total > 0) {
-                                            val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
-                                            "${p.stage} · $percent % · ${p.changed} point(s) écrit(s)"
-                                        } else p.stage
-                                        // Le callback arrive après un commit SQLite de 256 points :
-                                        // la courbe peut donc montrer la reconstruction sans attendre la fin.
-                                        if (p.total > 0 && p.processed > 0) {
-                                            suppressNextAuto = true
-                                            onDataChanged()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        busy = false
-                        result.fold(
-                            onSuccess = {
-                                // v0.10.2 : préserver le diagnostic de reconstruction pendant
-                                // le rechargement du graphique au lieu de le remplacer aussitôt.
-                                val detail = it.diagnostic?.let { d -> " · $d" }.orEmpty()
-                                info = "Historique : ${it.reconstructed} point(s) · ${it.raccords} raccord(s) · dérive max ${fmt(it.maxRaccordDrift)} °C · ${it.skippedSensors} refus$detail"
-                                suppressNextAuto = true
-                                onDataChanged()
-                            },
-                            onFailure = { info = it.message ?: "Reconstruction refusée" }
-                        )
-                    }
+                    scope.launch { beginHistoryWork(historyDays, "Reconstruction historique demandée") }
                 }) { Text("Estimer") }
             },
             dismissButton = { TextButton(onClick = { historyDialog = false }) { Text("Annuler") } }

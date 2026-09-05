@@ -15,7 +15,7 @@ import kotlin.math.sqrt
 private const val THERMAL_HOUR_MS = 60L * 60L * 1000L
 private const val THERMAL_DAY_MS = 24L * THERMAL_HOUR_MS
 private const val MIN_REAL_DAYS = 16
-private const val MAX_HISTORY_DAYS = 1098
+private const val MAX_HISTORY_DAYS = 1464
 
 data class ThermalMetrics(
     val mae: Double,
@@ -416,7 +416,8 @@ class ThermalEngine(
     fun refreshExistingReconstructions(
         reference: WeatherReference,
         profile: ThermalBuildingProfile = ThermalBuildingProfile(),
-        sensorId: Long? = null
+        sensorId: Long? = null,
+        maxHistoryDays: Int? = null
     ): ThermalWriteSummary {
         var total = 0
         var skipped = 0
@@ -429,7 +430,8 @@ class ThermalEngine(
             val first = measured.firstOrNull() ?: return@forEach
             if (existing.first < first.timestamp) {
                 val span = (first.timestamp - existing.first).coerceAtLeast(THERMAL_DAY_MS)
-                val days = ((span + THERMAL_DAY_MS - 1L) / THERMAL_DAY_MS).toInt().coerceIn(1, MAX_HISTORY_DAYS)
+                val fullDays = ((span + THERMAL_DAY_MS - 1L) / THERMAL_DAY_MS).toInt().coerceIn(1, MAX_HISTORY_DAYS)
+                val days = maxHistoryDays?.let { min(fullDays, it.coerceAtLeast(1)) } ?: fullDays
                 val r = reconstructHistory(reference, days, sensor.id, profile)
                 total += r.reconstructed
                 skipped += r.skippedSensors

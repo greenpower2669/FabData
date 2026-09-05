@@ -364,7 +364,7 @@ class WeatherReferenceManager(
      * 18 h supplémentaires sont chargées en amont : retard RC max 12 h + moyenne 6 h.
      */
     fun prepareHistory(reference: WeatherReference, requestedDays: Int): WeatherReferencePreparation {
-        val days = requestedDays.coerceIn(1, 1098)
+        val days = requestedDays.coerceIn(1, 1464)
         val indoor = db.physicalMeasuredBounds() ?: db.physicalSensorBounds() ?: db.globalTimeBounds()
             ?: error("Aucune donnée intérieure")
         val coreFrom = indoor.first - days.toLong() * 24L * hourMs
@@ -372,6 +372,16 @@ class WeatherReferenceManager(
         val loadTo = maxOf(indoor.last, System.currentTimeMillis() + 7L * hourMs)
         val sync = refreshSelected(reference, loadFrom, loadTo)
         val coverage = coverage(reference.key, loadFrom, indoor.first)
+        return WeatherReferencePreparation(sync, coverage, days)
+    }
+
+    /** Prépare un seul morceau historique, toujours du plus ancien vers le plus récent. */
+    fun prepareHistoryRange(reference: WeatherReference, from: Long, to: Long): WeatherReferencePreparation {
+        require(to >= from) { "Période historique invalide" }
+        val loadFrom = from - 18L * hourMs
+        val sync = refreshSelected(reference, loadFrom, to)
+        val coverage = coverage(reference.key, loadFrom, to)
+        val days = (((to - from).coerceAtLeast(0L) / (24L * hourMs)) + 1L).toInt().coerceAtLeast(1)
         return WeatherReferencePreparation(sync, coverage, days)
     }
 
@@ -427,7 +437,7 @@ class WeatherReferenceManager(
 
     /**
      * Rafraîchissement live léger : jamais d'archive longue. Il est conçu pour être
-     * appelé au focus puis toutes les 60 s sans relancer une reconstruction historique.
+     * appelé au focus puis selon la cadence premier-plan sans relancer une reconstruction historique.
      */
     fun refreshRecent(reference: WeatherReference): WeatherReferenceSyncResult {
         store.keepOnly(reference.key)
@@ -547,13 +557,13 @@ class WeatherReferenceManager(
         val endDate = Instant.ofEpochMilli(historyTo).atZone(zone).toLocalDate()
         if (startDate.isAfter(endDate)) return emptyList()
 
-        // v0.14 : 36 mois représentent ~26 000 points horaires. On découpe volontairement
-        // l'archive en fenêtres de 180 jours : moins de mémoire, moins de risque de timeout,
-        // et exactement la même série finale après déduplication.
+        // v0.18 : les historiques longs sont volontairement découpés en morceaux
+        // d'environ un mois. Même logique partout : ancien -> récent, reprise plus simple,
+        // moins de mémoire et aucune grosse requête monolithique.
         val out = mutableListOf<WeatherReferencePoint>()
         var cursor = startDate
         while (!cursor.isAfter(endDate)) {
-            val chunkEnd = minOf(cursor.plusDays(179L), endDate)
+            val chunkEnd = minOf(cursor.plusDays(30L), endDate)
             val url = "https://archive-api.open-meteo.com/v1/archive" +
                 "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
                 "&start_date=$cursor&end_date=$chunkEnd" +

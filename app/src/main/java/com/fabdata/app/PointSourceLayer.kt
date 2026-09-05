@@ -426,6 +426,38 @@ object PointSourceStore {
         return timestamps.size
     }
 
+    /** Supprime une plage d'une couche calculée uniquement. MEASURED reste interdit. */
+    fun deleteBySourceRange(
+        db: FabDataDb,
+        sensorId: Long,
+        source: PointSource,
+        from: Long,
+        to: Long
+    ): Int {
+        require(source != PointSource.MEASURED) { "Une mesure réelle ne peut jamais être invalidée" }
+        if (to < from) return 0
+        ensure(db.writableDatabase)
+        val timestamps = mutableListOf<Long>()
+        db.readableDatabase.rawQuery(
+            "SELECT timestamp FROM point_sources WHERE sensor_id=? AND source=? AND timestamp BETWEEN ? AND ? ORDER BY timestamp",
+            arrayOf(sensorId.toString(), source.dbValue, from.toString(), to.toString())
+        ).use { c -> while (c.moveToNext()) timestamps += c.getLong(0) }
+        if (timestamps.isEmpty()) return 0
+        db.inTransaction {
+            timestamps.forEach { ts ->
+                db.writableDatabase.delete(
+                    "samples", "sensor_id=? AND timestamp=?",
+                    arrayOf(sensorId.toString(), ts.toString())
+                )
+                db.writableDatabase.delete(
+                    "point_sources", "sensor_id=? AND timestamp=? AND source=?",
+                    arrayOf(sensorId.toString(), ts.toString(), source.dbValue)
+                )
+            }
+        }
+        return timestamps.size
+    }
+
     fun reconstructedBounds(db: FabDataDb, sensorId: Long): LongRange? =
         sourceBounds(db, sensorId, PointSource.RECONSTRUCTED)
 
