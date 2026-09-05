@@ -1,0 +1,80 @@
+name: FabData v0.19.1 contextual help + demo
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.1-help-demo'
+    paths:
+      - 'scripts/apply-v0191-help-demo.py'
+      - '.github/workflows/v0191-help-demo.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0191-help-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply contextual help patch
+        run: python3 scripts/apply-v0191-help-demo.py
+
+      - name: Regression guards
+        run: |
+          git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt
+
+          grep -q 'versionCode = 37' app/build.gradle.kts
+          grep -q 'versionName = "0.19.1"' app/build.gradle.kts
+          grep -q '? Aide' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q '! Astuce du jour' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'RangeSelectionHelpDemo' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'range_selection_used' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'range_tip_dismissed' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'appui long reste réservé au zoom 48 h' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'Utiliser cette zone comme nouveau zoom' app/src/main/java/com/fabdata/app/MainActivity.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug
+        run: gradle --no-daemon :app:compileDebugKotlin --stacktrace
+
+      - name: Commit compiled contextual help source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "Contextual help already applied"
+          else
+            git commit -m "Apply FabData v0.19.1 contextual help and micro-demo"
+            git push
+          fi
