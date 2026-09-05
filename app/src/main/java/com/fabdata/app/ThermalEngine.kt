@@ -233,7 +233,11 @@ class ThermalEngine(
             val split = (rows.size * 0.80).toInt().coerceIn(80, rows.size - 24)
             val train = rows.take(split)
             val valid = rows.drop(split)
-            val coeff = ridgeRegression(train) ?: continue
+            val coeff = ridgeRegression(train)?.clone() ?: continue
+            // Les deux gradients extérieurs représentent des conductances : ils ne peuvent
+            // pas devenir des moteurs de signe arbitraire à cause de la colinéarité du fit.
+            coeff[0] = coeff[0].coerceIn(0.0, 0.35)
+            coeff[1] = coeff[1].coerceIn(0.0, 0.35)
             val metrics = validate(coeff, valid)
             val driftRmse = validateLongHorizon(coeff, valid, profile, inertia.diagnostics)
             val exchange = coeff[0] + coeff[1]
@@ -961,15 +965,13 @@ class ThermalEngine(
     }
 
     private fun equilibriumTemperature(coeff: DoubleArray, tout: Double, avg6: Double, hour: Int): Double? {
-        val exchange = coeff[0] + coeff[1]
-        if (!exchange.isFinite() || abs(exchange) < 0.002) return null
-        val sinIndex = if (coeff.size >= 6) 3 else 2
-        val cosIndex = if (coeff.size >= 6) 4 else 3
-        val biasIndex = if (coeff.size >= 6) 5 else 4
-        // À l'équilibre air≈masse : le terme appris (T_mass-T_air) s'annule.
-        val seasonal = coeff[sinIndex] * sin(2.0 * PI * hour / 24.0) +
-            coeff[cosIndex] * cos(2.0 * PI * hour / 24.0) + coeff[biasIndex]
-        val value = (coeff[0] * tout + coeff[1] * avg6 + seasonal) / exchange
+        val kNow = coeff.getOrNull(0)?.coerceAtLeast(0.0) ?: return null
+        val kSlow = coeff.getOrNull(1)?.coerceAtLeast(0.0) ?: return null
+        val exchange = kNow + kSlow
+        if (!exchange.isFinite() || exchange < 0.002) return null
+        // À l'équilibre air≈masse. La correction horaire n'est volontairement PAS une
+        // température d'équilibre : elle reste un petit résidu autour du flux physique.
+        val value = (kNow * tout + kSlow * avg6) / exchange
         return value.takeIf { it.isFinite() }
     }
 
@@ -1063,14 +1065,25 @@ class ThermalEngine(
                 for (j in 0 until n) a[i][j] += row.features[i] * row.features[j]
             }
         }
-        val ridge = 0.015
-        for (i in 0 until n) a[i][i] += ridge
+        // Les gradients physiques restent libres ; l'heure de la journée et le biais
+        // sont fortement régularisés pour ne jamais fabriquer une oscillation autonome.
+        for (i in 0 until n) {
+            val ridge = when (i) {
+                3, 4 -> 0.30   // sin/cos 24 h : correction résiduelle seulement
+                5 -> 0.08      // biais
+                else -> 0.015  // gradients Tout/Tin et masse/Tin
+            }
+            a[i][i] += ridge
+        }
         return solve(a, b)
     }
 
     private fun validate(coeff: DoubleArray, rows: List<TrainingRow>): ThermalMetrics {
         val errors = rows.map { row ->
-            val predicted = row.tin + dot(coeff, row.features)
+            // Validation identique au moteur réellement utilisé : le résidu horaire est borné.
+            val predicted = row.tin + predictDelta(
+                coeff, row.tin, row.mass, row.tout, row.toutAvg6, row.hourOfDay
+            )
             predicted - row.nextTin
         }
         if (errors.isEmpty()) return ThermalMetrics(99.0, 99.0, 99.0, 99.0, 0)
@@ -1089,24 +1102,36 @@ class ThermalEngine(
         toutAvg6: Double,
         hour: Int
     ): Double {
-        val f = if (coeff.size >= 6) {
-            doubleArrayOf(
-                tout - tin,
-                toutAvg6 - tin,
-                mass - tin,
-                sin(2.0 * PI * hour / 24.0),
-                cos(2.0 * PI * hour / 24.0),
-                1.0
-            )
-        } else {
-            doubleArrayOf(
-                tout - tin,
-                toutAvg6 - tin,
-                sin(2.0 * PI * hour / 24.0),
-                cos(2.0 * PI * hour / 24.0),
-                1.0
-            )
+        if (coeff.size >= 6) {
+            // Cœur physique : l'air calculé est tendu par les gradients extérieur/air
+            // et masse/air. L'heure ne peut plus devenir un moteur indépendant.
+            val physical =
+                coeff[0].coerceAtLeast(0.0) * (tout - tin) +
+                coeff[1].coerceAtLeast(0.0) * (toutAvg6 - tin) +
+                coeff[2] * (mass - tin)
+            val dailyRaw =
+                coeff[3] * sin(2.0 * PI * hour / 24.0) +
+                coeff[4] * cos(2.0 * PI * hour / 24.0) + coeff[5]
+
+            // Résidu max ~0,025 °C/h, et surtout proportionnel au flux physique.
+            // Si le flux physique est quasi nul, le résidu tombe à quelques millièmes.
+            val residualLimit = min(0.025, 0.18 * abs(physical) + 0.0025)
+            val residual = dailyRaw.coerceIn(-residualLimit, residualLimit)
+            val combined = physical + residual
+
+            // Une correction horaire n'a jamais le droit d'inverser un flux physique net.
+            return if (abs(physical) >= 0.005 && combined * physical < 0.0) {
+                0.25 * physical
+            } else combined
         }
+
+        val f = doubleArrayOf(
+            tout - tin,
+            toutAvg6 - tin,
+            sin(2.0 * PI * hour / 24.0),
+            cos(2.0 * PI * hour / 24.0),
+            1.0
+        )
         return dot(coeff, f)
     }
 

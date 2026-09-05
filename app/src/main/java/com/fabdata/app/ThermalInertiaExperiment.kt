@@ -186,7 +186,9 @@ class ThermalInertiaEstimator(
             SamplePoint(
                 sensorId = THERMAL_INERTIA_SENSOR_ID,
                 timestamp = h.timestamp,
-                temperature = round2(outputMass[index]),
+                // Keep full latent precision: rounding the state itself can visually erase a small
+                // but physically real tangent change. Labels/diagnostics may still be rounded.
+                temperature = outputMass[index],
                 humidity = h.humidity,
                 source = PointSource.RECONSTRUCTED,
                 confidence = confidence
@@ -385,13 +387,13 @@ class ThermalInertiaEstimator(
                         abs(massSlopes[i] - massSlopes[i - 1]) / dt
                     }
                     .averageOr(0.0)
-                val tangent = tangentPenalty(hours, mass, clean)
+                val tangent = tangentPenalty(hours, mass, clean, outsideWeight)
 
                 val score = rmse +
                     0.06 * plateauError +
                     0.45 * max(0.0, slopeActivity - 0.065) +
                     0.18 * max(0.0, tangentAcceleration - 0.025) +
-                    0.42 * tangent.first
+                    0.55 * tangent.first
                 val candidate = InertiaCandidate(
                     tau, outsideWeight, mass, kOut, kMass, rmse, score,
                     clean.count { it }, plateau.count { it }, tangent.first, tangent.second
@@ -409,7 +411,7 @@ class ThermalInertiaEstimator(
         val (clean, plateau) = masks(hours, manualExclusions)
         val tau = 168.0
         val mass = propagate(hours, tau, 0.15, plateau)
-        val tangent = tangentPenalty(hours, mass, clean)
+        val tangent = tangentPenalty(hours, mass, clean, 0.15)
         return InertiaCandidate(
             tauHours = tau,
             outsideWeight = 0.15,
@@ -439,8 +441,8 @@ class ThermalInertiaEstimator(
             val target = hours[i - 1].smoothAir * (1.0 - outsideWeight) + hours[i - 1].outside * outsideWeight
             // La valeur ne saute jamais. Seule la vitesse de convergence augmente légèrement
             // lorsqu'un même changement de direction persiste sur plusieurs échelles de temps.
-            val regime = regimeConfidence(hours, i - 1)
-            val effectiveTau = tauHours / (1.0 + 0.55 * regime)
+            val regime = regimeConfidence(hours, i - 1, outsideWeight)
+            val effectiveTau = tauHours / (1.0 + 1.10 * regime)
             val alpha = 1.0 - exp(-dt / effectiveTau)
             var next = mass[i - 1] + alpha * (target - mass[i - 1])
             if (plateau[i]) {
@@ -466,8 +468,8 @@ class ThermalInertiaEstimator(
                 .coerceIn(0.5, 24.0)
             val target = hours[i - 1].smoothAir * (1.0 - outsideWeight) +
                 hours[i - 1].outside * outsideWeight
-            val regime = regimeConfidence(hours, i - 1)
-            val effectiveTau = tauHours.coerceAtLeast(24.0) / (1.0 + 0.55 * regime)
+            val regime = regimeConfidence(hours, i - 1, outsideWeight)
+            val effectiveTau = tauHours.coerceAtLeast(24.0) / (1.0 + 1.10 * regime)
             val alpha = 1.0 - exp(-dt / effectiveTau)
             mass[i] = (mass[i - 1] + alpha * (target - mass[i - 1])).coerceIn(-5.0, 50.0)
         }
@@ -476,29 +478,56 @@ class ThermalInertiaEstimator(
 
 
     /**
-     * Confiance 0..1 qu'un changement de pente est un vrai changement de régime.
-     * Les pentes courte (≈3 h) et moyenne (≈9 h) doivent être de même signe.
-     * La météo extérieure n'impose jamais le signe : elle ne fait que renforcer ou
-     * atténuer légèrement la confiance. Tous les calculs sont normalisés par Δt réel.
+     * v0.19.4 : le changement de régime est lu dans le FORÇAGE thermique, pas seulement
+     * dans la pente de l'air intérieur. La masse peut donc modifier immédiatement sa
+     * dérivée lorsque l'extérieur bouge alors que l'intérieur est encore presque plat.
+     *
+     * Le terme instantané est volontairement faible : un pic extérieur ne doit pas faire
+     * sauter la masse. La réponse forte n'arrive que si les pentes ≈3 h et ≈9 h du forçage
+     * restent cohérentes. La valeur de masse reste toujours continue.
      */
-    private fun regimeConfidence(hours: List<InertiaHour>, index: Int): Double {
-        if (index < 3 || index !in hours.indices) return 0.0
+    private fun regimeConfidence(hours: List<InertiaHour>, index: Int, outsideWeight: Double): Double {
+        if (index < 1 || index !in hours.indices) return 0.0
+        val instantFrom = max(0, index - 1)
         val shortFrom = max(0, index - 3)
         val mediumFrom = max(0, index - 9)
-        val shortSlope = slopeBetween(hours, shortFrom, index, outside = false) ?: return 0.0
-        val mediumSlope = slopeBetween(hours, mediumFrom, index, outside = false) ?: return 0.0
-        if (shortSlope * mediumSlope <= 0.0) return 0.0
-        if (abs(shortSlope) < 0.035 || abs(mediumSlope) < 0.020) return 0.0
+        val instantSlope = forcingSlopeBetween(hours, instantFrom, index, outsideWeight) ?: 0.0
+        val shortSlope = forcingSlopeBetween(hours, shortFrom, index, outsideWeight) ?: instantSlope
+        val mediumSlope = forcingSlopeBetween(hours, mediumFrom, index, outsideWeight) ?: shortSlope
 
-        val outsideSlope = slopeBetween(hours, mediumFrom, index, outside = true) ?: 0.0
-        val strength = ((0.65 * abs(shortSlope) + 0.35 * abs(mediumSlope) - 0.025) / 0.14)
-            .coerceIn(0.0, 1.0)
-        val outsideSupport = when {
-            abs(outsideSlope) < 0.015 -> 0.85
-            outsideSlope * mediumSlope > 0.0 -> 1.0
-            else -> 0.70
+        // Toute variation réelle du forçage produit un petit changement de tangente.
+        // Elle ne peut cependant apporter que 18 % de confiance à elle seule.
+        val instantStrength = (abs(instantSlope) / 0.12).coerceIn(0.0, 1.0)
+        val instant = 0.18 * instantStrength
+
+        val aligned = shortSlope * mediumSlope > 0.0
+        val persistentStrength = if (aligned) {
+            ((0.62 * abs(shortSlope) + 0.38 * abs(mediumSlope) - 0.004) / 0.10)
+                .coerceIn(0.0, 1.0)
+        } else 0.0
+        val instantAgreement = when {
+            abs(instantSlope) < 1e-6 -> 0.90
+            instantSlope * shortSlope > 0.0 -> 1.0
+            else -> 0.72
         }
-        return (strength * outsideSupport).coerceIn(0.0, 1.0)
+        return (instant + 0.82 * persistentStrength * instantAgreement).coerceIn(0.0, 1.0)
+    }
+
+    private fun forcingValue(hour: InertiaHour, outsideWeight: Double): Double {
+        val w = outsideWeight.coerceIn(0.02, 0.45)
+        return hour.smoothAir * (1.0 - w) + hour.outside * w
+    }
+
+    private fun forcingSlopeBetween(
+        hours: List<InertiaHour>,
+        fromIndex: Int,
+        toIndex: Int,
+        outsideWeight: Double
+    ): Double? {
+        if (fromIndex !in hours.indices || toIndex !in hours.indices || toIndex <= fromIndex) return null
+        val elapsed = (hours[toIndex].timestamp - hours[fromIndex].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble()
+        if (elapsed <= 0.25) return null
+        return (forcingValue(hours[toIndex], outsideWeight) - forcingValue(hours[fromIndex], outsideWeight)) / elapsed
     }
 
     private fun slopeBetween(
@@ -523,7 +552,8 @@ class ThermalInertiaEstimator(
     private fun tangentPenalty(
         hours: List<InertiaHour>,
         mass: DoubleArray,
-        clean: BooleanArray
+        clean: BooleanArray,
+        outsideWeight: Double
     ): Pair<Double, Int> {
         if (hours.size != mass.size || clean.size != mass.size || mass.size < 5) return 0.0 to 0
         var weightedError = 0.0
@@ -531,15 +561,15 @@ class ThermalInertiaEstimator(
         var regimeHours = 0
         for (i in 4 until mass.size) {
             if (!clean[i] || !clean[i - 1]) continue
-            val confidence = regimeConfidence(hours, i)
+            val confidence = regimeConfidence(hours, i, outsideWeight)
             if (confidence < 0.20) continue
             val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
                 .coerceAtLeast(0.25)
             val massSlope = (mass[i] - mass[i - 1]) / dt
-            val referenceSlope = slopeBetween(hours, max(0, i - 3), i, outside = false) ?: continue
-            if (abs(referenceSlope) < 0.035) continue
+            val referenceSlope = forcingSlopeBetween(hours, max(0, i - 3), i, outsideWeight) ?: continue
+            if (abs(referenceSlope) < 0.006) continue
 
-            val minimumUsefulSlope = min(0.055, abs(referenceSlope) * 0.22) * confidence
+            val minimumUsefulSlope = min(0.045, abs(referenceSlope) * 0.18) * confidence
             val wrongDirection = if (massSlope * referenceSlope < 0.0) {
                 min(0.20, abs(massSlope) + minimumUsefulSlope)
             } else 0.0
