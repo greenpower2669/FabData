@@ -1,0 +1,226 @@
+name: Android APK + AAB v0.18.1
+
+on:
+  push:
+    branches:
+      - 'agent/v0.18.1-station-discovery-fix'
+    paths-ignore:
+      - 'artifacts/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0181-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply v0.18.1 station discovery fix
+        run: |
+          if grep -q 'versionName = "0.18.1"' app/build.gradle.kts \
+             && test -f app/src/main/java/com/fabdata/app/StationSectorPrefs.kt \
+             && grep -q 'Tourniquet · toutes les stations locales' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt \
+             && grep -q 'reevaluateAuto = true' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt; then
+            echo "v0.18.1 source already generated"
+          else
+            python3 scripts/apply-v0181-station-discovery-fix.py
+          fi
+
+      - name: Regression guards
+        run: |
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt; then
+            echo "ERROR: backup/import format must stay untouched"
+            git diff -- app/src/main/java/com/fabdata/app/BackupLayer.kt
+            exit 1
+          fi
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt; then
+            echo "ERROR: physical data layer must stay untouched"
+            git diff -- app/src/main/java/com/fabdata/app/DataLayer.kt
+            exit 1
+          fi
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt; then
+            echo "ERROR: source priority / measured protection must stay untouched"
+            git diff -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+            exit 1
+          fi
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalEngine.kt; then
+            echo "ERROR: RC / reconstruction engine must stay untouched"
+            git diff -- app/src/main/java/com/fabdata/app/ThermalEngine.kt
+            exit 1
+          fi
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt; then
+            echo "ERROR: weather series / measured dominance layer must stay untouched"
+            git diff -- app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+            exit 1
+          fi
+
+          grep -q 'versionCode = 35' app/build.gradle.kts
+          grep -q 'versionName = "0.18.1"' app/build.gradle.kts
+          grep -q 'class WeatherStationSectorPrefs' app/src/main/java/com/fabdata/app/StationSectorPrefs.kt
+          grep -q 'sector_latitude' app/src/main/java/com/fabdata/app/StationSectorPrefs.kt
+          grep -q 'suspend fun gpsAnchor' app/src/main/java/com/fabdata/app/StationDiscovery.kt
+          grep -q 'requestSingleUpdate' app/src/main/java/com/fabdata/app/StationDiscovery.kt
+          grep -q 'heatCacheTtlMs' app/src/main/java/com/fabdata/app/StationDiscovery.kt
+          grep -q 'Tourniquet · toutes les stations locales' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'horizontalScroll' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q '🗺 Choisir sur la carte' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'openMapWhenReady' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'sectorPrefs.save' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'reevaluateAuto: Boolean = false' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -q 'reevaluateAuto = true' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -q 'discovery.discover(sector.anchor(), sector.radiusKm)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -q 'maxHistoryDays = 366' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -q 'val persistedKey = prefs.selectedKey()' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'if (persistedKey != selectedKey)' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'MEASURED("measured", 3)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'require(source != PointSource.MEASURED)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          live = Path('app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt').read_text()
+          assert 'delay(300_000L)' in live
+          assert 'reevaluateAuto = true' in live
+          assert 'reevaluateAuto = false' in live
+          assert 'maxHistoryDays = 366' in live
+          assert 'recordDebt' in live
+
+          ui = Path('app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt').read_text()
+          assert 'Tourniquet · toutes les stations locales' in ui
+          assert '🗺 Choisir sur la carte' in ui
+          assert 'found.candidates.forEachIndexed' in ui
+          assert 'savedSector?.let' in ui
+
+          discovery = Path('app/src/main/java/com/fabdata/app/StationDiscovery.kt').read_text()
+          assert 'suspend fun gpsAnchor' in discovery
+          assert 'withTimeoutOrNull(10_000L)' in discovery
+          assert 'requestSingleUpdate' in discovery
+          assert 'readCachedHeat' in discovery and 'saveCachedHeat' in discovery
+
+          thermal = Path('app/src/main/java/com/fabdata/app/ThermalUi.kt').read_text()
+          assert 'val persistedKey = prefs.selectedKey()' in thermal
+          assert 'return@LaunchedEffect' in thermal
+
+          print('v0.18.1 guards: exhaustive local carousel, visible map, restored sector memory, fresh GPS, foreground auto rescan, measured/RC untouched')
+          PY
+
+      - name: Commit generated source
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/StationSectorPrefs.kt \
+            app/src/main/java/com/fabdata/app/StationDiscovery.kt \
+            app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt \
+            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
+            app/src/main/java/com/fabdata/app/ThermalUi.kt
+          if git diff --cached --quiet; then
+            echo "v0.18.1 source already generated"
+          else
+            git commit -m "Apply FabData v0.18.1 station discovery fix"
+            git push
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Restore Google Play upload key when configured
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK and Android App Bundle
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify generated packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage named APK and AAB
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.18.1-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.18.1-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.18.1-signing-mode.txt
+          sha256sum artifacts/FabData-v0.18.1-release.apk artifacts/FabData-v0.18.1-release.aab > artifacts/FabData-v0.18.1-sha256.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.18.1-release
+          path: |
+            artifacts/FabData-v0.18.1-release.apk
+            artifacts/FabData-v0.18.1-release.aab
+            artifacts/FabData-v0.18.1-signing-mode.txt
+            artifacts/FabData-v0.18.1-sha256.txt
+          if-no-files-found: error
+
+      - name: Publish APK and AAB on branch
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add artifacts/FabData-v0.18.1-release.apk artifacts/FabData-v0.18.1-release.aab artifacts/FabData-v0.18.1-signing-mode.txt artifacts/FabData-v0.18.1-sha256.txt
+          if git diff --cached --quiet; then
+            echo "Packages unchanged"
+          else
+            git commit -m "Build FabData v0.18.1 APK + AAB"
+            git push
+          fi
+
+      - name: Publish GitHub Release with APK and AAB
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.18.1
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --target "$(git rev-parse HEAD)" \
+              --title "FabData v0.18.1" \
+              --notes "FabData v0.18.1 — correctif ciblé du sélecteur météo. Restaure la mémoire de secteur v0.13, le tourniquet horizontal exhaustif des stations locales et un GPS qui redemande une position fraîche lorsque nécessaire. Le bouton carte reste visible avant même le premier scan et ouvre la sélection cartographique après détection du secteur. En Auto protection, l'index du secteur mémorisé est resondé à chaque retour au premier plan, avec cache climatique 7 jours pour éviter les téléchargements lourds ; si la station Auto change, seuls les 12 derniers mois sont recalculés automatiquement et l'ancien historique reste tracé comme dette. Les mesures MEASURED, le moteur RC, l'import/export et le format de sauvegarde restent inchangés."
+          fi
+          gh release upload "$TAG" \
+            artifacts/FabData-v0.18.1-release.apk \
+            artifacts/FabData-v0.18.1-release.aab \
+            artifacts/FabData-v0.18.1-signing-mode.txt \
+            artifacts/FabData-v0.18.1-sha256.txt \
+            --clobber
