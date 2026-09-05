@@ -1,0 +1,108 @@
+name: FabData v0.19.5 source compile
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.5-bimass-zero-reference'
+    paths:
+      - 'scripts/apply-v0195-bimass-zero-reference-v2.py'
+      - '.github/workflows/v0195-source-compile.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0195-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-compile-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply corrected v0.19.5 patch
+        run: python3 scripts/apply-v0195-bimass-zero-reference-v2.py
+
+      - name: Physics and regression guards
+        run: |
+          grep -q 'versionCode = 41' app/build.gradle.kts
+          grep -q 'versionName = "0.19.5"' app/build.gradle.kts
+          grep -q 'thermal-zero-bimass-6' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'propagateTwoMass' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'surfaceTauHours' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'deepTauHours' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'deepShare' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'val x = tout - mass' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'val y = a.temperature - mass' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'fitProjectionFactor' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'val target = mass + k \* (tout - mass)' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+
+          git fetch origin tag v0.19.4 --force || true
+          for f in \
+            app/src/main/java/com/fabdata/app/BackupLayer.kt \
+            app/src/main/java/com/fabdata/app/DataLayer.kt \
+            app/src/main/java/com/fabdata/app/MainActivity.kt \
+            app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt; do
+            git diff --quiet v0.19.4 -- "$f" || { echo "Protected file changed: $f"; exit 1; }
+          done
+
+          python3 - <<'PY'
+          import math
+          def project(tm, tout, k): return tm + k*(tout-tm)
+          assert project(26.0, 26.0, .2) == 26.0
+          assert project(26.0, 30.0, .2) > 26.0
+          assert project(26.0, 22.0, .2) < 26.0
+          xs=[0,0,2,-2,4,-4]; ys=[.1,-.1,.4,-.4,.8,-.8]
+          k=sum(x*y for x,y in zip(xs,ys))/sum(x*x for x in xs)
+          assert math.isfinite(k) and abs(k-.2)<1e-12
+          surface=deep=26.0; forcing=30.0
+          a_s=1-math.exp(-1/30); a_d=1-math.exp(-1/336)
+          ns=surface+a_s*((.82*forcing+.18*deep)-surface)
+          nd=deep+a_d*(ns-deep)
+          nm=.30*ns+.70*nd
+          assert surface < nm < ns < forcing
+          ns2=ns+a_s*((.82*22+.18*nd)-ns)
+          assert ns2 < ns
+          print('v0.19.5 physics guards OK')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug
+        run: gradle --no-daemon :app:compileDebugKotlin --stacktrace
+
+      - name: Commit compiled v0.19.5 source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          if git diff --cached --quiet; then
+            echo "v0.19.5 source already applied"
+          else
+            git commit -m "Apply FabData v0.19.5 bi-mass inertia and zero-reference reconstruction"
+            git push
+          fi
