@@ -1,0 +1,204 @@
+name: Android APK + AAB v0.19.4 physical tangent
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.4-physical-gradient-tangent'
+    paths:
+      - 'scripts/apply-v0194-physical-gradient-tangent.py'
+      - '.github/workflows/android-build-v0194.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0194-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.19.4 physical patch
+        run: python3 scripts/apply-v0194-physical-gradient-tangent.py
+
+      - name: Regression and physics guards
+        run: |
+          grep -q 'versionCode = 40' app/build.gradle.kts
+          grep -q 'versionName = "0.19.4"' app/build.gradle.kts
+          grep -q 'thermal-rc-inertia-5' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+
+          # Inertia: full precision + forcing-based tangent response.
+          grep -q 'temperature = outputMass\[index\]' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'forcingSlopeBetween' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'regimeConfidence(hours, i - 1, outsideWeight)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q '1.10 \* regime' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          grep -q 'tangentPenalty(hours, mass, clean, outsideWeight)' app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+
+          # Indoor reconstruction: periodic terms are residual only.
+          grep -q 'val physical =' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'val residualLimit = min(0.025' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q "Une correction horaire n'a jamais le droit d'inverser" app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q '3, 4 -> 0.30' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+
+          # v0.19.1 selector/help and v0.19.3 ANR fix stay present.
+          grep -q 'Sélectionner une période' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q "Utiliser cette zone pour entraîner l'inertie" app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q "Exclure cette zone du modèle d'inertie" app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'Utiliser cette zone comme nouveau zoom' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q '? Aide' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'ThermalUiRuntime' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Initialisation thermique en arrière-plan' app/src/main/java/com/fabdata/app/ThermalUi.kt
+
+          git fetch origin tag v0.19.3 --force || true
+          if git rev-parse v0.19.3 >/dev/null 2>&1; then
+            for f in \
+              app/src/main/java/com/fabdata/app/BackupLayer.kt \
+              app/src/main/java/com/fabdata/app/DataLayer.kt \
+              app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+              app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt \
+              app/src/main/java/com/fabdata/app/MainActivity.kt \
+              app/src/main/java/com/fabdata/app/ThermalUi.kt; do
+              if ! git diff --quiet v0.19.3 -- "$f"; then
+                echo "ERROR: protected v0.19.3 file changed: $f"
+                git diff -- v0.19.3 -- "$f"
+                exit 1
+              fi
+            done
+          fi
+
+          python3 - <<'PY'
+          # Numeric sanity: a flat indoor state must still feel an exterior stimulus
+          # through the weighted forcing, while the latent state itself remains continuous.
+          import math
+          indoor = 25.0
+          outside0 = 25.0
+          outside1 = 31.0
+          w = 0.15
+          tau = 240.0
+          mass = 25.0
+          forcing0 = indoor * (1-w) + outside0*w
+          forcing1 = indoor * (1-w) + outside1*w
+          assert forcing1 > forcing0
+          base_slope0 = (forcing0 - mass) / tau
+          base_slope1 = (forcing1 - mass) / tau
+          assert base_slope1 > base_slope0
+          # Exact first-order update: no jump, just a changed derivative.
+          alpha = 1.0 - math.exp(-1.0/tau)
+          next_mass = mass + alpha * (forcing1 - mass)
+          assert mass < next_mass < forcing1
+
+          # Daily residual cannot dominate/reverse a meaningful physical flux.
+          physical = 0.08
+          limit = min(0.025, 0.18*abs(physical)+0.0025)
+          assert limit < physical
+          combined = physical + max(-limit, min(limit, -0.5))
+          assert combined > 0.0
+          print('v0.19.4 numeric physics sanity OK')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug first
+        run: gradle --no-daemon :app:compileDebugKotlin --stacktrace
+
+      - name: Restore Google Play upload key when configured
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build release APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage v0.19.4 packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.19.4-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.19.4-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.19.4-signing-mode.txt
+          sha256sum artifacts/FabData-v0.19.4-release.apk artifacts/FabData-v0.19.4-release.aab > artifacts/FabData-v0.19.4-sha256.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.19.4-release
+          path: |
+            artifacts/FabData-v0.19.4-release.apk
+            artifacts/FabData-v0.19.4-release.aab
+            artifacts/FabData-v0.19.4-signing-mode.txt
+            artifacts/FabData-v0.19.4-sha256.txt
+          if-no-files-found: error
+
+      - name: Commit compiled source and packages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            artifacts/FabData-v0.19.4-release.apk \
+            artifacts/FabData-v0.19.4-release.aab \
+            artifacts/FabData-v0.19.4-signing-mode.txt \
+            artifacts/FabData-v0.19.4-sha256.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Apply FabData v0.19.4 physical gradient tangent and build APK AAB"
+            git push
+          fi
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v0.19.4
+        run: |
+          NOTES='FabData v0.19.4 — test physique ciblé. La température intérieure calculée reste pilotée par les gradients extérieur/air et masse/air ; sin/cos 24 h et biais sont fortement régularisés et bornés à un petit résidu incapable d inverser un flux physique net. L inertie thermique lit désormais le changement de régime dans le forçage combiné intérieur + extérieur : même si l air intérieur reste plat, un stimulus extérieur modifie immédiatement mais continûment la tangente, puis la réponse augmente si le changement persiste. La série inertielle conserve sa précision complète pour ne pas effacer les micro-variations de pente à l affichage. MODEL_VERSION passe à thermal-rc-inertia-5 afin que Rationaliser les courbes détecte les anciennes reconstructions. Sélectionneur, aides, RAW et correctif ANR v0.19.3 conservés.'
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$(git rev-parse HEAD)" --title "FabData v0.19.4" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" \
+            artifacts/FabData-v0.19.4-release.apk \
+            artifacts/FabData-v0.19.4-release.aab \
+            artifacts/FabData-v0.19.4-signing-mode.txt \
+            artifacts/FabData-v0.19.4-sha256.txt \
+            --clobber
