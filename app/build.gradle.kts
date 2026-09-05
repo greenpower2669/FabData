@@ -23,8 +23,8 @@ android {
         applicationId = "com.fabdata.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 37
-        versionName = "0.19.1"
+        versionCode = 38
+        versionName = "0.19.2"
     }
 
     signingConfigs {

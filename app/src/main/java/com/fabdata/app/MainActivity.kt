@@ -280,7 +280,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val weatherReferenceStore = remember { WeatherReferenceStore(db) }
     val weatherReferenceManager = remember { WeatherReferenceManager(context, db, lyonLab, meteoCredentials) }
     val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
-    val thermalTrainingMaskStore = remember { ThermalTrainingMaskStore(db) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
@@ -738,7 +737,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 scope.launch {
                                     busy = true
                                     val changed = withContext(Dispatchers.IO) {
-                                        thermalTrainingMaskStore.includeRange(sensorId, range.first, range.last)
+                                        // ThermalTrainingMaskStore initialise SQLite dans son constructeur.
+                                        // Le créer ici empêche tout accès DB synchrone pendant la composition UI.
+                                        ThermalTrainingMaskStore(db).includeRange(sensorId, range.first, range.last)
                                     }
                                     reloadToken++
                                     busy = false
@@ -757,7 +758,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 scope.launch {
                                     busy = true
                                     withContext(Dispatchers.IO) {
-                                        thermalTrainingMaskStore.addMerged(
+                                        // Même garde-fou pour l'exclusion : création du store + écriture hors UI.
+                                        ThermalTrainingMaskStore(db).addMerged(
                                             sensorId,
                                             range.first,
                                             range.last,
