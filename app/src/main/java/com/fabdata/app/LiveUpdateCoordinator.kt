@@ -18,8 +18,11 @@ import kotlinx.coroutines.withContext
 /**
  * Orchestrateur toujours composé, indépendant des cartes LazyColumn.
  *
- * - au focus/ouverture puis toutes les 60 s : rafraîchissement météo léger + forecast ;
+ * - uniquement quand l'app est réellement au premier plan ;
+ * - ouverture / retour au focus : rafraîchissement immédiat ;
+ * - ensuite toutes les 5 minutes tant que l'utilisateur regarde l'app ;
  * - lorsqu'une vraie mesure intérieure change : météo fraîche -> inertie/reconstruction -> forecast ;
+ * - un changement reçu en arrière-plan est seulement mémorisé, aucun calcul n'y est lancé ;
  * - ne modifie jamais directement une mesure MEASURED.
  */
 @Composable
@@ -47,6 +50,7 @@ fun FabLiveUpdateCoordinator(
     }
     var working by remember { mutableStateOf(false) }
     var measuredRevision by remember { mutableStateOf<String?>(null) }
+    var pendingMeasuredRefresh by remember { mutableStateOf(false) }
 
     DisposableEffect(activity) {
         if (activity == null) return@DisposableEffect onDispose { }
@@ -61,10 +65,12 @@ fun FabLiveUpdateCoordinator(
         onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
-    suspend fun updateLive(rebuildFromMeasured: Boolean) {
-        if (working) return
+    suspend fun updateLive(rebuildFromMeasured: Boolean): Boolean {
+        // Garde-fou central : même si un effet UI se déclenche tardivement,
+        // rien de météo/thermique ne part lorsque l'app n'est plus regardée.
+        if (!foreground || working) return false
         working = true
-        try {
+        return try {
             val reference = weatherPrefs.selectedReference()
             withContext(Dispatchers.IO) {
                 // La station système Lyon possède une vraie source d'observation fraîche.
@@ -76,8 +82,6 @@ fun FabLiveUpdateCoordinator(
                     }
                 }
 
-                // Nettoie d'abord d'éventuels anciens calculs qui cohabitaient dans
-                // la même heure qu'une vraie mesure, sans jamais supprimer MEASURED.
                 PointSourceStore.reconcileMeasuredDominance(db)
                 manager.refreshRecent(reference)
 
@@ -86,34 +90,48 @@ fun FabLiveUpdateCoordinator(
                 val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
 
                 if (rebuildFromMeasured) {
-                    // refreshExistingReconstructions réestime l'inertie via le moteur
-                    // avant de réécrire uniquement les couches calculées concernées.
                     engine.refreshExistingReconstructions(reference, profile, selectedSensorId)
                 }
                 engine.refreshForecasts(reference, selectedSensorId, profile, mode)
             }
             onDataChanged()
+            true
         } finally {
             working = false
         }
     }
 
-    // Réagit à toute arrivée/import de données même si la carte thermique est hors écran.
+    // Une nouvelle vraie mesure déclenche immédiatement le recalcul seulement si l'app
+    // est visible. En arrière-plan on pose juste un drapeau, repris au prochain focus.
     LaunchedEffect(dataVersion) {
         val current = withContext(Dispatchers.IO) { db.physicalMeasuredRevision() }
         val previous = measuredRevision
         measuredRevision = current
         if (previous != null && current != previous) {
-            updateLive(rebuildFromMeasured = true)
+            pendingMeasuredRefresh = true
+            if (foreground && updateLive(rebuildFromMeasured = true)) {
+                pendingMeasuredRefresh = false
+            }
         }
     }
 
-    // Ouverture / retour au premier plan : immédiat, puis une fois par minute.
+    // Ouverture / retour au premier plan : immédiat. Puis cadence douce de 5 minutes.
+    // Le changement de lifecycle annule cet effet dès que l'app repasse derrière.
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
-        while (foreground) {
-            updateLive(rebuildFromMeasured = false)
-            delay(60_000L)
+
+        val rebuildNow = pendingMeasuredRefresh
+        if (updateLive(rebuildFromMeasured = rebuildNow) && rebuildNow) {
+            pendingMeasuredRefresh = false
+        }
+
+        while (true) {
+            delay(300_000L)
+            if (!foreground) break
+            val rebuild = pendingMeasuredRefresh
+            if (updateLive(rebuildFromMeasured = rebuild) && rebuild) {
+                pendingMeasuredRefresh = false
+            }
         }
     }
 }

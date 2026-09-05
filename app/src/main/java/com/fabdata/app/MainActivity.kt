@@ -1641,6 +1641,7 @@ private fun InteractiveChart(
 ) {
     var zoom by remember(resetKey, from, to) { mutableFloatStateOf(1f) }
     var center by remember(resetKey, from, to) { mutableFloatStateOf(0.5f) }
+    var sightTemperature by remember(resetKey, from, to) { mutableStateOf<Double?>(null) }
 
     val axisColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.60f)
     val gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
@@ -1658,25 +1659,48 @@ private fun InteractiveChart(
             (from + (fullSpan * endFraction).toLong())
     }
 
+    fun visibleTemperatureRange(window: LongRange): Pair<Double, Double> {
+        val values = sensors
+            .filter { showTemp[it.id] == true }
+            .flatMap { sampleMap[it.id].orEmpty() }
+            .filter { it.timestamp in window }
+            .flatMap { p ->
+                if (p.source == PointSource.FORECAST && p.uncertaintyC != null) {
+                    listOf(p.temperature, p.temperature + p.uncertaintyC, p.temperature - p.uncertaintyC)
+                } else listOf(p.temperature)
+            }
+        return paddedRange(values, 15.0, 35.0, -50.0, 80.0)
+    }
+
     Canvas(
         modifier = modifier
             .background(surfaceColor, RoundedCornerShape(16.dp))
-            .pointerInput(from, to, resetKey, selectedTimestamp) {
+            .pointerInput(from, to, resetKey, selectedTimestamp, sightTemperature) {
                 detectTransformGestures { centroid, pan, zoomChange, _ ->
                     val window = visibleWindow()
                     val span = (window.last - window.first).coerceAtLeast(1L)
                     val leftPx = 52.dp.toPx()
                     val rightPx = size.width - 44.dp.toPx()
+                    val topPx = 22.dp.toPx()
+                    val bottomPx = size.height - 38.dp.toPx()
+                    val plotHeight = (bottomPx - topPx).coerceAtLeast(1f)
+                    val range = visibleTemperatureRange(window)
                     val selectedX = selectedTimestamp
                         ?.takeIf { it in window }
                         ?.let { leftPx + ((it - window.first).toDouble() / span.toDouble()).toFloat() * (rightPx - leftPx) }
+                    val selectedY = sightTemperature?.let { temp ->
+                        bottomPx - (((temp - range.first) / (range.second - range.first)).toFloat() * plotHeight)
+                    }
                     val grabsSight = selectedX != null &&
-                        kotlin.math.abs(centroid.x - selectedX) <= 30.dp.toPx() &&
+                        (kotlin.math.abs(centroid.x - selectedX) <= 30.dp.toPx() ||
+                            (selectedY != null && kotlin.math.abs(centroid.y - selectedY) <= 24.dp.toPx())) &&
                         zoomChange in 0.97f..1.03f
 
-                    if (grabsSight && centroid.x in leftPx..rightPx) {
-                        val frac = ((centroid.x - leftPx) / (rightPx - leftPx)).coerceIn(0f, 1f)
-                        onSelectTimestamp(window.first + (span * frac).toLong())
+                    if (grabsSight && centroid.x in leftPx..rightPx && centroid.y in topPx..bottomPx) {
+                        val fracX = ((centroid.x - leftPx) / (rightPx - leftPx)).coerceIn(0f, 1f)
+                        onSelectTimestamp(window.first + (span * fracX).toLong())
+                        val fracY = ((bottomPx - centroid.y) / plotHeight).coerceIn(0f, 1f)
+                        sightTemperature = range.first + (range.second - range.first) * fracY.toDouble()
                     } else {
                         val oldVisible = 1f / zoom
                         val newZoom = (zoom * zoomChange).coerceIn(1f, 720f)
@@ -1744,6 +1768,13 @@ private fun InteractiveChart(
                             } else {
                                 val frac = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
                                 onSelectTimestamp(window.first + (span * frac).toLong())
+                                val top = 22.dp.toPx()
+                                val bottom = size.height - 38.dp.toPx()
+                                if (p.y in top..bottom) {
+                                    val range = visibleTemperatureRange(window)
+                                    val fracY = ((bottom - p.y) / (bottom - top).coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    sightTemperature = range.first + (range.second - range.first) * fracY.toDouble()
+                                }
                             }
                         }
                     }
@@ -1998,22 +2029,58 @@ private fun InteractiveChart(
 
         selectedTimestamp?.takeIf { it in visibleFrom..visibleTo }?.let { ts ->
             val x = mapX(ts)
-            drawLine(selectColor, Offset(x, top), Offset(x, bottom), strokeWidth = 2f)
+            drawLine(selectColor, Offset(x, top), Offset(x, bottom), strokeWidth = 2.dp.toPx())
 
-            // Heure directement sur la visée.
+            val fallbackTemperature = sensors
+                .firstOrNull { showTemp[it.id] == true }
+                ?.let { sensor -> nearestForSensor(sensor, sampleMap[sensor.id].orEmpty(), ts)?.temperature }
+            val crossTemperature = (sightTemperature ?: fallbackTemperature)
+                ?.coerceIn(tempRange.first, tempRange.second)
+            val crossY = crossTemperature?.let { mapTemp(it) }
+
+            // Vrai crosshair : température horizontale sur toute la zone utile.
+            if (crossY != null && crossY in top..bottom) {
+                drawLine(
+                    selectColor.copy(alpha = 0.88f),
+                    Offset(left, crossY),
+                    Offset(right, crossY),
+                    strokeWidth = 1.8.dp.toPx()
+                )
+                drawCircle(Color.White, 5.dp.toPx(), Offset(x, crossY))
+                drawCircle(selectColor, 3.2.dp.toPx(), Offset(x, crossY))
+            }
+
             val sightPaint = android.graphics.Paint(centerPaint).apply {
                 color = selectColor.toArgbCompat()
                 textSize = 9.dp.toPx()
                 isFakeBoldText = true
             }
-            drawContext.canvas.nativeCanvas.drawText(
-                formatDateTime(ts),
-                x.coerceIn(left + 54.dp.toPx(), right - 54.dp.toPx()),
-                top + 10.dp.toPx(),
-                sightPaint
-            )
+            val timeLabel = formatDateTime(ts)
+            val timeHalf = sightPaint.measureText(timeLabel) / 2f + 4.dp.toPx()
+            val timeX = x.coerceIn(left + timeHalf, right - timeHalf)
 
-            // Petit trait horizontal + valeur colorée à la hauteur de chaque sonde.
+            // Date/heure répétée en haut ET en bas du graphe.
+            drawContext.canvas.nativeCanvas.drawText(timeLabel, timeX, top + 10.dp.toPx(), sightPaint)
+            drawContext.canvas.nativeCanvas.drawText(timeLabel, timeX, bottom - 5.dp.toPx(), sightPaint)
+
+            // Température du crosshair répétée à gauche ET à droite.
+            if (crossTemperature != null && crossY != null) {
+                val tempLabel = String.format(Locale.FRANCE, "%.1f°", crossTemperature)
+                val leftSightPaint = android.graphics.Paint(paint).apply {
+                    color = selectColor.toArgbCompat()
+                    textSize = 9.dp.toPx()
+                    isFakeBoldText = true
+                    textAlign = android.graphics.Paint.Align.LEFT
+                }
+                val rightSightPaint = android.graphics.Paint(leftSightPaint).apply {
+                    textAlign = android.graphics.Paint.Align.RIGHT
+                }
+                val baseline = (crossY - 4.dp.toPx()).coerceIn(top + 9.dp.toPx(), bottom - 3.dp.toPx())
+                drawContext.canvas.nativeCanvas.drawText(tempLabel, left + 4.dp.toPx(), baseline, leftSightPaint)
+                drawContext.canvas.nativeCanvas.drawText(tempLabel, right - 4.dp.toPx(), baseline, rightSightPaint)
+            }
+
+            // Les températures réelles de chaque sonde restent indiquées à leur propre niveau.
             sensors.filter { showTemp[it.id] == true }.forEach { sensor ->
                 val point = nearestForSensor(sensor, sampleMap[sensor.id].orEmpty(), ts) ?: return@forEach
                 val y = mapTemp(point.temperature)
