@@ -52,8 +52,11 @@ data class ThermalInertiaDiagnostics(
 }
 
 data class ThermalInertiaEstimate(
+    /** Energy-weighted building mass. Internal engine state: never chart this directly. */
     val points: List<SamplePoint>,
-    val diagnostics: ThermalInertiaDiagnostics
+    val diagnostics: ThermalInertiaDiagnostics,
+    /** Observable surface / ground equivalent, defined only on the real MEASURED interval. */
+    val surfacePoints: List<SamplePoint> = emptyList()
 ) {
     fun window(from: Long, to: Long, maxPoints: Int = 5000): List<SamplePoint> {
         val selected = points.filter { it.timestamp in from..to }
@@ -195,8 +198,7 @@ class ThermalInertiaEstimator(
             SamplePoint(
                 sensorId = THERMAL_INERTIA_SENSOR_ID,
                 timestamp = h.timestamp,
-                // Keep full latent precision: rounding the state itself can visually erase a small
-                // but physically real tangent change. Labels/diagnostics may still be rounded.
+                // Hidden building state keeps full precision for the engine.
                 temperature = outputMass[index],
                 humidity = h.humidity,
                 source = PointSource.RECONSTRUCTED,
@@ -204,6 +206,26 @@ class ThermalInertiaEstimator(
             )
         }
         if (points.isEmpty()) return null
+
+        // What we display during the real period is NOT the hidden building mass.
+        // It is the superficial thermal layer (surface / ground equivalent) which is
+        // directly downstream of that mass and of the current forcing. It is deliberately
+        // built from MEASURED hours only, so the visible purple trace stops at the last
+        // real observation instead of leaking the hidden mass into reconstructed history.
+        val realPlateau = masks(hours, manualExclusions).second
+        val surfaceValues = propagateSurfaceDisplay(
+            hours, best.surfaceTauHours, best.deepTauHours, best.outsideWeight, realPlateau
+        )
+        val surfacePoints = hours.mapIndexed { index, h ->
+            SamplePoint(
+                sensorId = THERMAL_INERTIA_SENSOR_ID,
+                timestamp = h.timestamp,
+                temperature = surfaceValues[index],
+                humidity = h.humidity,
+                source = PointSource.RECONSTRUCTED,
+                confidence = confidence
+            )
+        }
 
         val trend = trendPerDay(outputHours, outputMass)
         val currentAir = outputHours.last().smoothAir
@@ -227,7 +249,7 @@ class ThermalInertiaEstimator(
             deepTauHours = best.deepTauHours,
             deepShare = best.deepShare
         )
-        return ThermalInertiaEstimate(points, diagnostics).also {
+        return ThermalInertiaEstimate(points, diagnostics, surfacePoints).also {
             cachedKey = key
             cached = it
         }
@@ -532,6 +554,44 @@ class ThermalInertiaEstimator(
         outsideWeight = outsideWeight,
         plateau = null
     )
+
+    /**
+     * Surface / sol équivalent visible. La profondeur reste totalement cachée : elle
+     * n'intervient ici que comme réservoir qui tire la couche superficielle.
+     */
+    private fun propagateSurfaceDisplay(
+        hours: List<InertiaHour>,
+        surfaceTauHours: Double,
+        deepTauHours: Double,
+        outsideWeight: Double,
+        plateau: BooleanArray?
+    ): DoubleArray {
+        val surfaceValues = DoubleArray(hours.size)
+        if (hours.isEmpty()) return surfaceValues
+        val w = outsideWeight.coerceIn(0.02, 0.45)
+        var surface = forcingValue(hours[0], w)
+        var deep = hours[0].smoothAir * 0.88 + hours[0].outside * 0.12
+        surfaceValues[0] = surface
+
+        for (i in 1 until hours.size) {
+            val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
+                .coerceIn(0.5, 24.0)
+            val forcing = forcingValue(hours[i - 1], w)
+            val surfaceTarget = 0.82 * forcing + 0.18 * deep
+            val alphaSurface = 1.0 - exp(-dt / surfaceTauHours.coerceAtLeast(6.0))
+            var nextSurface = surface + alphaSurface * (surfaceTarget - surface)
+            if (plateau?.getOrNull(i) == true) {
+                val observationGain = min(0.06, 0.015 * dt)
+                nextSurface += observationGain * (hours[i].smoothAir - nextSurface)
+            }
+            val alphaDeep = 1.0 - exp(-dt / deepTauHours.coerceAtLeast(surfaceTauHours * 2.5))
+            val nextDeep = deep + alphaDeep * (nextSurface - deep)
+            surface = nextSurface.coerceIn(-5.0, 50.0)
+            deep = nextDeep.coerceIn(-5.0, 50.0)
+            surfaceValues[i] = surface
+        }
+        return surfaceValues
+    }
 
     /**
      * v0.19.4 : le changement de régime est lu dans le FORÇAGE thermique, pas seulement

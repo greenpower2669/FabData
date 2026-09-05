@@ -622,122 +622,81 @@ class ThermalEngine(
         val firstHour = hourBucket(first.timestamp)
         if (start >= firstHour) return ForwardFillSummary(diagnostic = "Période historique vide.")
 
-        val initial = estimateInitialStateForward(model, first, start, firstHour, outside, profile, inertia)
-            ?: return ForwardFillSummary(diagnostic = "Impossible d'initialiser un état air/masse thermique plausible avec ${reference.city}.")
-
-        var current = initial.first
-        var currentH = initial.second
-        var currentMass = initial.third
+        // La masse bâtiment est l'état caché. On ne cherche plus une température de sonde
+        // initiale artificielle pour la faire raccorder au réel : le sol visible découle
+        // directement de cette masse et du transfert extérieur appris.
+        var currentMass = initialMassTemperature(profile, start, firstHour, outside)
+            ?: return ForwardFillSummary(diagnostic = "Impossible d'initialiser la masse thermique cachée avec ${reference.city}.")
+        var currentH = outside[hourBucket(start)]?.humidity ?: first.humidity
+        var currentGround = projectObservableGround(model, currentMass, outside, start, profile)
+            ?: return ForwardFillSummary(diagnostic = "Impossible de projeter le sol équivalent au début de la période.")
         var ts = start
         var stopDiagnostic: String? = null
         val writes = ArrayList<PriorityPointWrite>(((firstHour - start) / THERMAL_HOUR_MS).toInt().coerceAtLeast(0))
 
-        // Calcul pur d'abord : aucune écriture SQLite dans la boucle RC.
         while (ts < firstHour) {
+            val projected = projectObservableGround(model, currentMass, outside, ts, profile)
+            if (projected == null || !plausibleIndoor(projected)) {
+                stopDiagnostic = "Propagation arrêtée : projection sol impossible vers ${Instant.ofEpochMilli(ts).atZone(zone).toLocalDateTime()}."
+                break
+            }
+            currentGround = projected
             val horizonDays = (first.timestamp - ts).toDouble() / THERMAL_DAY_MS.toDouble()
             val confidence = (model.confidence * (1.0 - 0.0065 * horizonDays)).coerceIn(0.20, model.confidence)
             writes += PriorityPointWrite(
-                sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
+                sensor.id, ts, round2(currentGround), round2(currentH.coerceIn(0.0, 100.0)),
                 provenance(model, reference, PointSource.RECONSTRUCTED, confidence, fingerprint)
             )
 
-            val extTs = ts - model.lagHours * THERMAL_HOUR_MS
-            val ext = outsideAt(outside, extTs)
-            if (ext == null) {
-                stopDiagnostic = "Propagation arrêtée : météo extérieure absente vers ${Instant.ofEpochMilli(ts).atZone(zone).toLocalDateTime()}."
-                break
-            }
-            val extAvg6 = outsideAverage(outside, extTs, 6) ?: ext
-            val stepHour = Instant.ofEpochMilli(ts).atZone(zone).hour
-            val delta = massAwareDelta(model.coefficients, current, currentMass, ext, extAvg6, stepHour, profile)
-                .coerceIn(-1.2, 1.2)
-            val next = current + delta
-            if (!plausibleIndoor(next)) {
-                stopDiagnostic = "Propagation arrêtée avant dérive physique abusive (${round2(next)} °C)."
-                break
-            }
-            val nextMass = advanceInertiaMass(inertia.diagnostics, current, currentMass, extAvg6)
+            // La masse cachée évolue avec le forçage physique ACTUEL. Le lag appris ne
+            // s'applique qu'à la projection du sol observable.
+            val massOutside = outsideAverage(outside, ts, 6)
+                ?: outsideAt(outside, ts)
+                ?: run {
+                    stopDiagnostic = "Propagation arrêtée : météo extérieure absente vers ${Instant.ofEpochMilli(ts).atZone(zone).toLocalDateTime()}."
+                    break
+                }
+            currentMass = advanceInertiaMass(inertia.diagnostics, currentGround, currentMass, massOutside)
             val outHum = outside[hourBucket(ts)]?.humidity ?: currentH
             currentH += 0.08 * (outHum - currentH)
-            current = next
-            currentMass = nextMass
             ts += THERMAL_HOUR_MS
         }
 
         val created = PointSourceStore.upsertBatchByPriority(db, writes, 256) { processed, changed ->
-            progress?.invoke(
-                ThermalProgress("Écriture historique · ${sensor.room}", processed, writes.size, changed)
-            )
+            progress?.invoke(ThermalProgress("Écriture sol reconstruit · ${sensor.room}", processed, writes.size, changed))
         }
         if (stopDiagnostic != null) return ForwardFillSummary(created, 0, 0.0, stopDiagnostic)
 
-        val drift = abs(current - first.temperature)
+        val projectedAtFirst = projectObservableGround(model, currentMass, outside, firstHour, profile)
+        val drift = projectedAtFirst?.let { abs(it - first.temperature) } ?: 0.0
         return ForwardFillSummary(
-            created, 1, drift,
-            "État inertiel initial ${round2(initial.third)} °C · τ ${round2(inertia.diagnostics.tauHours)} h · couplage appris"
+            created, if (projectedAtFirst != null) 1 else 0, drift,
+            "Sol reconstruit depuis masse bâtiment cachée · τ ${round2(inertia.diagnostics.tauHours)} h · lag ${model.lagHours} h"
         )
     }
 
-    private fun estimateInitialStateForward(
+    private fun projectObservableGround(
         model: ThermalModel,
-        first: HourPoint,
-        start: Long,
-        firstHour: Long,
+        hiddenMass: Double,
         outside: Map<Long, HourPoint>,
-        profile: ThermalBuildingProfile,
-        inertia: ThermalInertiaEstimate
-    ): Triple<Double, Double, Double>? {
-        val initialMass = initialMassTemperature(profile, start, firstHour, outside) ?: return null
-        val targetMassAtFirst = inertia.points.minByOrNull { abs(it.timestamp - firstHour) }?.temperature
-        val low = (initialMass - 7.0).coerceAtLeast(5.0)
-        val high = (initialMass + 7.0).coerceAtMost(42.0)
-        var candidate = low
-        var bestStart: Double? = null
-        var bestError = Double.POSITIVE_INFINITY
-
-        while (candidate <= high + 1e-9) {
-            var current = candidate
-            var mass = initialMass
-            var ts = start
-            var valid = true
-            while (ts < firstHour) {
-                val extTs = ts - model.lagHours * THERMAL_HOUR_MS
-                val ext = outsideAt(outside, extTs)
-                if (ext == null) {
-                    valid = false
-                    break
-                }
-                val avg6 = outsideAverage(outside, extTs, 6) ?: ext
-                val hour = Instant.ofEpochMilli(ts).atZone(zone).hour
-                val delta = massAwareDelta(model.coefficients, current, mass, ext, avg6, hour, profile)
-                    .coerceIn(-1.2, 1.2)
-                val next = current + delta
-                if (!plausibleIndoor(next)) {
-                    valid = false
-                    break
-                }
-                val nextMass = advanceInertiaMass(inertia.diagnostics, current, mass, avg6)
-                current = next
-                mass = nextMass
-                ts += THERMAL_HOUR_MS
-            }
-            if (valid && ts >= firstHour) {
-                // Le premier vrai point juge le départ, mais une petite pénalité évite
-                // de choisir une température d'air initiale artificiellement éloignée de la masse.
-                val massError = targetMassAtFirst?.let { abs(mass - it) } ?: 0.0
-                val error = abs(current - first.temperature) +
-                    0.20 * massError + 0.035 * abs(candidate - initialMass)
-                if (error < bestError) {
-                    bestError = error
-                    bestStart = candidate
-                }
-            }
-            candidate += 0.25
-        }
-
-        val startTemp = bestStart ?: return null
-        val startHumidity = outside[hourBucket(start)]?.humidity ?: first.humidity
-        return Triple(startTemp, startHumidity, initialMass)
+        timestamp: Long,
+        profile: ThermalBuildingProfile
+    ): Double? {
+        val extTs = timestamp - model.lagHours * THERMAL_HOUR_MS
+        val tout = outsideAt(outside, extTs) ?: return null
+        val avg6 = outsideAverage(outside, extTs, 6) ?: tout
+        val hour = Instant.ofEpochMilli(timestamp).atZone(zone).hour
+        val deltaFromMass = massAwareDelta(
+            model.coefficients,
+            hiddenMass,
+            hiddenMass,
+            tout,
+            avg6,
+            hour,
+            profile
+        )
+        val ground = hiddenMass + deltaFromMass
+        return ground.takeIf { plausibleIndoor(it) }
     }
 
     private fun fillInteriorGapsForward(
@@ -765,52 +724,59 @@ class ThermalEngine(
         measured.zipWithNext().forEach { (left, right) ->
             val gapHours = ((right.timestamp - left.timestamp) / THERMAL_HOUR_MS).toInt()
             if (gapHours !in 2..(14 * 24)) return@forEach
-            var current = left.temperature
             var currentH = left.humidity
             var currentMass = inertia.points
                 .minByOrNull { abs(it.timestamp - left.timestamp) }
                 ?.takeIf { abs(it.timestamp - left.timestamp) <= 3L * THERMAL_HOUR_MS }
                 ?.temperature ?: left.temperature
+            var currentGround = projectObservableGround(model, currentMass, outMap, hourBucket(left.timestamp), profile)
+                ?: left.temperature
             var completed = true
 
             for (step in 1 until gapHours) {
                 val previousTs = hourBucket(left.timestamp) + (step - 1) * THERMAL_HOUR_MS
                 val ts = previousTs + THERMAL_HOUR_MS
-                val extTs = previousTs - model.lagHours * THERMAL_HOUR_MS
-                val tout = outsideAt(outMap, extTs)
-                if (tout == null) {
+
+                // First advance ONLY the hidden building state with current physical forcing.
+                val massOutside = outsideAverage(outMap, previousTs, 6)
+                    ?: outsideAt(outMap, previousTs)
+                if (massOutside == null) {
                     completed = false
                     break
                 }
-                val avg6 = outsideAverage(outMap, extTs, 6) ?: tout
-                val hour = Instant.ofEpochMilli(previousTs).atZone(zone).hour
-                val delta = massAwareDelta(model.coefficients, current, currentMass, tout, avg6, hour, profile)
-                    .coerceIn(-1.2, 1.2)
-                val predicted = current + delta
-                if (!plausibleIndoor(predicted)) { completed = false; break }
-                val nextMass = advanceInertiaMass(inertia.diagnostics, current, currentMass, avg6)
-                current = predicted
-                currentMass = nextMass
+                currentMass = advanceInertiaMass(
+                    inertia.diagnostics, currentGround, currentMass, massOutside
+                )
+
+                // Then derive the observable ground at its own timestamp. This removes the
+                // accidental extra +1 h phase shift that existed in v0.19.5/v0.19.6.
+                val predicted = projectObservableGround(model, currentMass, outMap, ts, profile)
+                if (predicted == null || !plausibleIndoor(predicted)) {
+                    completed = false
+                    break
+                }
+                currentGround = predicted
                 val outHum = outMap[hourBucket(ts)]?.humidity ?: currentH
                 currentH += 0.08 * (outHum - currentH)
                 val confidence = (model.confidence * 0.82).coerceIn(0.20, 0.85)
                 writes += PriorityPointWrite(
-                    sensor.id, ts, round2(current), round2(currentH.coerceIn(0.0, 100.0)),
+                    sensor.id, ts, round2(currentGround), round2(currentH.coerceIn(0.0, 100.0)),
                     provenance(model, reference, PointSource.RECONSTRUCTED, confidence, fingerprint)
                 )
             }
 
             if (completed) {
                 val previousTs = hourBucket(right.timestamp) - THERMAL_HOUR_MS
-                val extTs = previousTs - model.lagHours * THERMAL_HOUR_MS
-                val tout = outsideAt(outMap, extTs)
-                val avg6 = if (tout != null) outsideAverage(outMap, extTs, 6) ?: tout else null
-                if (tout != null && avg6 != null) {
-                    val hour = Instant.ofEpochMilli(previousTs).atZone(zone).hour
-                    val projectedAtRight = current + massAwareDelta(
-                        model.coefficients, current, currentMass, tout, avg6, hour, profile
-                    ).coerceIn(-1.2, 1.2)
-                    if (plausibleIndoor(projectedAtRight)) {
+                val massOutside = outsideAverage(outMap, previousTs, 6)
+                    ?: outsideAt(outMap, previousTs)
+                if (massOutside != null) {
+                    val massAtRight = advanceInertiaMass(
+                        inertia.diagnostics, currentGround, currentMass, massOutside
+                    )
+                    val projectedAtRight = projectObservableGround(
+                        model, massAtRight, outMap, hourBucket(right.timestamp), profile
+                    )
+                    if (projectedAtRight != null && plausibleIndoor(projectedAtRight)) {
                         raccords++
                         maxDrift = max(maxDrift, abs(projectedAtRight - right.temperature))
                     }
@@ -819,7 +785,7 @@ class ThermalEngine(
         }
 
         val created = PointSourceStore.upsertBatchByPriority(db, writes, 256) { processed, changed ->
-            progress?.invoke(ThermalProgress("Comblement des trous · ${sensor.room}", processed, writes.size, changed))
+            progress?.invoke(ThermalProgress("Comblement sol reconstruit · ${sensor.room}", processed, writes.size, changed))
         }
         return ForwardFillSummary(created, raccords, maxDrift)
     }

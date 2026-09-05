@@ -45,7 +45,7 @@ fun ThermalInertiaExperimentCard(estimate: ThermalInertiaEstimate?) {
         ) {
             Text("Modèle thermique interne · expérimental", fontWeight = FontWeight.Bold)
             Text(
-                "La courbe reconstruite visible représente la surface / le sol équivalent. La masse thermique du bâtiment reste un état caché appris uniquement sur les points MEASURED propres ; elle sert au calcul mais n’est plus tracée sur le graphe principal.",
+                "Sur les données réelles, la courbe Sol inertiel estimé montre la couche superficielle. Hors réel, FabData reconstruit cette même grandeur à partir de la masse thermique cachée du bâtiment et du transfert extérieur appris. La masse profonde reste diagnostic interne.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
