@@ -28,33 +28,35 @@ jobs:
 
       - name: Final v0.19.5 regression and physics guards
         run: |
-          grep -q 'versionCode = 41' app/build.gradle.kts
-          grep -q 'versionName = "0.19.5"' app/build.gradle.kts
-          grep -q 'thermal-zero-bimass-6' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          need() { grep -Fq "$1" "$2" || { echo "ERROR missing guard: $1 in $2"; exit 1; }; }
+
+          need 'versionCode = 41' app/build.gradle.kts
+          need 'versionName = "0.19.5"' app/build.gradle.kts
+          need 'thermal-zero-bimass-6' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
 
           INERTIA=app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
           ENGINE=app/src/main/java/com/fabdata/app/ThermalEngine.kt
           MAIN=app/src/main/java/com/fabdata/app/MainActivity.kt
 
-          grep -q 'val surfaceTaus = doubleArrayOf(18.0, 30.0, 48.0, 72.0)' "$INERTIA"
-          grep -q 'val deepTaus = doubleArrayOf(144.0, 240.0, 336.0, 504.0, 720.0)' "$INERTIA"
-          grep -q 'val deepShares = doubleArrayOf(0.55, 0.70, 0.82)' "$INERTIA"
-          grep -q 'private fun propagateTwoMass' "$INERTIA"
-          grep -q 'val surfaceTarget = 0.82 \* forcing + 0.18 \* deep' "$INERTIA"
-          grep -q 'val nextDeep = deep + alphaDeep \* (nextSurface - deep)' "$INERTIA"
-          grep -q 'temperature = outputMass\[index\]' "$INERTIA"
+          need 'val surfaceTaus = doubleArrayOf(18.0, 30.0, 48.0, 72.0)' "$INERTIA"
+          need 'val deepTaus = doubleArrayOf(144.0, 240.0, 336.0, 504.0, 720.0)' "$INERTIA"
+          need 'val deepShares = doubleArrayOf(0.55, 0.70, 0.82)' "$INERTIA"
+          need 'private fun propagateTwoMass' "$INERTIA"
+          need 'val surfaceTarget = 0.82 * forcing + 0.18 * deep' "$INERTIA"
+          need 'val nextDeep = deep + alphaDeep * (nextSurface - deep)' "$INERTIA"
+          need 'temperature = outputMass[index]' "$INERTIA"
 
-          grep -q 'val x = tout - mass' "$ENGINE"
-          grep -q 'val y = a.temperature - mass' "$ENGINE"
-          grep -q 'private fun fitProjectionFactor' "$ENGINE"
-          grep -q 'val target = mass + k \* (tout - mass)' "$ENGINE"
-          grep -q 'if (coeff.size == 1 || coeff.size >= 6) return learned' "$ENGINE"
+          need 'val x = tout - mass' "$ENGINE"
+          need 'val y = a.temperature - mass' "$ENGINE"
+          need 'private fun fitProjectionFactor' "$ENGINE"
+          need 'val target = mass + k * (tout - mass)' "$ENGINE"
+          need 'if (coeff.size == 1 || coeff.size >= 6) return learned' "$ENGINE"
 
-          # Fonctionnalités v0.19.1/v0.19.3 conservées.
-          grep -q 'Sélectionner une période' "$MAIN"
-          grep -q '? Aide' "$MAIN"
-          grep -q '! Astuce du jour' "$MAIN"
-          grep -q 'Initialisation thermique en arrière-plan' "$MAIN"
+          # Le sélecteur et ses aides restent présents ; l'égalité binaire de MainActivity
+          # avec v0.19.4 ci-dessous protège également le correctif ANR v0.19.3.
+          need 'Sélectionner une période' "$MAIN"
+          need '? Aide' "$MAIN"
+          need '! Astuce du jour' "$MAIN"
 
           git fetch origin tag v0.19.4 --force || true
           for f in \
@@ -68,16 +70,13 @@ jobs:
 
           python3 - <<'PY'
           import math
-          # Reconstructed probe around inertia zero.
           def projected(tm,tout,k): return tm+k*(tout-tm)
           assert projected(26,26,.2)==26
           assert projected(26,30,.2)>26
           assert projected(26,22,.2)<26
-          # No pointwise division: global fit survives x=0.
           xs=[0,0,2,-2,4,-4]; ys=[.1,-.1,.4,-.4,.8,-.8]
           k=sum(x*y for x,y in zip(xs,ys))/sum(x*x for x in xs)
           assert math.isfinite(k) and abs(k-.2)<1e-12
-          # Two-mass continuity and direction response.
           surface=deep=26.0
           a_s=1-math.exp(-1/30.0); a_d=1-math.exp(-1/336.0)
           ns=surface+a_s*((.82*30+.18*deep)-surface)
