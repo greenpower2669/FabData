@@ -29,10 +29,11 @@ jobs:
           if grep -q 'versionName = "0.17.1"' app/build.gradle.kts \
              && grep -q 'delay(300_000L)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
              && grep -q 'var sightTemperature' app/src/main/java/com/fabdata/app/MainActivity.kt; then
-            echo "v0.17.1 source already generated"
+            echo "v0.17.1 main source already generated"
           else
             python3 scripts/apply-v171-focus-crosshair.py
           fi
+          python3 scripts/apply-v171-crosshair-drag-fix.py
 
       - name: Regression guards
         run: |
@@ -63,6 +64,8 @@ jobs:
           grep -q 'if (!foreground || working) return false' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
           grep -q 'pendingMeasuredRefresh' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
           grep -q 'var sightTemperature' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'rememberUpdatedState(selectedTimestamp)' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'pointerInput(from, to, resetKey)' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -q 'Vrai crosshair' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -q 'Date/heure répétée en haut ET en bas' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -q 'Température du crosshair répétée à gauche ET à droite' app/src/main/java/com/fabdata/app/MainActivity.kt
@@ -79,6 +82,8 @@ jobs:
 
           main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
           assert 'sightTemperature = range.first + (range.second - range.first)' in main
+          assert 'val currentSelectedTimestamp by rememberUpdatedState(selectedTimestamp)' in main
+          assert '.pointerInput(from, to, resetKey) {' in main
           assert 'drawLine(\n                    selectColor.copy(alpha = 0.88f)' in main
           assert main.count('drawContext.canvas.nativeCanvas.drawText(timeLabel') == 2
           assert 'left + 4.dp.toPx()' in main and 'right - 4.dp.toPx()' in main
@@ -86,7 +91,7 @@ jobs:
           point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
           delete = point[point.index('fun deleteBySource'):point.index('fun reconstructedBounds')]
           assert 'require(source != PointSource.MEASURED)' in delete
-          print('Regression guards: 5-minute foreground-only refresh, immediate resume, true crosshair, measured data protected')
+          print('Regression guards: 5-minute foreground-only refresh, immediate resume, stable 2D crosshair drag, measured data protected')
           PY
 
       - name: Commit generated source
@@ -188,7 +193,7 @@ jobs:
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
               --title "FabData v0.17.1" \
-              --notes "FabData v0.17.1 — cadence live ramenée à 5 minutes et strictement limitée au premier plan. Aucun rafraîchissement météo ni calcul thermique n'est lancé quand l'application est en arrière-plan ; le retour au focus déclenche immédiatement une mise à jour, puis la cadence reprend toutes les 5 minutes. Une nouvelle vraie mesure reçue hors focus est seulement marquée pour être traitée au prochain retour. La visée du graphe devient un crosshair 2D déplaçable : verticale pour date/heure, horizontale pour température, date/heure répétée en haut et en bas, température répétée à gauche et à droite, tout en conservant les valeurs colorées de chaque sonde à leur niveau. Moteur RC, inertie, priorité MEASURED et sauvegardes inchangés."
+              --notes "FabData v0.17.1 — cadence live ramenée à 5 minutes et strictement limitée au premier plan. Aucun rafraîchissement météo ni calcul thermique n'est lancé quand l'application est en arrière-plan ; le retour au focus déclenche immédiatement une mise à jour, puis la cadence reprend toutes les 5 minutes. Une nouvelle vraie mesure reçue hors focus est seulement marquée pour être traitée au prochain retour. La visée du graphe devient un crosshair 2D déplaçable finement : verticale pour date/heure, horizontale pour température, date/heure répétée en haut et en bas, température répétée à gauche et à droite, tout en conservant les valeurs colorées de chaque sonde à leur niveau. Moteur RC, inertie, priorité MEASURED et sauvegardes inchangés."
           fi
           gh release upload "$TAG" \
             artifacts/FabData-v0.17.1-release.apk \
