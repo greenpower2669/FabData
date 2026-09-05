@@ -1,0 +1,2 @@
+549c832ea152114dec30c5021b0d8625064ec61fd5862a47f4e1f76f4ede8b52  artifacts/FabData-v0.19.3-release.apk
+4b957a2dbd154ddbded33a09b037a9b7baf0d800d277eb0d7ec721448086c21f  artifacts/FabData-v0.19.3-release.aab
