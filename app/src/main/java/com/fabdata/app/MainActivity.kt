@@ -74,6 +74,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -1642,6 +1643,7 @@ private fun InteractiveChart(
     var zoom by remember(resetKey, from, to) { mutableFloatStateOf(1f) }
     var center by remember(resetKey, from, to) { mutableFloatStateOf(0.5f) }
     var sightTemperature by remember(resetKey, from, to) { mutableStateOf<Double?>(null) }
+    val currentSelectedTimestamp by rememberUpdatedState(selectedTimestamp)
 
     val axisColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.60f)
     val gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
@@ -1675,7 +1677,7 @@ private fun InteractiveChart(
     Canvas(
         modifier = modifier
             .background(surfaceColor, RoundedCornerShape(16.dp))
-            .pointerInput(from, to, resetKey, selectedTimestamp, sightTemperature) {
+            .pointerInput(from, to, resetKey) {
                 detectTransformGestures { centroid, pan, zoomChange, _ ->
                     val window = visibleWindow()
                     val span = (window.last - window.first).coerceAtLeast(1L)
@@ -1685,7 +1687,7 @@ private fun InteractiveChart(
                     val bottomPx = size.height - 38.dp.toPx()
                     val plotHeight = (bottomPx - topPx).coerceAtLeast(1f)
                     val range = visibleTemperatureRange(window)
-                    val selectedX = selectedTimestamp
+                    val selectedX = currentSelectedTimestamp
                         ?.takeIf { it in window }
                         ?.let { leftPx + ((it - window.first).toDouble() / span.toDouble()).toFloat() * (rightPx - leftPx) }
                     val selectedY = sightTemperature?.let { temp ->
