@@ -1,0 +1,193 @@
+name: Android APK + AAB v0.19.7 ground observable
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.7-ground-observable-reconstruction'
+    paths:
+      - 'scripts/apply-v0197-ground-observable-reconstruction.py'
+      - '.github/workflows/android-build-v0197-ground-observable.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0197-ground-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.19.7 correction
+        run: python3 scripts/apply-v0197-ground-observable-reconstruction.py
+
+      - name: Physics and regression guards
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          build = Path('app/build.gradle.kts').read_text()
+          main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
+          engine = Path('app/src/main/java/com/fabdata/app/ThermalEngine.kt').read_text()
+          inertia = Path('app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt').read_text()
+          point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
+          ui = Path('app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt').read_text()
+
+          required = {
+              'version code': ('versionCode = 43', build),
+              'version name': ('versionName = "0.19.7"', build),
+              'new model marker': ('thermal-ground-observable-7', point),
+              'surface trace': ('val surfacePoints: List<SamplePoint> = emptyList()', inertia),
+              'surface only from measured hours': ('val surfacePoints = hours.mapIndexed', inertia),
+              'surface propagator': ('private fun propagateSurfaceDisplay', inertia),
+              'ground chart label': ('name = "Sol inertiel estimé"', main),
+              'chart uses surface': ('inertiaEstimate?.surfacePoints', main),
+              'observable projector': ('private fun projectObservableGround', engine),
+              'projection lag': ('timestamp - model.lagHours * THERMAL_HOUR_MS', engine),
+              'mass actual forcing history': ('outsideAverage(outside, ts, 6)', engine),
+              'mass actual forcing gaps': ('outsideAverage(outMap, previousTs, 6)', engine),
+              'same timestamp wording': ('same grandeur', ui),
+              'period selector': ('Sélectionner une période', main),
+              'help': ('? Aide', main),
+              'tip': ('! Astuce du jour', main),
+          }
+          for name, (needle, haystack) in required.items():
+              assert needle in haystack, f'missing guard {name}: {needle}'
+
+          # Main chart must never receive the hidden energy-weighted building mass.
+          assert 'inertiaEstimate?.points' not in main, 'hidden building mass leaked into main chart'
+          # The old global hide regression must be gone.
+          assert 'showTemp[THERMAL_INERTIA_SENSOR_ID] = false' not in main
+          # Old one-hour shifted gap projection must be gone.
+          assert 'val extTs = previousTs - model.lagHours * THERMAL_HOUR_MS' not in engine
+
+          # Small deterministic physics checks for the observable projection.
+          def ground(mass, outside, k):
+              return mass + k * (outside - mass)
+          assert ground(28.0, 28.0, 0.22) == 28.0
+          assert 28.0 < ground(28.0, 34.0, 0.22) < 34.0
+          assert 22.0 < ground(28.0, 22.0, 0.22) < 28.0
+          outside = [20.0, 24.0, 30.0, 26.0]
+          mass = [26.0, 26.1, 26.2, 26.3]
+          # lag=0 => t uses outside[t], no accidental t-1.
+          predicted = [ground(mass[t], outside[t], .2) for t in range(4)]
+          assert predicted[2] == ground(mass[2], 30.0, .2)
+          # lag=2 => t=3 uses outside[1] exactly.
+          assert ground(mass[3], outside[3-2], .2) == ground(26.3, 24.0, .2)
+          print('v0.19.7 observable-ground guards OK')
+          PY
+
+          git fetch origin tag v0.19.6 --force || true
+          for f in \
+            app/src/main/java/com/fabdata/app/BackupLayer.kt \
+            app/src/main/java/com/fabdata/app/DataLayer.kt \
+            app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt; do
+            git diff --quiet v0.19.6 -- "$f" || { echo "ERROR protected file changed: $f"; exit 1; }
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.19.7-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.19.7-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.19.7-signing-mode.txt
+          sha256sum artifacts/FabData-v0.19.7-release.apk artifacts/FabData-v0.19.7-release.aab > artifacts/FabData-v0.19.7-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.19.7-release
+          path: |
+            artifacts/FabData-v0.19.7-release.apk
+            artifacts/FabData-v0.19.7-release.aab
+            artifacts/FabData-v0.19.7-signing-mode.txt
+            artifacts/FabData-v0.19.7-sha256.txt
+          if-no-files-found: error
+
+      - name: Commit correction and packages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/MainActivity.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
+            app/src/main/java/com/fabdata/app/ThermalExperimentUi.kt \
+            artifacts/FabData-v0.19.7-release.apk \
+            artifacts/FabData-v0.19.7-release.aab \
+            artifacts/FabData-v0.19.7-signing-mode.txt \
+            artifacts/FabData-v0.19.7-sha256.txt
+          git commit -m "Release FabData v0.19.7 observable ground reconstruction"
+          git push
+
+      - name: Publish v0.19.7 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES='FabData v0.19.7 — correction du sens physique de la reconstruction. Sur la période réelle, le graphe réaffiche Sol inertiel estimé, c est-à-dire la couche superficielle issue du modèle bi-masse, et jamais la masse profonde du bâtiment. Cette courbe s arrête aux données MEASURED. Pour les trous et l historique, la sortie reconstruite est désormais explicitement le sol/surface observable dérivé de la masse bâtiment cachée. Le lag Δ ne s applique qu au transfert extérieur vers le sol ; la masse bâtiment continue d évoluer avec le forçage extérieur au temps réel. Le décalage horaire artificiel +1 h du moteur de comblement a été supprimé : la projection est calculée au timestamp qu elle écrit. MODEL_VERSION devient thermal-ground-observable-7 : utiliser Rationaliser les courbes une fois après installation pour remplacer les anciennes reconstructions. RAW, sélection/exclusion, aides et garde-fous précédents sont conservés.'
+          gh release create v0.19.7 \
+            --target "$(git rev-parse HEAD)" \
+            --title "FabData v0.19.7" \
+            --notes "$NOTES" \
+            artifacts/FabData-v0.19.7-release.apk \
+            artifacts/FabData-v0.19.7-release.aab \
+            artifacts/FabData-v0.19.7-signing-mode.txt \
+            artifacts/FabData-v0.19.7-sha256.txt
