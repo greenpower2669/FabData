@@ -1,9 +1,9 @@
-name: Android APK + AAB v0.17.1
+name: Android APK + AAB v0.18.0
 
 on:
   push:
     branches:
-      - 'agent/v0.17.1-focus-crosshair'
+      - 'agent/v0.18-monthly-history-debt'
     paths-ignore:
       - 'artifacts/**'
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fabdata-v0171-${{ github.ref }}
+  group: fabdata-v0180-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,74 +24,81 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.17.1 focus cadence and crosshair
+      - name: Apply v0.18 history coherence
         run: |
-          if grep -q 'versionName = "0.17.1"' app/build.gradle.kts \
-             && grep -q 'delay(300_000L)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
-             && grep -q 'var sightTemperature' app/src/main/java/com/fabdata/app/MainActivity.kt; then
-            echo "v0.17.1 main source already generated"
+          if grep -q 'versionName = "0.18.0"' app/build.gradle.kts \
+             && grep -q 'ThermalHistoryDebtStore' app/src/main/java/com/fabdata/app/ThermalUi.kt \
+             && grep -q 'Station météo officielle' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo "v0.18 source already generated"
           else
-            python3 scripts/apply-v171-focus-crosshair.py
+            python3 scripts/apply-v018-history-coherence.py
           fi
-          python3 scripts/apply-v171-crosshair-drag-fix.py
 
       - name: Regression guards
         run: |
-          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalEngine.kt; then
-            echo "ERROR: v0.17.1 must not rewrite the thermal engine"
-            git diff -- app/src/main/java/com/fabdata/app/ThermalEngine.kt
-            exit 1
-          fi
-          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt; then
-            echo "ERROR: v0.17.1 must not rewrite the inertia model"
-            git diff -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
-            exit 1
-          fi
           if ! git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt; then
-            echo "ERROR: v0.17.1 must keep backup/import format compatible"
+            echo "ERROR: backup/import format must stay compatible"
             git diff -- app/src/main/java/com/fabdata/app/BackupLayer.kt
             exit 1
           fi
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt; then
+            echo "ERROR: physical data layer must stay untouched"
+            git diff -- app/src/main/java/com/fabdata/app/DataLayer.kt
+            exit 1
+          fi
 
-          grep -q 'versionCode = 33' app/build.gradle.kts
-          grep -q 'versionName = "0.17.1"' app/build.gradle.kts
+          grep -q 'versionCode = 34' app/build.gradle.kts
+          grep -q 'versionName = "0.18.0"' app/build.gradle.kts
           grep -q 'MEASURED("measured", 3)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'RECONSTRUCTED("reconstructed", 2)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'FORECAST("forecast", 1)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'fun reconcileMeasuredDominance(db: FabDataDb)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'FabLiveUpdateCoordinator(' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'delay(300_000L)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
-          grep -q 'if (!foreground || working) return false' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
-          grep -q 'pendingMeasuredRefresh' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
-          grep -q 'var sightTemperature' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'rememberUpdatedState(selectedTimestamp)' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'pointerInput(from, to, resetKey)' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'Vrai crosshair' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'Date/heure répétée en haut ET en bas' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'Température du crosshair répétée à gauche ET à droite' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'require(source != PointSource.MEASURED)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'fun deleteBySourceRange' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'private const val MAX_HISTORY_DAYS = 1464' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'maxHistoryDays: Int? = null' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'maxHistoryDays = 366' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -q 'class ThermalHistoryDebtStore' app/src/main/java/com/fabdata/app/ThermalHistoryDebt.kt
+          grep -q 'HistoricalDebtState.PAUSED' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Text("Continuer")' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Text("Mettre en pause")' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Text("Annuler")' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Mettre à jour l.historique ancien' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'fun prepareHistoryRange' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -q 'cursor.plusDays(30L)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -q 'Station météo officielle' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'Station météo reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'weather:official' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'thermal:inertia' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'Réinitialiser' app/src/main/java/com/fabdata/app/LyonLabLayer.kt
 
           python3 - <<'PY'
           from pathlib import Path
+          point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
+          assert 'require(source != PointSource.MEASURED)' in point
+          assert 'deleteBySourceRange' in point
+
           live = Path('app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt').read_text()
-          assert 'delay(60_000L)' not in live, 'old one-minute cadence remains'
           assert 'delay(300_000L)' in live
-          assert 'if (!foreground || working) return false' in live
-          assert 'Lifecycle.Event.ON_RESUME -> foreground = true' in live
-          assert 'Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> foreground = false' in live
-          assert 'refreshExistingReconstructions' in live
+          assert 'maxHistoryDays = 366' in live
+          assert 'recordDebt' in live
+
+          thermal = Path('app/src/main/java/com/fabdata/app/ThermalUi.kt').read_text()
+          assert 'ThermalHistoryChoice("48 mois", 1464)' in thermal
+          assert 'processNextHistoryChunk' in thermal
+          assert 'beginHistoryWork' in thermal
+          assert 'fullHistoryDays > 366' in thermal
+          assert 'deleteBySourceRange' in thermal
+          assert all(x in thermal for x in ['Continuer','Mettre en pause','Annuler'])
+
+          weather = Path('app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt').read_text()
+          assert 'prepareHistoryRange' in weather
+          assert 'cursor.plusDays(30L)' in weather
 
           main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
-          assert 'sightTemperature = range.first + (range.second - range.first)' in main
-          assert 'val currentSelectedTimestamp by rememberUpdatedState(selectedTimestamp)' in main
-          assert '.pointerInput(from, to, resetKey) {' in main
-          assert 'drawLine(\n                    selectColor.copy(alpha = 0.88f)' in main
-          assert main.count('drawContext.canvas.nativeCanvas.drawText(timeLabel') == 2
-          assert 'left + 4.dp.toPx()' in main and 'right - 4.dp.toPx()' in main
+          assert 'WEATHER_OFFICIAL_SENSOR_ID' in main
+          assert 'Station météo officielle' in main
+          assert 'Station météo reconstruite' in main
+          assert 'CurvePersonalizationCard(' not in main
 
-          point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
-          delete = point[point.index('fun deleteBySource'):point.index('fun reconstructedBounds')]
-          assert 'require(source != PointSource.MEASURED)' in delete
-          print('Regression guards: 5-minute foreground-only refresh, immediate resume, stable 2D crosshair drag, measured data protected')
+          print('v0.18 guards: measured protected, 12-month auto cap, persistent historical debt, monthly oldest-to-newest prep, single curve controls')
           PY
 
       - name: Commit generated source
@@ -102,11 +109,17 @@ jobs:
           git add \
             app/build.gradle.kts \
             app/src/main/java/com/fabdata/app/MainActivity.kt \
-            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
+            app/src/main/java/com/fabdata/app/LyonLabLayer.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/ThermalUi.kt \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+            app/src/main/java/com/fabdata/app/ThermalHistoryDebt.kt
           if git diff --cached --quiet; then
-            echo "v0.17.1 source already generated"
+            echo "v0.18 source already generated"
           else
-            git commit -m "Apply FabData v0.17.1 focus refresh and crosshair"
+            git commit -m "Apply FabData v0.18 monthly history coherence"
             git push
           fi
 
@@ -156,18 +169,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.17.1-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.17.1-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.17.1-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.18.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.18.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.18.0-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.17.1-release
+          name: FabData-v0.18.0-release
           path: |
-            artifacts/FabData-v0.17.1-release.apk
-            artifacts/FabData-v0.17.1-release.aab
-            artifacts/FabData-v0.17.1-signing-mode.txt
+            artifacts/FabData-v0.18.0-release.apk
+            artifacts/FabData-v0.18.0-release.aab
+            artifacts/FabData-v0.18.0-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -175,11 +188,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.17.1-release.apk artifacts/FabData-v0.17.1-release.aab artifacts/FabData-v0.17.1-signing-mode.txt
+          git add artifacts/FabData-v0.18.0-release.apk artifacts/FabData-v0.18.0-release.aab artifacts/FabData-v0.18.0-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.17.1 APK + AAB"
+            git commit -m "Build FabData v0.18.0 APK + AAB"
             git push
           fi
 
@@ -187,16 +200,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.17.1
+          TAG: v0.18.0
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
-              --title "FabData v0.17.1" \
-              --notes "FabData v0.17.1 — cadence live ramenée à 5 minutes et strictement limitée au premier plan. Aucun rafraîchissement météo ni calcul thermique n'est lancé quand l'application est en arrière-plan ; le retour au focus déclenche immédiatement une mise à jour, puis la cadence reprend toutes les 5 minutes. Une nouvelle vraie mesure reçue hors focus est seulement marquée pour être traitée au prochain retour. La visée du graphe devient un crosshair 2D déplaçable finement : verticale pour date/heure, horizontale pour température, date/heure répétée en haut et en bas, température répétée à gauche et à droite, tout en conservant les valeurs colorées de chaque sonde à leur niveau. Moteur RC, inertie, priorité MEASURED et sauvegardes inchangés."
+              --title "FabData v0.18.0" \
+              --notes "FabData v0.18.0 — courbes météo renommées Station météo officielle / Station météo reconstruite, visibilité et personnalisation réunies dans Superposition avec réinitialisation des styles. Historiques jusqu'à 48 mois préparés par morceaux d'environ un mois, toujours du plus ancien vers le présent. Après chaque morceau : Continuer / Mettre en pause / Annuler, avec reprise persistante. Les recalculs automatiques déclenchés par de nouvelles données ou paramètres sont limités aux 12 derniers mois ; l'historique plus ancien reste enregistré comme dette visible avec bouton de mise à jour. Les mesures MEASURED, sauvegardes et imports restent protégés."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.17.1-release.apk \
-            artifacts/FabData-v0.17.1-release.aab \
-            artifacts/FabData-v0.17.1-signing-mode.txt \
+            artifacts/FabData-v0.18.0-release.apk \
+            artifacts/FabData-v0.18.0-release.aab \
+            artifacts/FabData-v0.18.0-signing-mode.txt \
             --clobber
