@@ -1,0 +1,98 @@
+name: FabData v0.19.3 lazy thermal UI ANR fix
+
+on:
+  push:
+    branches:
+      - 'agent/v0.19.3-lazy-thermal-ui-anr-fix'
+    paths:
+      - 'scripts/apply-v0193-lazy-thermal-ui-anr-fix.py'
+      - '.github/workflows/v0193-lazy-thermal-ui-anr-fix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fabdata-v0193-anr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply v0.19.3 patch
+        run: python3 scripts/apply-v0193-lazy-thermal-ui-anr-fix.py
+
+      - name: Regression guards
+        run: |
+          git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalTrainingMask.kt
+          git diff --quiet -- app/src/main/java/com/fabdata/app/MainActivity.kt
+
+          grep -q 'versionCode = 39' app/build.gradle.kts
+          grep -q 'versionName = "0.19.3"' app/build.gradle.kts
+          grep -q 'private data class ThermalUiRuntime' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'val built = withContext(Dispatchers.IO)' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'val manager = WeatherReferenceManager' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'val engine = ThermalEngine' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'val coherenceStore = ThermalCoherenceStore' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Initialisation thermique en arrière-plan' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'status = withContext(Dispatchers.IO)' app/src/main/java/com/fabdata/app/ThermalUi.kt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/fabdata/app/ThermalUi.kt').read_text()
+          # Les trois objets DB-bound doivent apparaître dans le bloc withContext(IO).
+          anchor = p.index('val built = withContext(Dispatchers.IO)')
+          end = p.index('built.fold', anchor)
+          block = p[anchor:end]
+          assert 'WeatherReferenceManager(context, db, lyonLab, credentials)' in block
+          assert 'ThermalEngine(db, manager.store())' in block
+          assert 'ThermalCoherenceStore(db)' in block
+          # Plus aucun remember direct de ces objets dans la carte.
+          assert 'remember { WeatherReferenceManager(context, db, lyonLab, credentials) }' not in p
+          assert 'remember { ThermalEngine(db, manager.store()) }' not in p
+          assert 'remember { ThermalCoherenceStore(db) }' not in p
+          print('v0.19.3 ANR guard OK: lazy card cannot synchronously initialize SQLite on UI')
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin debug
+        run: gradle --no-daemon :app:compileDebugKotlin --stacktrace
+
+      - name: Commit compiled v0.19.3 source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+greenpower2669@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/ThermalUi.kt
+          if git diff --cached --quiet; then
+            echo "v0.19.3 already applied"
+          else
+            git commit -m "Fix v0.19.3 scroll ANR in lazy thermal card"
+            git push
+          fi
