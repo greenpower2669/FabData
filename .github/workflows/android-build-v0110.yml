@@ -1,9 +1,9 @@
-name: Android APK + AAB v0.16.0
+name: Android APK + AAB v0.17.0
 
 on:
   push:
     branches:
-      - 'agent/v0.16-rationalize-curves'
+      - 'agent/v0.17-live-coherence-map'
     paths-ignore:
       - 'artifacts/**'
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: fabdata-v0160-${{ github.ref }}
+  group: fabdata-v0170-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,61 +24,67 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply v0.16.0 rationalization and monitoring-first UI
+      - name: Apply v0.17.0 live coherence, sight and station map
         run: |
-          if grep -q 'versionName = "0.16.0"' app/build.gradle.kts \
-             && test -f app/src/main/java/com/fabdata/app/ThermalCoherence.kt \
-             && grep -q 'Rationaliser les courbes' app/src/main/java/com/fabdata/app/ThermalUi.kt; then
-            echo "v0.16.0 main source already generated"
+          if grep -q 'versionName = "0.17.0"' app/build.gradle.kts \
+             && grep -q 'FabLiveUpdateCoordinator(' app/src/main/java/com/fabdata/app/MainActivity.kt \
+             && grep -q 'fun refreshRecent(reference: WeatherReference)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt; then
+            echo "v0.17.0 source already generated"
           else
-            python3 scripts/apply-v160-rationalize-curves.py
+            python3 scripts/apply-v170-live-coherence-map.py
           fi
-          python3 scripts/apply-v160-build-fixes.py
 
       - name: Regression guards
         run: |
-          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/DataLayer.kt; then
-            echo "ERROR: v0.16 must not modify measured-data storage"
-            git diff -- app/src/main/java/com/fabdata/app/DataLayer.kt
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalEngine.kt; then
+            echo "ERROR: v0.17 must not rewrite the thermal engine"
+            git diff -- app/src/main/java/com/fabdata/app/ThermalEngine.kt
+            exit 1
+          fi
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt; then
+            echo "ERROR: v0.17 must not rewrite the inertia model"
+            git diff -- app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt
             exit 1
           fi
           if ! git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt; then
-            echo "ERROR: v0.16 must keep backup/import format compatible"
+            echo "ERROR: v0.17 must keep backup/import format compatible"
             git diff -- app/src/main/java/com/fabdata/app/BackupLayer.kt
             exit 1
           fi
 
-          grep -q 'versionCode = 31' app/build.gradle.kts
-          grep -q 'versionName = "0.16.0"' app/build.gradle.kts
+          grep -q 'versionCode = 32' app/build.gradle.kts
+          grep -q 'versionName = "0.17.0"' app/build.gradle.kts
+          grep -q 'org.maplibre.gl:android-sdk:13.4.1' app/build.gradle.kts
           grep -q 'MEASURED("measured", 3)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
           grep -q 'RECONSTRUCTED("reconstructed", 2)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
           grep -q 'FORECAST("forecast", 1)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'dependency_hash TEXT' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'Une mesure réelle ne peut jamais être invalidée' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
-          grep -q 'Rationaliser les courbes' app/src/main/java/com/fabdata/app/ThermalUi.kt
-          grep -q 'Profil bâtiment modifié' app/src/main/java/com/fabdata/app/ThermalUi.kt
-          grep -q 'PreviewPreset.entries.forEach' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -q 'TimePreset.entries.forEach' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'fun reconcileMeasuredDominance(db: FabDataDb)' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -q 'fun reconcileMeasuredDominance(referenceKey: String)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -q 'fun refreshRecent(reference: WeatherReference)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -q 'SUM(CAST(ROUND(p.temperature \* 1000.0)' app/src/main/java/com/fabdata/app/DataLayer.kt
+          grep -q 'FabLiveUpdateCoordinator(' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'grabsSight' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'Choisir sur la carte' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'StationMapDialog(' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'stations_xhr.php?format=geojson' app/src/main/java/com/fabdata/app/StationDiscovery.kt
+          ! grep -q '\.take(24)' app/src/main/java/com/fabdata/app/StationDiscovery.kt
 
           python3 - <<'PY'
           from pathlib import Path
           main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
-          o = main.index('HistoryOverviewCard(')
-          t = main.index('TimeTabs(preset = preset', o)
-          c = main.index('ChartCard(', t)
-          s = main.index('SensorSourcesCard(', c)
-          assert o < t < c < s, 'monitoring-first order broken'
-
+          assert 'windowCenterTimestamp = ts' in main
+          assert 'sensor.id == LYON_RECONSTRUCTED_SENSOR_ID' in main
           point = Path('app/src/main/java/com/fabdata/app/PointSourceLayer.kt').read_text()
           delete = point[point.index('fun deleteBySource'):point.index('fun reconstructedBounds')]
           assert 'require(source != PointSource.MEASURED)' in delete
-          assert 'source=?' in delete
-
-          inertia = Path('app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt').read_text()
-          marker = '    private fun allHourly(sensorId: Long): List<SamplePoint> {'
-          assert inertia.count(marker) == 1, 'duplicate allHourly helper remains'
-          assert 'best.mapNotNull { it.confidence }.averageOr(1.0)' in inertia
-          print('Regression guards: measured untouched, period controls separate, monitoring first, inertia helper unique')
+          dominance = point[point.index('fun reconcileMeasuredDominance'):point.index('private fun invalidateForecastsAfterMeasured')]
+          assert "c.source<>'measured'" in dominance
+          weather = Path('app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt').read_text()
+          assert "it.source == PointSource.MEASURED ||" in weather
+          live = Path('app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt').read_text()
+          assert 'delay(60_000L)' in live
+          assert 'refreshExistingReconstructions' in live
+          print('Regression guards: real data protected, RC/inertia untouched, live minute loop and station map present')
           PY
 
       - name: Commit generated source
@@ -90,14 +96,15 @@ jobs:
             app/build.gradle.kts \
             app/src/main/java/com/fabdata/app/MainActivity.kt \
             app/src/main/java/com/fabdata/app/ThermalUi.kt \
-            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
-            app/src/main/java/com/fabdata/app/ThermalCoherence.kt \
-            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
-            app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+            app/src/main/java/com/fabdata/app/StationDiscovery.kt \
+            app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            app/src/main/java/com/fabdata/app/DataLayer.kt
           if git diff --cached --quiet; then
-            echo "v0.16.0 source already generated"
+            echo "v0.17.0 source already generated"
           else
-            git commit -m "Normalize FabData v0.16.0 generated source"
+            git commit -m "Apply FabData v0.17.0 live coherence and map"
             git push
           fi
 
@@ -147,18 +154,18 @@ jobs:
       - name: Stage named APK and AAB
         run: |
           mkdir -p artifacts
-          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.16.0-release.apk
-          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.16.0-release.aab
-          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.16.0-signing-mode.txt
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.17.0-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.17.0-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.17.0-signing-mode.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.16.0-release
+          name: FabData-v0.17.0-release
           path: |
-            artifacts/FabData-v0.16.0-release.apk
-            artifacts/FabData-v0.16.0-release.aab
-            artifacts/FabData-v0.16.0-signing-mode.txt
+            artifacts/FabData-v0.17.0-release.apk
+            artifacts/FabData-v0.17.0-release.aab
+            artifacts/FabData-v0.17.0-signing-mode.txt
           if-no-files-found: error
 
       - name: Publish APK and AAB on branch
@@ -166,11 +173,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+greenpower2669@users.noreply.github.com"
-          git add artifacts/FabData-v0.16.0-release.apk artifacts/FabData-v0.16.0-release.aab artifacts/FabData-v0.16.0-signing-mode.txt
+          git add artifacts/FabData-v0.17.0-release.apk artifacts/FabData-v0.17.0-release.aab artifacts/FabData-v0.17.0-signing-mode.txt
           if git diff --cached --quiet; then
             echo "Packages unchanged"
           else
-            git commit -m "Build FabData v0.16.0 APK + AAB"
+            git commit -m "Build FabData v0.17.0 APK + AAB"
             git push
           fi
 
@@ -178,16 +185,16 @@ jobs:
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v0.16.0
+          TAG: v0.17.0
         run: |
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" \
               --target "$(git rev-parse HEAD)" \
-              --title "FabData v0.16.0" \
-              --notes "FabData v0.16.0 — fiabilisation des recalculs et ergonomie monitoring-first. Les points calculés portent une empreinte légère du profil bâtiment et de leurs dépendances dans la provenance existante. Une modification du profil, des mesures ou de la référence peut invalider les résultats aval sans jamais toucher aux points MEASURED. Le bouton « Rationaliser les courbes » conserve les calculs encore cohérents, retire uniquement les couches calculées périmées/incertaines et réutilise le moteur existant pour les reconstruire. L’ouverture d’une ancienne base reste conservatrice : aucune reconstruction héritée n’est détruite automatiquement au premier affichage. L’interface place désormais Vue globale, boutons de période du détail et graphe détaillé avant les sondes/stations et outils avancés ; les deux contrôles de période restent indépendants. Import/export et format de sauvegarde restent inchangés."
+              --title "FabData v0.17.0" \
+              --notes "FabData v0.17.0 — raccords réel/calculé fiabilisés, actualisation live et visée enrichie. Une observation MEASURED domine désormais aussi les calculs voisins du même bucket horaire sans jamais supprimer une autre mesure réelle ; les anciennes bases sont lues de façon canonique. Un coordinateur toujours composé actualise la météo au focus puis toutes les 60 s et, lors d'une nouvelle vraie mesure intérieure, enchaîne météo fraîche, inertie/reconstruction existante et prévision. Le moteur RC et l'estimateur inertiel ne sont pas réécrits. La visée se recentre depuis le bandeau, se déplace par drag et affiche heure + températures colorées au niveau de chaque courbe. La découverte des stations n'est plus limitée à 24 candidates ; sans token elle utilise un catalogue public open-data élargi, avec token l'index Météo-France reste prioritaire. Une carte tactile MapLibre/OpenFreeMap permet de choisir directement une station. Import/export et sauvegardes restent compatibles."
           fi
           gh release upload "$TAG" \
-            artifacts/FabData-v0.16.0-release.apk \
-            artifacts/FabData-v0.16.0-release.aab \
-            artifacts/FabData-v0.16.0-signing-mode.txt \
+            artifacts/FabData-v0.17.0-release.apk \
+            artifacts/FabData-v0.17.0-release.aab \
+            artifacts/FabData-v0.17.0-signing-mode.txt \
             --clobber
