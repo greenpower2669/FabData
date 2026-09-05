@@ -383,6 +383,14 @@ fun ThermalReferenceCard(
     // v0.16 : le premier affichage ne détruit jamais une ancienne sauvegarde inconnue.
     // Après cette baseline, mesure/référence changée = chaîne aval rationalisée.
     LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile, forecastMode) {
+        // La station peut avoir changé automatiquement lors du resondage de secteur
+        // effectué au retour au premier plan. Synchroniser d'abord l'état Compose,
+        // puis seulement lancer les calculs pour éviter de recharger l'ancienne station.
+        val persistedKey = prefs.selectedKey()
+        if (persistedKey != selectedKey) {
+            selectedKey = persistedKey
+            return@LaunchedEffect
+        }
         if (busy) return@LaunchedEffect
         val currentMeasuredRevision = withContext(Dispatchers.IO) { db.physicalMeasuredRevision() }
         val measuredChanged = measuredRevision != null && currentMeasuredRevision != measuredRevision

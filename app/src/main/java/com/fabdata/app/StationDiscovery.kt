@@ -4,7 +4,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Looper
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -13,6 +18,7 @@ import java.net.URLEncoder
 import java.net.URL
 import java.time.LocalDate
 import java.time.ZoneId
+import kotlin.coroutines.resume
 import kotlin.math.asin
 import kotlin.math.cos
 import kotlin.math.pow
@@ -53,6 +59,8 @@ class WeatherStationDiscovery(
     private val credentials: MeteoFranceCredentialStore
 ) {
     private val zone = ZoneId.of("Europe/Paris")
+    private val heatPrefs = context.getSharedPreferences("fabdata_station_heat_cache", Context.MODE_PRIVATE)
+    private val heatCacheTtlMs = 7L * 24L * 60L * 60L * 1000L
 
     fun geocode(query: String): StationSearchAnchor {
         val clean = query.trim()
@@ -79,22 +87,63 @@ class WeatherStationDiscovery(
         return anchorFromFeature(features.getJSONObject(0))
     }
 
+    /**
+     * GPS v0.18.1 : on réutilise une position récente, sinon on demande réellement
+     * une nouvelle position ponctuelle. Une dernière position plus ancienne reste un secours.
+     */
     @SuppressLint("MissingPermission")
-    fun gpsAnchor(): StationSearchAnchor {
+    suspend fun gpsAnchor(): StationSearchAnchor {
         val fine = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val coarse = context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         if (!fine && !coarse) error("Permission de localisation refusée")
 
         val manager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        val best = manager.getProviders(true)
-            .mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
-            .maxByOrNull { it.time }
-            ?: error("Position GPS indisponible pour l'instant")
+        val providers = listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER,
+            LocationManager.PASSIVE_PROVIDER
+        ).filter { runCatching { manager.isProviderEnabled(it) }.getOrDefault(false) }
 
-        val resolved = reverse(best.latitude, best.longitude)
-        return resolved.copy(label = "GPS · ${resolved.label}")
+        val last = providers.mapNotNull { provider ->
+            runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
+        }.maxByOrNull { it.time }
+
+        val recent = last?.takeIf { System.currentTimeMillis() - it.time <= 30L * 60L * 1000L }
+        val fresh = if (recent == null) {
+            val provider = providers.firstOrNull { it != LocationManager.PASSIVE_PROVIDER }
+                ?: providers.firstOrNull()
+            if (provider == null) null
+            else withTimeoutOrNull(10_000L) { awaitSingleLocation(manager, provider) }
+        } else null
+
+        val best = recent ?: fresh ?: last ?: error("Position GPS indisponible pour l'instant")
+        val resolved = runCatching { reverse(best.latitude, best.longitude) }.getOrNull()
+        return resolved?.copy(label = "GPS · ${resolved.label}")
+            ?: StationSearchAnchor("GPS", best.latitude, best.longitude)
     }
 
+    @SuppressLint("MissingPermission")
+    private suspend fun awaitSingleLocation(manager: LocationManager, provider: String): Location? =
+        suspendCancellableCoroutine { continuation ->
+            val listener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    runCatching { manager.removeUpdates(this) }
+                    if (continuation.isActive) continuation.resume(location)
+                }
+            }
+            runCatching {
+                @Suppress("DEPRECATION")
+                manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            }.onFailure {
+                if (continuation.isActive) continuation.resume(null)
+            }
+            continuation.invokeOnCancellation { runCatching { manager.removeUpdates(listener) } }
+        }
+
+    /**
+     * L'index est relu à chaque sondage. Les statistiques climatiques, elles, sont mises
+     * en cache 7 jours afin que la réévaluation au retour dans l'app reste légère.
+     */
     fun discover(anchor: StationSearchAnchor, radiusKm: Int): StationDiscoveryResult {
         val radius = radiusKm.coerceIn(10, 150)
         val raw = fetchObservationStationIndex()
@@ -108,13 +157,27 @@ class WeatherStationDiscovery(
             .toList()
 
         if (stations.isEmpty()) {
-            error("Aucune station Météo-France trouvée dans un rayon de $radius km")
+            error("Aucune station météo trouvée dans un rayon de $radius km")
         }
 
         val endYear = LocalDate.now(zone).year - 1
         val startYear = endYear - 9
-        val heat = runCatching { fetchHeatStats(stations.map { it.reference }, startYear, endYear) }
-            .getOrDefault(emptyMap())
+        val cached = linkedMapOf<String, StationHeatStats>()
+        val missing = mutableListOf<WeatherReference>()
+        stations.forEach { candidate ->
+            val value = readCachedHeat(candidate.reference, startYear, endYear)
+            if (value != null) cached[candidate.reference.key] = value
+            else missing += candidate.reference
+        }
+
+        val fetched = if (missing.isEmpty()) emptyMap() else {
+            runCatching { fetchHeatStats(missing, startYear, endYear) }.getOrDefault(emptyMap())
+        }
+        fetched.forEach { (key, stats) ->
+            val ref = missing.firstOrNull { it.key == key }
+            if (ref != null) saveCachedHeat(ref, startYear, endYear, stats)
+        }
+        val heat = cached + fetched
 
         val enriched = stations.map { candidate ->
             candidate.copy(heat = heat[candidate.reference.key])
@@ -142,8 +205,6 @@ class WeatherStationDiscovery(
         val credential = credentials.get().trim()
         val publicFallback = "https://www.infoclimat.fr/opendata/stations_xhr.php?format=geojson"
         if (credential.isBlank()) {
-            // Sans compte Météo-France : catalogue public open-data élargi
-            // (stations nationales ouvertes + réseau StatIC).
             return httpGet(publicFallback, null)
         }
         val endpoints = listOf(
@@ -153,7 +214,6 @@ class WeatherStationDiscovery(
         endpoints.forEach { endpoint ->
             runCatching { httpGet(endpoint, credential) }.onSuccess { return it }
         }
-        // Une panne de l'index officiel ne doit plus réduire l'UI aux 7 stations bootstrap.
         return httpGet(publicFallback, null)
     }
 
@@ -232,6 +292,39 @@ class WeatherStationDiscovery(
         }.distinctBy { it.stationId }
     }
 
+    private fun cacheKey(reference: WeatherReference, startYear: Int, endYear: Int): String =
+        "${reference.key}:$startYear:$endYear"
+
+    private fun readCachedHeat(reference: WeatherReference, startYear: Int, endYear: Int): StationHeatStats? {
+        val raw = heatPrefs.getString(cacheKey(reference, startYear, endYear), null) ?: return null
+        return runCatching {
+            val json = JSONObject(raw)
+            val savedAt = json.getLong("savedAt")
+            if (System.currentTimeMillis() - savedAt > heatCacheTtlMs) return null
+            StationHeatStats(
+                p95C = json.getDouble("p95"),
+                recordC = json.getDouble("record"),
+                days = json.getInt("days"),
+                years = json.getInt("years")
+            )
+        }.getOrNull()
+    }
+
+    private fun saveCachedHeat(
+        reference: WeatherReference,
+        startYear: Int,
+        endYear: Int,
+        stats: StationHeatStats
+    ) {
+        val json = JSONObject()
+            .put("savedAt", System.currentTimeMillis())
+            .put("p95", stats.p95C)
+            .put("record", stats.recordC)
+            .put("days", stats.days)
+            .put("years", stats.years)
+        heatPrefs.edit().putString(cacheKey(reference, startYear, endYear), json.toString()).apply()
+    }
+
     private fun fetchHeatStats(
         references: List<WeatherReference>,
         startYear: Int,
@@ -301,7 +394,7 @@ class WeatherStationDiscovery(
             readTimeout = 35_000
             instanceFollowRedirects = true
             setRequestProperty("Accept", "*/*")
-            setRequestProperty("User-Agent", "FabData/0.13.0 Android")
+            setRequestProperty("User-Agent", "FabData/0.18.1 Android")
             if (!credential.isNullOrBlank()) {
                 setRequestProperty("Authorization", "Bearer $credential")
                 setRequestProperty("apikey", credential)

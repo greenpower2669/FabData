@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,6 +25,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -50,45 +52,74 @@ fun StationDiscoveryDialog(
 ) {
     val context = LocalContext.current
     val discovery = remember { WeatherStationDiscovery(context, credentials) }
+    val sectorPrefs = remember { WeatherStationSectorPrefs(context) }
+    val savedSector = remember { sectorPrefs.load() }
     val scope = rememberCoroutineScope()
 
-    var query by rememberSaveable { mutableStateOf(currentReference.city) }
-    var latitudeText by rememberSaveable { mutableStateOf("") }
-    var longitudeText by rememberSaveable { mutableStateOf("") }
-    var radiusKm by rememberSaveable { mutableIntStateOf(50) }
+    var query by rememberSaveable { mutableStateOf(savedSector?.label ?: currentReference.city) }
+    var latitudeText by rememberSaveable { mutableStateOf(savedSector?.latitude?.let { String.format(Locale.ROOT, "%.6f", it) }.orEmpty()) }
+    var longitudeText by rememberSaveable { mutableStateOf(savedSector?.longitude?.let { String.format(Locale.ROOT, "%.6f", it) }.orEmpty()) }
+    var radiusKm by rememberSaveable { mutableIntStateOf(savedSector?.radiusKm ?: 50) }
     var busy by remember { mutableStateOf(false) }
-    var info by remember { mutableStateOf("Choisis un lieu puis FabData cherchera les stations du secteur.") }
+    var info by remember {
+        mutableStateOf(
+            savedSector?.let { "Secteur mémorisé · ${it.label} · resondage automatique à l'ouverture." }
+                ?: "Choisis un lieu puis FabData cherchera toutes les stations du secteur."
+        )
+    }
     var result by remember { mutableStateOf<StationDiscoveryResult?>(null) }
     var selectedIndex by remember { mutableIntStateOf(0) }
     var mapOpen by remember { mutableStateOf(false) }
+    var openMapAfterScan by remember { mutableStateOf(false) }
 
-    fun runScan(anchorProvider: () -> StationSearchAnchor) {
+    fun runScan(anchorProvider: suspend () -> StationSearchAnchor, openMapWhenReady: Boolean = false) {
         if (busy) return
+        if (openMapWhenReady) openMapAfterScan = true
         scope.launch {
             busy = true
-            info = "Localisation · index Météo-France · classement chaleur…"
+            info = "Localisation · nouvel index des stations · classement chaleur…"
             val outcome = withContext(Dispatchers.IO) {
-                runCatching {
+                try {
                     val anchor = anchorProvider()
-                    discovery.discover(anchor, radiusKm)
+                    Result.success(discovery.discover(anchor, radiusKm))
+                } catch (error: Throwable) {
+                    Result.failure(error)
                 }
             }
             outcome.fold(
                 onSuccess = { found ->
                     result = found
-                    selectedIndex = found.autoCandidate?.let { auto ->
-                        found.candidates.indexOfFirst { it.reference.key == auto.reference.key }
-                    }?.coerceAtLeast(0) ?: 0
+                    sectorPrefs.save(found.anchor, found.radiusKm)
+                    sectorPrefs.recordScan(found.candidates.size, found.autoCandidate?.reference?.key)
+                    query = found.anchor.label
+                    latitudeText = String.format(Locale.ROOT, "%.6f", found.anchor.latitude)
+                    longitudeText = String.format(Locale.ROOT, "%.6f", found.anchor.longitude)
+                    selectedIndex = found.candidates.indexOfFirst { it.reference.key == currentReference.key }
+                        .takeIf { it >= 0 }
+                        ?: found.autoCandidate?.let { auto ->
+                            found.candidates.indexOfFirst { it.reference.key == auto.reference.key }
+                        }?.coerceAtLeast(0)
+                        ?: 0
                     val warm = found.candidates.count { it.heat != null }
                     val catalogue = if (credentials.hasCredential()) "index Météo-France" else "catalogue public élargi"
                     info = "${found.anchor.label} · ${found.candidates.size} station(s) à ≤ ${found.radiusKm} km · $warm classée(s) · $catalogue · ${found.historyLabel}"
+                    if (openMapAfterScan) {
+                        openMapAfterScan = false
+                        mapOpen = true
+                    }
                 },
                 onFailure = { error ->
+                    openMapAfterScan = false
+                    sectorPrefs.recordScan(0, null, error.message)
                     info = error.message ?: "Recherche des stations impossible"
                 }
             )
             busy = false
         }
+    }
+
+    LaunchedEffect(Unit) {
+        savedSector?.let { memory -> runScan { memory.anchor() } }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -97,7 +128,7 @@ fun StationDiscoveryDialog(
         if (grants.values.any { it }) {
             runScan { discovery.gpsAnchor() }
         } else {
-            info = "Permission GPS refusée · utilise adresse, code postal, ville ou coordonnées."
+            info = "Permission GPS refusée · utilise adresse, code postal, ville, coordonnées ou la carte."
         }
     }
 
@@ -106,11 +137,11 @@ fun StationDiscoveryDialog(
         title = { Text("Sondes proches · Auto protection") },
         text = {
             Column(
-                Modifier.heightIn(max = 570.dp).verticalScroll(rememberScrollState()),
+                Modifier.heightIn(max = 610.dp).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    "Auto protection privilégie la station du secteur historiquement la plus chaude. Le moteur RC lui-même n'est pas modifié.",
+                    "Auto protection privilégie la station du secteur historiquement la plus chaude. Le secteur et le rayon restent mémorisés ; l'index est resondé à chaque retour dans l'app.",
                     style = MaterialTheme.typography.bodySmall
                 )
 
@@ -196,6 +227,33 @@ fun StationDiscoveryDialog(
                     }
                 }
 
+                OutlinedButton(
+                    onClick = {
+                        val found = result
+                        if (found != null && found.candidates.isNotEmpty()) {
+                            mapOpen = true
+                        } else {
+                            val lat = latitudeText.trim().replace(',', '.').toDoubleOrNull()
+                            val lon = longitudeText.trim().replace(',', '.').toDoubleOrNull()
+                            when {
+                                lat != null && lon != null -> runScan({ discovery.reverse(lat, lon) }, openMapWhenReady = true)
+                                query.trim().length >= 2 -> runScan({ discovery.geocode(query) }, openMapWhenReady = true)
+                                savedSector != null -> runScan({ savedSector.anchor() }, openMapWhenReady = true)
+                                else -> runScan({
+                                    StationSearchAnchor(
+                                        "Autour de ${currentReference.label}",
+                                        currentReference.latitude,
+                                        currentReference.longitude,
+                                        currentReference.departmentId
+                                    )
+                                }, openMapWhenReady = true)
+                            }
+                        }
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("🗺 Choisir sur la carte") }
+
                 Text(info, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
                 val found = result
@@ -211,47 +269,55 @@ fun StationDiscoveryDialog(
                         }
                     }
 
-                    val current = found.candidates[selectedIndex.coerceIn(0, found.candidates.lastIndex)]
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = {
-                                selectedIndex = (selectedIndex - 1 + found.candidates.size) % found.candidates.size
-                            },
-                            enabled = !busy && found.candidates.size > 1
-                        ) { Text("◀") }
-                        Card(Modifier.weight(1f), shape = RoundedCornerShape(14.dp)) {
-                            Column(Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text("${selectedIndex + 1}/${found.candidates.size} · ${current.reference.stationName}", fontWeight = FontWeight.SemiBold)
-                                Text(candidateLine(current), style = MaterialTheme.typography.bodySmall)
-                                Text("ID ${current.reference.stationId}", style = MaterialTheme.typography.labelSmall)
-                            }
+                    Text("Tourniquet · toutes les stations locales", fontWeight = FontWeight.SemiBold)
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        found.candidates.forEachIndexed { index, candidate ->
+                            FilterChip(
+                                selected = selectedIndex == index,
+                                onClick = { selectedIndex = index },
+                                label = {
+                                    Column {
+                                        Text(candidate.reference.stationName)
+                                        Text(candidateLine(candidate), style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            )
                         }
-                        OutlinedButton(
-                            onClick = { selectedIndex = (selectedIndex + 1) % found.candidates.size },
-                            enabled = !busy && found.candidates.size > 1
-                        ) { Text("▶") }
                     }
 
-                    OutlinedButton(
-                        onClick = { mapOpen = true },
-                        enabled = !busy && found.candidates.isNotEmpty(),
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("🗺 Choisir sur la carte") }
+                    val current = found.candidates[selectedIndex.coerceIn(0, found.candidates.lastIndex)]
+                    Card(shape = RoundedCornerShape(14.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("${selectedIndex + 1}/${found.candidates.size} · ${current.reference.stationName}", fontWeight = FontWeight.SemiBold)
+                            Text(candidateLine(current), style = MaterialTheme.typography.bodySmall)
+                            Text("ID ${current.reference.stationId}", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
 
                     Button(
-                        onClick = { auto?.let { onSelect(it.reference, true) } },
+                        onClick = {
+                            val selected = auto ?: return@Button
+                            sectorPrefs.save(found.anchor, found.radiusKm)
+                            onSelect(selected.reference, true)
+                        },
                         enabled = !busy && auto != null,
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("Utiliser Auto protection") }
 
                     OutlinedButton(
-                        onClick = { onSelect(current.reference, false) },
+                        onClick = {
+                            sectorPrefs.save(found.anchor, found.radiusKm)
+                            onSelect(current.reference, false)
+                        },
                         enabled = !busy,
                         modifier = Modifier.fillMaxWidth()
                     ) { Text("Choisir cette station manuellement") }
 
                     Text(
-                        "Indice chaud = 95e percentile des maximales estivales (juin–septembre), calculé sur une réanalyse historique homogène. Le record est affiché à titre de contexte mais ne décide pas seul du classement.",
+                        "Indice chaud = 95e percentile des maximales estivales (juin–septembre), calculé sur une période homogène. Le record reste un contexte et ne décide pas seul du classement.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -271,9 +337,11 @@ fun StationDiscoveryDialog(
             initialIndex = selectedIndex,
             onDismiss = { mapOpen = false },
             onSelectIndex = { index ->
-                selectedIndex = index.coerceIn(0, mapped.candidates.lastIndex)
+                val safeIndex = index.coerceIn(0, mapped.candidates.lastIndex)
+                selectedIndex = safeIndex
+                sectorPrefs.save(mapped.anchor, mapped.radiusKm)
                 mapOpen = false
-                onSelect(mapped.candidates[selectedIndex].reference, false)
+                onSelect(mapped.candidates[safeIndex].reference, false)
             }
         )
     }
