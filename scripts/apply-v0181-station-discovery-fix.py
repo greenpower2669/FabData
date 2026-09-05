@@ -627,7 +627,7 @@ fun StationDiscoveryDialog(
     var mapOpen by remember { mutableStateOf(false) }
     var openMapAfterScan by remember { mutableStateOf(false) }
 
-    fun runScan(anchorProvider: suspend () -> StationSearchAnchor, openMapWhenReady: Boolean = false) {
+    fun runScan(openMapWhenReady: Boolean = false, anchorProvider: suspend () -> StationSearchAnchor) {
         if (busy) return
         if (openMapWhenReady) openMapAfterScan = true
         scope.launch {
@@ -791,17 +791,17 @@ fun StationDiscoveryDialog(
                             val lat = latitudeText.trim().replace(',', '.').toDoubleOrNull()
                             val lon = longitudeText.trim().replace(',', '.').toDoubleOrNull()
                             when {
-                                lat != null && lon != null -> runScan({ discovery.reverse(lat, lon) }, openMapWhenReady = true)
-                                query.trim().length >= 2 -> runScan({ discovery.geocode(query) }, openMapWhenReady = true)
-                                savedSector != null -> runScan({ savedSector.anchor() }, openMapWhenReady = true)
-                                else -> runScan({
+                                lat != null && lon != null -> runScan(openMapWhenReady = true) { discovery.reverse(lat, lon) }
+                                query.trim().length >= 2 -> runScan(openMapWhenReady = true) { discovery.geocode(query) }
+                                savedSector != null -> runScan(openMapWhenReady = true) { savedSector.anchor() }
+                                else -> runScan(openMapWhenReady = true) {
                                     StationSearchAnchor(
                                         "Autour de ${currentReference.label}",
                                         currentReference.latitude,
                                         currentReference.longitude,
                                         currentReference.departmentId
                                     )
-                                }, openMapWhenReady = true)
+                                }
                             }
                         }
                     },
