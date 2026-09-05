@@ -24,7 +24,10 @@ data class ThermalInertiaDiagnostics(
     val fitRmse: Double,
     val currentFluxCPerHour: Double,
     val tangentPenalty: Double = 0.0,
-    val regimeHours: Int = 0
+    val regimeHours: Int = 0,
+    val surfaceTauHours: Double = 48.0,
+    val deepTauHours: Double = 336.0,
+    val deepShare: Double = 0.72
 ) {
     val trendLabel: String get() = when {
         trendCPerDay > 0.06 -> "↑ charge thermique"
@@ -72,6 +75,9 @@ private data class InertiaHour(
 
 private data class InertiaCandidate(
     val tauHours: Double,
+    val surfaceTauHours: Double,
+    val deepTauHours: Double,
+    val deepShare: Double,
     val outsideWeight: Double,
     val mass: DoubleArray,
     val kOutside: Double,
@@ -85,7 +91,7 @@ private data class InertiaCandidate(
 )
 
 /**
- * Estimateur inertiel couplé v0.19.
+ * Estimateur inertiel couplé bi-masse v0.19.5.
  *
  * v0.19 ajoute une lecture tangentielle explicitement normalisée par Δt :
  * la valeur reste inertielle et continue, mais un changement de régime persistant
@@ -97,9 +103,11 @@ private data class InertiaCandidate(
  * - l'estimateur ne persiste aucune donnée et ne modifie jamais les points MEASURED ;
  * - T_mass devient une entrée obligatoire du modèle d'historique et de prévision.
  *
- * T_mass est un état latent lent. Plusieurs constantes de temps et couplages extérieurs
- * sont testés sur les seules mesures propres, puis ces paramètres peuvent être propagés
- * sur l'historique sans réentraîner le modèle sur ses propres sorties.
+ * T_mass affichée est la moyenne énergétique de deux états latents : une couche
+ * superficielle réactive (murs/mobilier/cloisons) et une masse profonde lente.
+ * Un changement extérieur modifie donc immédiatement la dérivée de la couche de surface
+ * sans faire sauter aucune température ; si le forçage persiste, il se transmet ensuite
+ * à la masse profonde. Les paramètres sont appris uniquement sur les vraies mesures.
  */
 class ThermalInertiaEstimator(
     private val db: FabDataDb,
@@ -172,7 +180,7 @@ class ThermalInertiaEstimator(
             }
             if (built.size >= 120) {
                 outputHours = built
-                outputMass = propagateDisplay(built, best.tauHours, best.outsideWeight)
+                outputMass = propagateDisplay(built, best.surfaceTauHours, best.deepTauHours, best.deepShare, best.outsideWeight)
             } else {
                 outputHours = hours
                 outputMass = best.mass
@@ -213,7 +221,10 @@ class ThermalInertiaEstimator(
             fitRmse = best.rmse,
             currentFluxCPerHour = currentFlux,
             tangentPenalty = best.tangentPenalty,
-            regimeHours = best.regimeHours
+            regimeHours = best.regimeHours,
+            surfaceTauHours = best.surfaceTauHours,
+            deepTauHours = best.deepTauHours,
+            deepShare = best.deepShare
         )
         return ThermalInertiaEstimate(points, diagnostics).also {
             cachedKey = key
@@ -335,70 +346,93 @@ class ThermalInertiaEstimator(
         manualExclusions: List<ThermalTrainingExclusion>
     ): InertiaCandidate? {
         val (clean, plateau) = masks(hours, manualExclusions)
-        val taus = doubleArrayOf(48.0, 72.0, 96.0, 120.0, 168.0, 240.0, 336.0, 480.0, 720.0)
+        // Deux réservoirs thermiques : surface (heures/jours) et profondeur (jours/semaines).
+        // La grille reste volontairement compacte pour rester légère sur téléphone.
+        val surfaceTaus = doubleArrayOf(18.0, 30.0, 48.0, 72.0)
+        val deepTaus = doubleArrayOf(144.0, 240.0, 336.0, 504.0, 720.0)
+        val deepShares = doubleArrayOf(0.55, 0.70, 0.82)
         val outsideWeights = doubleArrayOf(0.08, 0.15, 0.25, 0.35)
         var best: InertiaCandidate? = null
-        for (tau in taus) {
-            for (outsideWeight in outsideWeights) {
-                val mass = propagate(hours, tau, outsideWeight, plateau)
-                val rows = mutableListOf<DoubleArray>()
-                for (i in 2 until hours.size) {
-                    if (!clean[i]) continue
-                    val dt = (hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble()
-                    if (dt !in 0.75..2.5) continue
-                    val y = (hours[i].smoothAir - hours[i - 1].smoothAir) / dt
-                    rows += doubleArrayOf(
-                        hours[i - 1].outside - hours[i - 1].smoothAir,
-                        mass[i - 1] - hours[i - 1].smoothAir,
-                        y
-                    )
-                }
-                if (rows.size < 80) continue
-                val split = (rows.size * 0.75).toInt().coerceIn(60, rows.size - 20)
-                val coeff = fitTwo(rows.take(split)) ?: continue
-                val kOut = coeff.first
-                val kMass = coeff.second
-                if (kOut !in 0.0..0.25 || kMass !in 0.001..0.20) continue
-                val validation = rows.drop(split)
-                val rmse = sqrt(validation.map { r ->
-                    val e = kOut * r[0] + kMass * r[1] - r[2]
-                    e * e
-                }.average())
-                val plateauIndices = hours.indices.filter { plateau[it] }
-                val plateauError = plateauIndices.map { i -> abs(mass[i] - hours[i].smoothAir) }.averageOr(1.5)
 
-                // v_mass = ΔT_mass / Δt : contrairement à l'ancien jitter en simple ΔT,
-                // cette grandeur reste cohérente si des trous temporels apparaissent.
-                val massSlopes = DoubleArray(mass.size)
-                for (i in 1 until mass.size) {
-                    val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
-                        .coerceAtLeast(0.25)
-                    massSlopes[i] = (mass[i] - mass[i - 1]) / dt
-                }
-                val slopeActivity = (1 until mass.size)
-                    .filter { clean[it] }
-                    .map { abs(massSlopes[it]) }
-                    .averageOr(0.0)
-                val tangentAcceleration = (2 until mass.size)
-                    .filter { clean[it] && clean[it - 1] }
-                    .map { i ->
-                        val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
-                            .coerceAtLeast(0.25)
-                        abs(massSlopes[i] - massSlopes[i - 1]) / dt
+        for (surfaceTau in surfaceTaus) {
+            for (deepTau in deepTaus) {
+                if (deepTau < surfaceTau * 3.0) continue
+                for (deepShare in deepShares) {
+                    for (outsideWeight in outsideWeights) {
+                        val mass = propagateTwoMass(
+                            hours, surfaceTau, deepTau, deepShare, outsideWeight, plateau
+                        )
+                        val rows = mutableListOf<DoubleArray>()
+                        for (i in 2 until hours.size) {
+                            if (!clean[i]) continue
+                            val dt = (hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble()
+                            if (dt !in 0.75..2.5) continue
+                            val y = (hours[i].smoothAir - hours[i - 1].smoothAir) / dt
+                            rows += doubleArrayOf(
+                                hours[i - 1].outside - hours[i - 1].smoothAir,
+                                mass[i - 1] - hours[i - 1].smoothAir,
+                                y
+                            )
+                        }
+                        if (rows.size < 80) continue
+                        val split = (rows.size * 0.75).toInt().coerceIn(60, rows.size - 20)
+                        val coeff = fitTwo(rows.take(split)) ?: continue
+                        val kOut = coeff.first
+                        val kMass = coeff.second
+                        if (kOut !in 0.0..0.25 || kMass !in 0.001..0.20) continue
+                        val validation = rows.drop(split)
+                        val rmse = sqrt(validation.map { r ->
+                            val e = kOut * r[0] + kMass * r[1] - r[2]
+                            e * e
+                        }.average())
+                        val plateauIndices = hours.indices.filter { plateau[it] }
+                        val plateauError = plateauIndices.map { i -> abs(mass[i] - hours[i].smoothAir) }.averageOr(1.5)
+
+                        val massSlopes = DoubleArray(mass.size)
+                        for (i in 1 until mass.size) {
+                            val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
+                                .coerceAtLeast(0.25)
+                            massSlopes[i] = (mass[i] - mass[i - 1]) / dt
+                        }
+                        val slopeActivity = (1 until mass.size)
+                            .filter { clean[it] }
+                            .map { abs(massSlopes[it]) }
+                            .averageOr(0.0)
+                        val tangentAcceleration = (2 until mass.size)
+                            .filter { clean[it] && clean[it - 1] }
+                            .map { i ->
+                                val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
+                                    .coerceAtLeast(0.25)
+                                abs(massSlopes[i] - massSlopes[i - 1]) / dt
+                            }
+                            .averageOr(0.0)
+                        val tangent = tangentPenalty(hours, mass, clean, outsideWeight)
+                        val effectiveTau = (surfaceTau * (1.0 - deepShare) + deepTau * deepShare)
+
+                        val score = rmse +
+                            0.06 * plateauError +
+                            0.40 * max(0.0, slopeActivity - 0.070) +
+                            0.16 * max(0.0, tangentAcceleration - 0.030) +
+                            0.60 * tangent.first
+                        val candidate = InertiaCandidate(
+                            tauHours = effectiveTau,
+                            surfaceTauHours = surfaceTau,
+                            deepTauHours = deepTau,
+                            deepShare = deepShare,
+                            outsideWeight = outsideWeight,
+                            mass = mass,
+                            kOutside = kOut,
+                            kMass = kMass,
+                            rmse = rmse,
+                            score = score,
+                            cleanHours = clean.count { it },
+                            plateauHours = plateau.count { it },
+                            tangentPenalty = tangent.first,
+                            regimeHours = tangent.second
+                        )
+                        if (best == null || candidate.score < best!!.score) best = candidate
                     }
-                    .averageOr(0.0)
-                val tangent = tangentPenalty(hours, mass, clean, outsideWeight)
-
-                val score = rmse +
-                    0.06 * plateauError +
-                    0.45 * max(0.0, slopeActivity - 0.065) +
-                    0.18 * max(0.0, tangentAcceleration - 0.025) +
-                    0.55 * tangent.first
-                val candidate = InertiaCandidate(
-                    tau, outsideWeight, mass, kOut, kMass, rmse, score,
-                    clean.count { it }, plateau.count { it }, tangent.first, tangent.second
-                )
-                if (best == null || candidate.score < best!!.score) best = candidate
+                }
             }
         }
         return best
@@ -409,12 +443,18 @@ class ThermalInertiaEstimator(
         manualExclusions: List<ThermalTrainingExclusion>
     ): InertiaCandidate {
         val (clean, plateau) = masks(hours, manualExclusions)
-        val tau = 168.0
-        val mass = propagate(hours, tau, 0.15, plateau)
-        val tangent = tangentPenalty(hours, mass, clean, 0.15)
+        val surfaceTau = 48.0
+        val deepTau = 336.0
+        val deepShare = 0.72
+        val outsideWeight = 0.15
+        val mass = propagateTwoMass(hours, surfaceTau, deepTau, deepShare, outsideWeight, plateau)
+        val tangent = tangentPenalty(hours, mass, clean, outsideWeight)
         return InertiaCandidate(
-            tauHours = tau,
-            outsideWeight = 0.15,
+            tauHours = surfaceTau * (1.0 - deepShare) + deepTau * deepShare,
+            surfaceTauHours = surfaceTau,
+            deepTauHours = deepTau,
+            deepShare = deepShare,
+            outsideWeight = outsideWeight,
             mass = mass,
             kOutside = 0.02,
             kMass = 0.012,
@@ -427,55 +467,70 @@ class ThermalInertiaEstimator(
         )
     }
 
-    private fun propagate(
+    /**
+     * RC bi-masse stable : la couche superficielle reçoit immédiatement le forçage
+     * air + extérieur et échange avec la masse profonde. La masse profonde ne voit
+     * que la couche de surface. Aucune valeur ne saute ; seule la dérivée change dès
+     * que le gradient thermique change.
+     */
+    private fun propagateTwoMass(
         hours: List<InertiaHour>,
-        tauHours: Double,
+        surfaceTauHours: Double,
+        deepTauHours: Double,
+        deepShare: Double,
         outsideWeight: Double,
-        plateau: BooleanArray
+        plateau: BooleanArray? = null
     ): DoubleArray {
         val mass = DoubleArray(hours.size)
-        mass[0] = hours[0].smoothAir * 0.78 + hours[0].outside * 0.22
+        if (hours.isEmpty()) return mass
+        val share = deepShare.coerceIn(0.45, 0.90)
+        val w = outsideWeight.coerceIn(0.02, 0.45)
+        var surface = forcingValue(hours[0], w)
+        var deep = hours[0].smoothAir * 0.88 + hours[0].outside * 0.12
+        mass[0] = (1.0 - share) * surface + share * deep
+
         for (i in 1 until hours.size) {
             val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
                 .coerceIn(0.5, 24.0)
-            val target = hours[i - 1].smoothAir * (1.0 - outsideWeight) + hours[i - 1].outside * outsideWeight
-            // La valeur ne saute jamais. Seule la vitesse de convergence augmente légèrement
-            // lorsqu'un même changement de direction persiste sur plusieurs échelles de temps.
-            val regime = regimeConfidence(hours, i - 1, outsideWeight)
-            val effectiveTau = tauHours / (1.0 + 1.10 * regime)
-            val alpha = 1.0 - exp(-dt / effectiveTau)
-            var next = mass[i - 1] + alpha * (target - mass[i - 1])
-            if (plateau[i]) {
-                // Tangente/plateau = observation indirecte faible, jamais une contrainte dure.
-                val observationGain = min(0.10, 0.025 * dt)
-                next += observationGain * (hours[i].smoothAir - next)
+            val forcing = forcingValue(hours[i - 1], w)
+
+            // La surface est surtout tirée par le flux courant, mais garde un lien avec
+            // le noyau profond. Ce couplage évite qu'elle ne devienne une simple copie filtrée.
+            val surfaceTarget = 0.82 * forcing + 0.18 * deep
+            val alphaSurface = 1.0 - exp(-dt / surfaceTauHours.coerceAtLeast(6.0))
+            var nextSurface = surface + alphaSurface * (surfaceTarget - surface)
+
+            if (plateau?.getOrNull(i) == true) {
+                // Une vraie phase intérieure calme donne une faible observation de la surface,
+                // jamais de la masse profonde.
+                val observationGain = min(0.06, 0.015 * dt)
+                nextSurface += observationGain * (hours[i].smoothAir - nextSurface)
             }
-            mass[i] = next.coerceIn(-5.0, 50.0)
+
+            val alphaDeep = 1.0 - exp(-dt / deepTauHours.coerceAtLeast(surfaceTauHours * 2.5))
+            val nextDeep = deep + alphaDeep * (nextSurface - deep)
+
+            surface = nextSurface.coerceIn(-5.0, 50.0)
+            deep = nextDeep.coerceIn(-5.0, 50.0)
+            mass[i] = ((1.0 - share) * surface + share * deep).coerceIn(-5.0, 50.0)
         }
         return mass
     }
-
 
     private fun propagateDisplay(
         hours: List<InertiaHour>,
-        tauHours: Double,
+        surfaceTauHours: Double,
+        deepTauHours: Double,
+        deepShare: Double,
         outsideWeight: Double
-    ): DoubleArray {
-        val mass = DoubleArray(hours.size)
-        mass[0] = hours[0].smoothAir * 0.78 + hours[0].outside * 0.22
-        for (i in 1 until hours.size) {
-            val dt = ((hours[i].timestamp - hours[i - 1].timestamp).toDouble() / INERTIA_HOUR_MS.toDouble())
-                .coerceIn(0.5, 24.0)
-            val target = hours[i - 1].smoothAir * (1.0 - outsideWeight) +
-                hours[i - 1].outside * outsideWeight
-            val regime = regimeConfidence(hours, i - 1, outsideWeight)
-            val effectiveTau = tauHours.coerceAtLeast(24.0) / (1.0 + 1.10 * regime)
-            val alpha = 1.0 - exp(-dt / effectiveTau)
-            mass[i] = (mass[i - 1] + alpha * (target - mass[i - 1])).coerceIn(-5.0, 50.0)
-        }
-        return mass
-    }
-
+    ): DoubleArray = propagateTwoMass(
+        hours = hours,
+        surfaceTauHours = surfaceTauHours,
+        deepTauHours = deepTauHours,
+        deepShare = deepShare,
+        outsideWeight = outsideWeight,
+        plateau = null
+    )
 
     /**
      * v0.19.4 : le changement de régime est lu dans le FORÇAGE thermique, pas seulement

@@ -145,13 +145,16 @@ private data class ForecastAnalogStats(
 )
 
 /**
- * Modèle thermique grey-box RC discret :
- * ΔTin = a(Tout_lag-Tin) + b(Tout_moy6h-Tin) + c.sin(h) + d.cos(h) + e
+ * Modèle de sonde reconstruite v0.19.5, exprimé autour de l'inertie thermique :
  *
- * Les termes a/b représentent échange + accumulation thermique. Les termes jour/nuit
- * ne forcent aucune sinusoïde sur la courbe : ils corrigent seulement le résidu horaire
- * appris sur les vraies mesures. Les reconstructions/prévisions passent toujours par
- * PointSourceStore et sa priorité stricte.
+ *     x(t) = Tout(t-Δ) - Tm(t)
+ *     y(t) = Tin(t) - Tm(t)
+ *     y(t) ≈ k · x(t)
+ *
+ * donc Tin_recon(t) = Tm(t) + k [Tout(t-Δ) - Tm(t)].
+ * Le changement de signe est naturel puisque Tm est le zéro du repère. Le facteur k
+ * est ajusté globalement par moindres carrés robustes, jamais par un ratio point-à-point,
+ * donc aucun problème lorsque x≈0. Les RAW restent prioritaires et inchangées.
  */
 class ThermalEngine(
     private val db: FabDataDb,
@@ -197,7 +200,7 @@ class ThermalEngine(
         } else if (candidates.none { it.model?.acceptableForHistory == true }) {
             "Les données sont assez longues, mais la validation rétrospective n'est pas encore assez bonne pour autoriser une reconstruction fiable."
         } else {
-            "Modèle thermique RC validé. FabData utilise toutes les données réelles propres disponibles au-delà du minimum de 16 jours."
+            "Projection inertielle validée. FabData apprend l’atténuation et le retard uniquement sur les données réelles propres."
         }
         return ThermalStatus(reference, candidates, preferred, message)
     }
@@ -233,18 +236,11 @@ class ThermalEngine(
             val split = (rows.size * 0.80).toInt().coerceIn(80, rows.size - 24)
             val train = rows.take(split)
             val valid = rows.drop(split)
-            val coeff = ridgeRegression(train)?.clone() ?: continue
-            // Les deux gradients extérieurs représentent des conductances : ils ne peuvent
-            // pas devenir des moteurs de signe arbitraire à cause de la colinéarité du fit.
-            coeff[0] = coeff[0].coerceIn(0.0, 0.35)
-            coeff[1] = coeff[1].coerceIn(0.0, 0.35)
+            val k = fitProjectionFactor(train) ?: continue
+            if (k !in 0.01..0.85) continue
+            val coeff = doubleArrayOf(k)
             val metrics = validate(coeff, valid)
             val driftRmse = validateLongHorizon(coeff, valid, profile, inertia.diagnostics)
-            val exchange = coeff[0] + coeff[1]
-            val massCoupling = coeff.getOrNull(2) ?: Double.NaN
-            if (!exchange.isFinite() || exchange <= 0.002 || exchange >= 0.65) continue
-            if (!massCoupling.isFinite() || massCoupling !in 0.001..0.25) continue
-            val tau = (1.0 / exchange).coerceIn(1.0, 500.0)
             val dataFactor = min(1.0, realDays / 35.0) * min(1.0, rows.size / 500.0)
             val errorFactor = (1.0 - metrics.rmse / 2.8).coerceIn(0.0, 1.0)
             val biasFactor = (1.0 - abs(metrics.bias) / 1.3).coerceIn(0.0, 1.0)
@@ -253,7 +249,7 @@ class ThermalEngine(
             val model = ThermalModel(
                 sensor.id, sensor.name, sensor.room, reference.key, reference.stationId, reference.city,
                 lag, coeff, train.first().timestamp, train.last().timestamp, rows.size, realDays,
-                metrics, driftRmse, confidence, tau
+                metrics, driftRmse, confidence, inertia.diagnostics.tauHours
             )
             val better = if (best == null) {
                 true
@@ -261,12 +257,11 @@ class ThermalEngine(
                 (model.metrics.rmse + 0.35 * model.longHorizonRmse) <
                     (best!!.metrics.rmse + 0.35 * best!!.longHorizonRmse)
             } else {
-                // Historique : comportement v0.11, meilleur RMSE court terme.
                 model.metrics.rmse < best!!.metrics.rmse
             }
             if (better) best = model
         }
-        return best ?: error("Aucun modèle RC stable n'a passé la calibration")
+        return best ?: error("Aucun facteur de projection inertielle stable n'a passé la calibration")
     }
 
     /**
@@ -929,9 +924,15 @@ class ThermalEngine(
         outsideAvg: Double
     ): Double {
         val w = diagnostics.outsideWeight.coerceIn(0.02, 0.45)
-        val tau = diagnostics.tauHours.coerceIn(24.0, 1440.0)
         val target = indoor * (1.0 - w) + outsideAvg * w
-        return mass + (target - mass) / tau
+        // Pendant une reconstruction, on ne transporte qu'une température de masse.
+        // On utilise donc l'équivalent énergétique des deux pôles appris ; l'affichage
+        // inertiel complet est recalculé ensuite par ThermalInertiaEstimator.
+        val share = diagnostics.deepShare.coerceIn(0.45, 0.90)
+        val alphaSurface = 1.0 - exp(-1.0 / diagnostics.surfaceTauHours.coerceAtLeast(6.0))
+        val alphaDeep = 1.0 - exp(-1.0 / diagnostics.deepTauHours.coerceAtLeast(24.0))
+        val alpha = ((1.0 - share) * alphaSurface + share * alphaDeep).coerceIn(0.0001, 0.25)
+        return mass + alpha * (target - mass)
     }
 
     private fun massAwareDelta(
@@ -944,7 +945,7 @@ class ThermalEngine(
         profile: ThermalBuildingProfile
     ): Double {
         val learned = predictDelta(coeff, indoor, mass, outside, outsideAvg6, hour)
-        if (coeff.size >= 6) return learned
+        if (coeff.size == 1 || coeff.size >= 6) return learned
         val slowMemory = profile.massCoupling() * (mass - indoor)
         return learned + slowMemory
     }
@@ -965,6 +966,7 @@ class ThermalEngine(
     }
 
     private fun equilibriumTemperature(coeff: DoubleArray, tout: Double, avg6: Double, hour: Int): Double? {
+        if (coeff.size == 1) return tout.takeIf { it.isFinite() }
         val kNow = coeff.getOrNull(0)?.coerceAtLeast(0.0) ?: return null
         val kSlow = coeff.getOrNull(1)?.coerceAtLeast(0.0) ?: return null
         val exchange = kNow + kSlow
@@ -1031,28 +1033,70 @@ class ThermalEngine(
             val dt = b.timestamp - a.timestamp
             if (dt !in (45L * 60L * 1000L)..(90L * 60L * 1000L)) return@forEach
             val dTin = b.temperature - a.temperature
-            // Clim, fenêtre, douche/chauffage et excursions intérieures rapides.
+            // On garde les mêmes garde-fous d'événements atypiques qu'avant.
             if (abs(dTin) > 1.35) return@forEach
             if (abs(b.humidity - a.humidity) > 18.0) return@forEach
             val buildingDelta = medianDeltas[hourBucket(a.timestamp)]
             if (buildingDelta != null && abs(dTin - buildingDelta) > 1.25) return@forEach
 
-            val extTs = hourBucket(a.timestamp) - lagHours * THERMAL_HOUR_MS
+            val ts = hourBucket(a.timestamp)
+            val extTs = ts - lagHours * THERMAL_HOUR_MS
             val tout = outsideAt(outside, extTs) ?: return@forEach
-            val avg6 = outsideAverage(outside, extTs, 6) ?: return@forEach
-            val mass = inertia[hourBucket(a.timestamp)]?.temperature ?: return@forEach
+            val avg6 = outsideAverage(outside, extTs, 6) ?: tout
+            val mass = inertia[ts]?.temperature ?: return@forEach
             val hour = Instant.ofEpochMilli(a.timestamp).atZone(zone).hour
-            val features = doubleArrayOf(
-                tout - a.temperature,
-                avg6 - a.temperature,
-                mass - a.temperature,
-                sin(2.0 * PI * hour / 24.0),
-                cos(2.0 * PI * hour / 24.0),
-                1.0
+
+            // Repère centré sur l'inertie : x = Tout-Tm, y = Tin-Tm.
+            val x = tout - mass
+            val y = a.temperature - mass
+            rows += TrainingRow(
+                timestamp = a.timestamp,
+                tin = a.temperature,
+                nextTin = a.temperature,
+                tout = tout,
+                toutAvg6 = avg6,
+                mass = mass,
+                hourOfDay = hour,
+                features = doubleArrayOf(x),
+                delta = y
             )
-            rows += TrainingRow(a.timestamp, a.temperature, b.temperature, tout, avg6, mass, hour, features, dTin)
         }
         return rows
+    }
+
+    /**
+     * Ajustement à l'origine y≈k·x. On n'utilise jamais k=y/x point par point :
+     * le passage x=0 ne crée donc aucune singularité. Une seconde passe robuste retire
+     * seulement les gros résidus encore présents après les garde-fous physiques.
+     */
+    private fun fitProjectionFactor(rows: List<TrainingRow>): Double? {
+        fun fit(source: List<TrainingRow>): Double? {
+            var xx = 0.0
+            var xy = 0.0
+            source.forEach { row ->
+                val x = row.features.firstOrNull() ?: return@forEach
+                val y = row.delta
+                if (!x.isFinite() || !y.isFinite()) return@forEach
+                xx += x * x
+                xy += x * y
+            }
+            if (xx < 4.0) return null
+            return (xy / xx).takeIf { it.isFinite() }
+        }
+
+        val first = fit(rows) ?: return null
+        val residuals = rows.mapNotNull { row ->
+            val x = row.features.firstOrNull() ?: return@mapNotNull null
+            val r = abs(row.delta - first * x)
+            r.takeIf { it.isFinite() }
+        }.sorted()
+        val medianResidual = residuals.getOrNull(residuals.size / 2) ?: 0.20
+        val limit = max(0.20, 3.0 * medianResidual)
+        val robust = rows.filter { row ->
+            val x = row.features.firstOrNull() ?: return@filter false
+            abs(row.delta - first * x) <= limit
+        }
+        return (fit(robust.ifEmpty { rows }) ?: first).coerceIn(0.0, 0.85)
     }
 
     private fun ridgeRegression(rows: List<TrainingRow>): DoubleArray? {
@@ -1102,6 +1146,11 @@ class ThermalEngine(
         toutAvg6: Double,
         hour: Int
     ): Double {
+        if (coeff.size == 1) {
+            val k = coeff[0].coerceIn(0.0, 0.85)
+            val target = mass + k * (tout - mass)
+            return target - tin
+        }
         if (coeff.size >= 6) {
             // Cœur physique : l'air calculé est tendu par les gradients extérieur/air
             // et masse/air. L'heure ne peut plus devenir un moteur indépendant.

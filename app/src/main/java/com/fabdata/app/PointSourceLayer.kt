@@ -52,7 +52,7 @@ data class PriorityPointWrite(
 )
 
 object PointSourceStore {
-    const val MODEL_VERSION = "thermal-rc-inertia-5"
+    const val MODEL_VERSION = "thermal-zero-bimass-6"
 
     // v0.12.2 : une migration additive n'a besoin d'être vérifiée qu'une seule fois
     // par handle SQLite. WeakHashMap évite de retenir une base fermée en mémoire.
