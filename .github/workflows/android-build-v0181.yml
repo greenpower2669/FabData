@@ -34,6 +34,7 @@ jobs:
           else
             python3 scripts/apply-v0181-station-discovery-fix.py
           fi
+          python3 scripts/fix-v0181-runscan.py
 
       - name: Regression guards
         run: |
@@ -74,6 +75,7 @@ jobs:
           grep -q 'horizontalScroll' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
           grep -q '🗺 Choisir sur la carte' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
           grep -q 'openMapWhenReady' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
+          grep -q 'runScan(anchorProvider = {' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
           grep -q 'sectorPrefs.save' app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt
           grep -q 'reevaluateAuto: Boolean = false' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
           grep -q 'reevaluateAuto = true' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
@@ -98,6 +100,9 @@ jobs:
           assert '🗺 Choisir sur la carte' in ui
           assert 'found.candidates.forEachIndexed' in ui
           assert 'savedSector?.let' in ui
+          assert 'runScan(anchorProvider = {' in ui
+          assert 'runScan {' not in ui
+          assert 'runScan(openMapWhenReady = true) {' not in ui
 
           discovery = Path('app/src/main/java/com/fabdata/app/StationDiscovery.kt').read_text()
           assert 'suspend fun gpsAnchor' in discovery
@@ -123,7 +128,8 @@ jobs:
             app/src/main/java/com/fabdata/app/StationDiscovery.kt \
             app/src/main/java/com/fabdata/app/StationDiscoveryUi.kt \
             app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
-            app/src/main/java/com/fabdata/app/ThermalUi.kt
+            app/src/main/java/com/fabdata/app/ThermalUi.kt \
+            scripts/apply-v0181-station-discovery-fix.py
           if git diff --cached --quiet; then
             echo "v0.18.1 source already generated"
           else
