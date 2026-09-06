@@ -52,7 +52,8 @@ class ThermalCoherenceStore(private val db: FabDataDb) {
         profile: ThermalBuildingProfile,
         sensorId: Long,
         source: PointSource,
-        forecastMode: ForecastHorizonMode? = null
+        forecastMode: ForecastHorizonMode? = null,
+        trainedModel: ThermalModel? = null
     ): ThermalDependencyFingerprint {
         require(source != PointSource.MEASURED) { "Une mesure réelle n'a pas d'empreinte calculée" }
         val pHash = profileHash(profile)
@@ -60,7 +61,7 @@ class ThermalCoherenceStore(private val db: FabDataDb) {
         val weather = weatherHash(reference.key, includeForecast = source == PointSource.FORECAST)
         val mode = if (source == PointSource.FORECAST) (forecastMode ?: ForecastHorizonMode.AUTO).name else "history"
         val dependency = hashStrings(
-            "thermal-dependency-v1",
+            "thermal-dependency-v2",
             source.dbValue,
             PointSourceStore.MODEL_VERSION,
             reference.key,
@@ -68,7 +69,8 @@ class ThermalCoherenceStore(private val db: FabDataDb) {
             pHash,
             measured,
             weather,
-            mode
+            mode,
+            trainedModel?.stableSignature() ?: "no-trained-model"
         )
         return ThermalDependencyFingerprint(pHash, dependency)
     }
@@ -78,10 +80,11 @@ class ThermalCoherenceStore(private val db: FabDataDb) {
         profile: ThermalBuildingProfile,
         sensorId: Long,
         source: PointSource,
-        forecastMode: ForecastHorizonMode? = null
+        forecastMode: ForecastHorizonMode? = null,
+        trainedModel: ThermalModel? = null
     ): ThermalCurveCoherence? {
         require(source != PointSource.MEASURED)
-        val expected = dependencyFingerprint(reference, profile, sensorId, source, forecastMode)
+        val expected = dependencyFingerprint(reference, profile, sensorId, source, forecastMode, trainedModel)
         return db.readableDatabase.rawQuery(
             """
             SELECT COUNT(*), MIN(timestamp), MAX(timestamp),

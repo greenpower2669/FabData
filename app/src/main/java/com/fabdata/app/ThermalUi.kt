@@ -1,5 +1,10 @@
 package com.fabdata.app
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -30,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -92,6 +98,7 @@ fun ThermalReferenceCard(
     val prefs = remember { WeatherReferencePrefs(context) }
     val profileStore = remember { ThermalProfileStore(context) }
     val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
+    val trainedModelStore = remember { ThermalTrainedModelStore(context) }
     val modelSensorPrefs = remember {
         context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
     }
@@ -147,6 +154,7 @@ fun ThermalReferenceCard(
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
     val reference = remember(selectedKey) { prefs.selectedReference() }
+    var trainedModel by remember { mutableStateOf<ThermalModel?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var stationDiscoveryOpen by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
@@ -171,6 +179,11 @@ fun ThermalReferenceCard(
     var debtSnapshot by remember { mutableStateOf(historyDebtStore.loadDebt()) }
     var continuationWork by remember { mutableStateOf<ThermalHistoryWork?>(null) }
 
+    LaunchedEffect(selectedKey, selectedSensorId, dataVersion) {
+        trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+        status = engine.statusFromTrainedModel(reference, selectedSensorId, trainedModel)
+    }
+
     fun refreshDebtState() { debtSnapshot = historyDebtStore.loadDebt() }
 
     suspend fun processNextHistoryChunk() {
@@ -187,9 +200,8 @@ fun ThermalReferenceCard(
                 }
                 val advanced = historyDebtStore.advanceWork() ?: error("Session historique perdue")
                 if (advanced.nextChunk >= advanced.totalChunks) {
-                    val checked = engine.status(reference, advanced.sensorId, profile)
-                    if (!checked.canReconstruct) error(checked.message)
-                    val activeModel = checked.preferred?.model?.takeIf { it.sensorId == advanced.sensorId }
+                    val activeModel = trainedModelStore.loadUsable(reference.key, advanced.sensorId)
+                        ?: error("Modèle vide ou à réentraîner")
                     val summary = engine.reconstructHistory(
                         reference = reference,
                         requestedDays = advanced.requestedDays,
@@ -242,9 +254,9 @@ fun ThermalReferenceCard(
     }
 
     suspend fun beginHistoryWork(days: Int, reason: String) {
-        val checked = withContext(Dispatchers.IO) { engine.status(reference, selectedSensorId, profile) }
-        if (!checked.canReconstruct) { info = checked.message; return }
-        val activeId = selectedSensorId ?: checked.preferred?.sensor?.id ?: run { info = "Aucune sonde modèle"; return }
+        val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+            ?: run { info = "Modèle vide ou à réentraîner"; return }
+        val activeId = activeModel.sensorId
         val firstReal = withContext(Dispatchers.IO) { coherenceStore.firstMeasuredTimestamp(activeId) }
             ?: run { info = "Aucune vraie mesure pour initialiser l'historique"; return }
         val boundedDays = days.coerceIn(1, 1464)
@@ -272,15 +284,16 @@ fun ThermalReferenceCard(
                 val to = maxOf(bounds.last, System.currentTimeMillis() + (forecastMode.maxHours + 2L) * 60L * 60L * 1000L)
                 val sync = if (allHistory) manager.refreshSelected(reference, from, to)
                     else manager.ensureLocalCache(reference, from, to)
-                val thermalStatus = engine.status(reference, selectedSensorId, profile)
+                val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                val thermalStatus = engine.statusFromTrainedModel(reference, selectedSensorId, activeModel)
                 val activeSensor = selectedSensorId ?: thermalStatus.preferred?.sensor?.id
-                if (rebuildHistoryFromNewMeasured && thermalStatus.sensors.any { it.model?.acceptableForHistory == true }) {
-                    // v0.12.1 : recalcul du passé uniquement après une vraie variation
-                    // du jeu de mesures MEASURED, jamais sur un simple changement d'UI.
-                    engine.refreshExistingReconstructions(reference, profile, activeSensor)
-                }
-                val forecast = if (thermalStatus.sensors.any { it.model?.acceptableForForecast == true }) {
-                    engine.refreshForecasts(reference, activeSensor, profile, forecastMode)
+
+                // v0.19.8: refresh never recalculates the past and never retrains.
+                val forecast = if (activeModel?.acceptableForForecast == true) {
+                    engine.refreshForecasts(
+                        reference, activeModel.sensorId, profile, forecastMode,
+                        precalibratedModel = activeModel
+                    )
                 } else ThermalWriteSummary(0, 0, 0)
                 Triple(sync, thermalStatus, forecast)
             }
@@ -312,6 +325,41 @@ fun ThermalReferenceCard(
         busy = false
     }
 
+    suspend fun trainPersistedModel() {
+        if (busy) return
+        busy = true
+        info = "Entraînement du modèle · préparation des mesures réelles…"
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val bounds = db.physicalMeasuredBounds() ?: error("Aucune mesure réelle")
+                manager.ensureLocalCache(
+                    reference,
+                    bounds.first - 18L * 60L * 60L * 1000L,
+                    bounds.last
+                )
+                val model = engine.trainModel(reference, selectedSensorId, profile)
+                trainedModelStore.save(model)
+                model
+            }
+        }
+        result.fold(
+            onSuccess = { model ->
+                trainedModel = model
+                selectedSensorId = model.sensorId
+                modelSensorPrefs.edit().putLong("selected_sensor_id", model.sensorId).apply()
+                status = engine.statusFromTrainedModel(reference, model.sensorId, model)
+                val k = model.coefficients.firstOrNull() ?: 0.0
+                info = "Modèle entraîné une fois · k ${fmt(k)} · Δ ${model.lagHours} h · futur prêt"
+                suppressNextAuto = true
+                onDataChanged()
+            },
+            onFailure = { error ->
+                info = error.message ?: "Entraînement impossible"
+            }
+        )
+        busy = false
+    }
+
     suspend fun rationalizeCurves(
         reason: String,
         targetProfile: ThermalBuildingProfile = profile,
@@ -330,6 +378,8 @@ fun ThermalReferenceCard(
         }
         val result = withContext(Dispatchers.IO) {
             runCatching {
+                val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                    ?: error("Modèle vide ou à réentraîner")
                 val measuredBounds = db.physicalMeasuredBounds() ?: db.physicalSensorBounds()
                     ?: error("Aucune donnée intérieure")
                 val hourMs = 60L * 60L * 1000L
@@ -346,11 +396,11 @@ fun ThermalReferenceCard(
                     )
                 }
 
-                fun reconStates() = coherenceStore.calculatedSensorIds().mapNotNull { id ->
-                    coherenceStore.inspect(reference, targetProfile, id, PointSource.RECONSTRUCTED)
+                fun reconStates() = coherenceStore.calculatedSensorIds().filter { it == activeModel.sensorId }.mapNotNull { id ->
+                    coherenceStore.inspect(reference, targetProfile, id, PointSource.RECONSTRUCTED, trainedModel = activeModel)
                 }
-                fun forecastStates() = coherenceStore.calculatedSensorIds().mapNotNull { id ->
-                    coherenceStore.inspect(reference, targetProfile, id, PointSource.FORECAST, forecastMode)
+                fun forecastStates() = coherenceStore.calculatedSensorIds().filter { it == activeModel.sensorId }.mapNotNull { id ->
+                    coherenceStore.inspect(reference, targetProfile, id, PointSource.FORECAST, forecastMode, activeModel)
                 }
 
                 var staleRecon = reconStates().filterNot { it.current }
@@ -405,7 +455,8 @@ fun ThermalReferenceCard(
                         db, state.sensorId, PointSource.RECONSTRUCTED, recentStart, previousBounds.last
                     )
                     val rebuilt = engine.rebuildCalculatedExtent(
-                        reference, targetProfile, state.sensorId, recentStart..previousBounds.last, progressCallback
+                        reference, targetProfile, state.sensorId, recentStart..previousBounds.last, progressCallback,
+                        precalibratedModel = activeModel
                     )
                     reconstructed += rebuilt.reconstructed
                     skipped += rebuilt.skippedSensors
@@ -415,7 +466,7 @@ fun ThermalReferenceCard(
                 // le hash du forecast ne dépend pas des points reconstruits. On peut traiter ensuite.
                 staleForecast.forEach { state ->
                     removed += PointSourceStore.deleteBySource(db, state.sensorId, PointSource.FORECAST)
-                    val rebuilt = engine.refreshForecasts(reference, state.sensorId, targetProfile, forecastMode)
+                    val rebuilt = engine.refreshForecasts(reference, state.sensorId, targetProfile, forecastMode, precalibratedModel = activeModel)
                     forecasts += rebuilt.forecast
                     skipped += rebuilt.skippedSensors
                 }
@@ -468,11 +519,16 @@ fun ThermalReferenceCard(
             suppressNextAuto = false
         } else {
             when {
-                referenceChanged -> rationalizeCurves("Référence météo modifiée", profile, manual = false)
+                referenceChanged -> {
+                    trainedModelStore.markDirty("Référence météo modifiée")
+                    trainedModel = null
+                    status = engine.statusFromTrainedModel(reference, selectedSensorId, null)
+                    info = "Référence météo modifiée · modèle à réentraîner · aucun calcul du passé lancé"
+                }
                 measuredChanged -> {
                     // Le coordinateur global, toujours composé, traite la chaîne lourde.
                     // Cette carte ne lance pas un second recalcul concurrent.
-                    info = "Nouvelle mesure réelle détectée · synchronisation globale en cours…"
+                    info = "Nouvelle mesure réelle détectée · futur actualisé sans réentraîner le modèle"
                 }
                 dataChanged -> {
                     status = withContext(Dispatchers.IO) { runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull() }
@@ -493,6 +549,23 @@ fun ThermalReferenceCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            val interruptedWork = historyDebtStore.loadWork()
+            if (interruptedWork != null) {
+                Button(
+                    onClick = {
+                        scope.launch {
+                            historyDebtStore.resumeWork()
+                            continuationWork = null
+                            processNextHistoryChunk()
+                        }
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("⚠ Reprendre chargement morcelé · ${interruptedWork.nextChunk}/${interruptedWork.totalChunks}")
+                }
+            }
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Column(Modifier.weight(1f)) {
@@ -681,11 +754,36 @@ fun ThermalReferenceCard(
                 }
             }
 
-            OutlinedButton(
-                onClick = { weatherHistoryDialog = true },
-                enabled = !busy,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("Étendre historique météo + bâtiment") }
+            val trainingRequired = trainedModel == null
+            val blinkTransition = rememberInfiniteTransition(label = "model-training-blink")
+            val trainAlpha by blinkTransition.animateFloat(
+                initialValue = 0.45f,
+                targetValue = 1.0f,
+                animationSpec = infiniteRepeatable(tween(650), RepeatMode.Reverse),
+                label = "model-training-alpha"
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { weatherHistoryDialog = true },
+                    enabled = !busy && trainedModel != null,
+                    modifier = Modifier.weight(1f)
+                ) { Text("Étendre historique") }
+                Button(
+                    onClick = { scope.launch { trainPersistedModel() } },
+                    enabled = !busy,
+                    modifier = Modifier.weight(1f).graphicsLayer(alpha = if (trainingRequired) trainAlpha else 1f)
+                ) { Text(if (trainingRequired) "⚠ Entraîner modèle" else "Réentraîner modèle") }
+            }
+            Text(
+                if (trainingRequired) {
+                    trainedModelStore.dirtyReason()?.let { "Modèle à entraîner · $it" }
+                        ?: "Modèle vide : aucun calcul du passé ne part automatiquement."
+                } else {
+                    "Modèle figé : réutilisé pour le futur jusqu'à un réentraînement explicite."
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
@@ -733,8 +831,10 @@ fun ThermalReferenceCard(
                 profileStore.save(next)
                 profileDialog = false
                 if (changed) {
-                    suppressNextAuto = true
-                    scope.launch { rationalizeCurves("Profil bâtiment modifié", next, manual = false) }
+                    trainedModelStore.markDirty("Profil bâtiment modifié")
+                    trainedModel = null
+                    status = engine.statusFromTrainedModel(reference, selectedSensorId, null)
+                    info = "Profil modifié · modèle à réentraîner manuellement"
                 }
             },
             onReset = {
@@ -743,8 +843,10 @@ fun ThermalReferenceCard(
                 profile = next
                 profileDialog = false
                 if (changed) {
-                    suppressNextAuto = true
-                    scope.launch { rationalizeCurves("Profil bâtiment réinitialisé", next, manual = false) }
+                    trainedModelStore.markDirty("Profil bâtiment réinitialisé")
+                    trainedModel = null
+                    status = engine.statusFromTrainedModel(reference, selectedSensorId, null)
+                    info = "Profil réinitialisé · modèle à réentraîner manuellement"
                 }
             }
         )

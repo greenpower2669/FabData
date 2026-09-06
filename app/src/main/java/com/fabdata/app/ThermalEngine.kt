@@ -41,7 +41,17 @@ data class ThermalModel(
     val metrics: ThermalMetrics,
     val longHorizonRmse: Double,
     val confidence: Double,
-    val tauHours: Double
+    val tauHours: Double,
+    val inertiaSurfaceTauHours: Double = 48.0,
+    val inertiaDeepTauHours: Double = 336.0,
+    val inertiaDeepShare: Double = 0.72,
+    val inertiaOutsideWeight: Double = 0.15,
+    val inertiaCouplingPerHour: Double = 0.012,
+    val inertiaFitRmse: Double = 0.80,
+    val inertiaCleanHours: Int = 0,
+    val inertiaPlateauHours: Int = 0,
+    val inertiaTangentPenalty: Double = 0.0,
+    val inertiaRegimeHours: Int = 0
 ) {
     /**
      * Confiance historique compatible v0.11 : la dérive libre ne doit jamais
@@ -205,6 +215,51 @@ class ThermalEngine(
         return ThermalStatus(reference, candidates, preferred, message)
     }
 
+
+    /** Cheap status: never calibrates. The persisted model is the sole trained model. */
+    fun statusFromTrainedModel(
+        reference: WeatherReference,
+        selectedSensorId: Long? = null,
+        trainedModel: ThermalModel? = null
+    ): ThermalStatus {
+        val sensors = physicalSensors()
+        val statuses = sensors.map { sensor ->
+            val linked = trainedModel?.takeIf {
+                it.sensorId == sensor.id && it.referenceKey == reference.key
+            }
+            ThermalSensorStatus(
+                sensor = sensor,
+                realDays = linked?.realDays ?: 0,
+                model = linked,
+                measuredHours = linked?.usablePoints ?: 0,
+                ignoredHours = 0
+            )
+        }
+        val preferred = statuses.firstOrNull { it.sensor.id == selectedSensorId }
+            ?: trainedModel?.let { m -> statuses.firstOrNull { it.sensor.id == m.sensorId } }
+            ?: statuses.firstOrNull()
+        val message = when {
+            trainedModel == null -> "Modèle thermique non entraîné · lancer Entraîner modèle"
+            trainedModel.referenceKey != reference.key -> "Référence météo différente · réentraînement manuel requis"
+            selectedSensorId != null && trainedModel.sensorId != selectedSensorId -> "Sonde modèle différente · réentraînement manuel requis"
+            else -> "Modèle figé chargé · aucun réentraînement automatique"
+        }
+        return ThermalStatus(reference, statuses, preferred, message)
+    }
+
+    /** Explicit, user-triggered training. This is the only normal path that calls calibrate. */
+    fun trainModel(
+        reference: WeatherReference,
+        sensorId: Long? = null,
+        profile: ThermalBuildingProfile = ThermalBuildingProfile()
+    ): ThermalModel {
+        val sensors = physicalSensors()
+        val sensor = sensorId?.let { wanted -> sensors.firstOrNull { it.id == wanted } }
+            ?: sensors.maxByOrNull { measuredHourly(it.id).size }
+            ?: error("Aucune sonde physique à entraîner")
+        return calibrate(sensor, reference, profile, preferLongHorizon = true)
+    }
+
     fun calibrate(
         sensor: Sensor,
         reference: WeatherReference,
@@ -249,7 +304,17 @@ class ThermalEngine(
             val model = ThermalModel(
                 sensor.id, sensor.name, sensor.room, reference.key, reference.stationId, reference.city,
                 lag, coeff, train.first().timestamp, train.last().timestamp, rows.size, realDays,
-                metrics, driftRmse, confidence, inertia.diagnostics.tauHours
+                metrics, driftRmse, confidence, inertia.diagnostics.tauHours,
+                inertiaSurfaceTauHours = inertia.diagnostics.surfaceTauHours,
+                inertiaDeepTauHours = inertia.diagnostics.deepTauHours,
+                inertiaDeepShare = inertia.diagnostics.deepShare,
+                inertiaOutsideWeight = inertia.diagnostics.outsideWeight,
+                inertiaCouplingPerHour = inertia.diagnostics.couplingPerHour,
+                inertiaFitRmse = inertia.diagnostics.fitRmse,
+                inertiaCleanHours = inertia.diagnostics.cleanHours,
+                inertiaPlateauHours = inertia.diagnostics.plateauHours,
+                inertiaTangentPenalty = inertia.diagnostics.tangentPenalty,
+                inertiaRegimeHours = inertia.diagnostics.regimeHours
             )
             val better = if (best == null) {
                 true
@@ -343,7 +408,7 @@ class ThermalEngine(
             }
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
             val fingerprint = coherenceStore.dependencyFingerprint(
-                reference, profile, sensor.id, PointSource.RECONSTRUCTED
+                reference, profile, sensor.id, PointSource.RECONSTRUCTED, trainedModel = model
             )
 
             progress?.invoke(ThermalProgress("État initial · ${sensor.room}"))
@@ -379,7 +444,8 @@ class ThermalEngine(
         profile: ThermalBuildingProfile,
         sensorId: Long,
         previousBounds: LongRange,
-        progress: ((ThermalProgress) -> Unit)? = null
+        progress: ((ThermalProgress) -> Unit)? = null,
+        precalibratedModel: ThermalModel? = null
     ): ThermalWriteSummary {
         val sensor = physicalSensors().firstOrNull { it.id == sensorId }
             ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Sonde thermique introuvable")
@@ -390,11 +456,13 @@ class ThermalEngine(
             val span = (first.timestamp - previousBounds.first).coerceAtLeast(THERMAL_DAY_MS)
             val days = ((span + THERMAL_DAY_MS - 1L) / THERMAL_DAY_MS).toInt()
                 .coerceIn(1, MAX_HISTORY_DAYS)
-            return reconstructHistory(reference, days, sensor.id, profile, progress = progress)
+            return reconstructHistory(reference, days, sensor.id, profile, precalibratedModel = precalibratedModel, progress = progress)
         }
 
-        val model = runCatching { calibrate(sensor, reference, profile) }.getOrNull()
-            ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Modèle non recalibrable")
+        val model = precalibratedModel?.takeIf {
+            it.sensorId == sensor.id && it.referenceKey == reference.key
+        } ?: runCatching { calibrate(sensor, reference, profile) }.getOrNull()
+            ?: return ThermalWriteSummary(0, 0, 1, diagnostic = "Modèle non disponible")
         if (!model.acceptableForHistory) {
             return ThermalWriteSummary(0, 0, 1, diagnostic = "Modèle non validé pour l'historique")
         }
@@ -465,7 +533,8 @@ class ThermalEngine(
         reference: WeatherReference,
         sensorId: Long? = null,
         profile: ThermalBuildingProfile = ThermalBuildingProfile(),
-        mode: ForecastHorizonMode = ForecastHorizonMode.AUTO
+        mode: ForecastHorizonMode = ForecastHorizonMode.AUTO,
+        precalibratedModel: ThermalModel? = null
     ): ThermalWriteSummary {
         var total = 0
         var skipped = 0
@@ -474,22 +543,22 @@ class ThermalEngine(
         var bestAnalogCount = 0
 
         physicalSensors().filter { sensorId == null || it.id == sensorId }.forEach { sensor ->
-            val model = runCatching { calibrate(sensor, reference, profile, preferLongHorizon = true) }.getOrNull()
+            val model = precalibratedModel?.takeIf {
+                it.sensorId == sensor.id && it.referenceKey == reference.key
+            }
             if (model == null || !model.acceptableForForecast) { skipped++; return@forEach }
-            val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
-                ?: run { skipped++; return@forEach }
             val measured = measuredHourly(sensor.id)
             val latest = measured.lastOrNull() ?: run { skipped++; return@forEach }
             val recent = measured.takeLast(5)
             PointSourceStore.deleteForecastsAtOrAfter(db, sensor.id, latest.timestamp + 1L)
 
-            val from = latest.timestamp - 18L * THERMAL_HOUR_MS
+            val from = latest.timestamp - 7L * 24L * THERMAL_HOUR_MS
             val to = latest.timestamp + (mode.maxHours + 1L) * THERMAL_HOUR_MS
             val outside = referenceHourly(reference.key, from, to, includeForecast = true)
             val outMap = outside.associateBy { hourBucket(it.timestamp) }
             if (outside.none { it.timestamp > latest.timestamp }) { skipped++; return@forEach }
             val fingerprint = coherenceStore.dependencyFingerprint(
-                reference, profile, sensor.id, PointSource.FORECAST, mode
+                reference, profile, sensor.id, PointSource.FORECAST, mode, model
             )
 
             val slopes = recent.zipWithNext().mapNotNull { (a, b) ->
@@ -501,8 +570,7 @@ class ThermalEngine(
 
             var currentT = latest.temperature
             var currentH = latest.humidity
-            var currentMass = inertia.points.minByOrNull { abs(it.timestamp - latest.timestamp) }
-                ?.temperature ?: inertia.diagnostics.currentC
+            var currentMass = estimateCurrentMassFromModel(model, measured, outMap)
 
             for (horizon in 1..mode.maxHours) {
                 val ts = hourBucket(latest.timestamp) + horizon * THERMAL_HOUR_MS
@@ -541,7 +609,7 @@ class ThermalEngine(
                 // Trois heures minimum pour un modèle validé ; ensuite arrêt honnête si l'incertitude explose.
                 if (horizon > 3 && sigma > 1.50) break
 
-                val nextMass = advanceInertiaMass(inertia.diagnostics, currentT, currentMass, avg6)
+                val nextMass = advanceInertiaMass(model, currentT, currentMass, avg6)
                 currentT += delta
                 currentMass = nextMass
                 currentH += 0.08 * (outHum - currentH)
@@ -882,6 +950,36 @@ class ThermalEngine(
         return mass + (target - mass) / profile.massTauHours()
     }
 
+
+    private fun advanceInertiaMass(
+        model: ThermalModel,
+        indoor: Double,
+        mass: Double,
+        outsideAvg: Double
+    ): Double {
+        val w = model.inertiaOutsideWeight.coerceIn(0.02, 0.45)
+        val target = indoor * (1.0 - w) + outsideAvg * w
+        val share = model.inertiaDeepShare.coerceIn(0.45, 0.90)
+        val alphaSurface = 1.0 - exp(-1.0 / model.inertiaSurfaceTauHours.coerceAtLeast(6.0))
+        val alphaDeep = 1.0 - exp(-1.0 / model.inertiaDeepTauHours.coerceAtLeast(24.0))
+        val alpha = ((1.0 - share) * alphaSurface + share * alphaDeep).coerceIn(0.0001, 0.25)
+        return mass + alpha * (target - mass)
+    }
+
+    private fun estimateCurrentMassFromModel(
+        model: ThermalModel,
+        measured: List<HourPoint>,
+        outside: Map<Long, HourPoint>
+    ): Double {
+        val recent = measured.takeLast(7 * 24).ifEmpty { measured }
+        var mass = recent.firstOrNull()?.temperature ?: 22.0
+        recent.forEach { p ->
+            val out = outsideAt(outside, p.timestamp) ?: return@forEach
+            val avg6 = outsideAverage(outside, p.timestamp, 6) ?: out
+            mass = advanceInertiaMass(model, p.temperature, mass, avg6)
+        }
+        return mass
+    }
 
     private fun advanceInertiaMass(
         diagnostics: ThermalInertiaDiagnostics,

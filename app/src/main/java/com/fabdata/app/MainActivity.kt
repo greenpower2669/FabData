@@ -280,6 +280,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val weatherReferenceStore = remember { WeatherReferenceStore(db) }
     val weatherReferenceManager = remember { WeatherReferenceManager(context, db, lyonLab, meteoCredentials) }
     val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
+    val trainedModelStore = remember { ThermalTrainedModelStore(context) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
@@ -529,9 +530,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     .getSharedPreferences("fabdata_thermal_model", Context.MODE_PRIVATE)
                     .getLong("selected_sensor_id", -1L)
                     .takeIf { it >= 0L }
-                val inertia = runCatching {
-                    inertiaEstimator.estimate(selectedWeatherReference, modelSensorId, includeHistory = true)
-                }.getOrNull()
+                val trainedModel = trainedModelStore.loadUsable(selectedWeatherReference.key, modelSensorId)
+                val inertia = trainedModel?.let { model ->
+                    runCatching { inertiaEstimator.projectTrained(selectedWeatherReference, model) }.getOrNull()
+                }
                 LoadedData(
                     s, all, chosen, samples, overviewWithReference, stat,
                     db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia
@@ -754,11 +756,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                         // Le créer ici empêche tout accès DB synchrone pendant la composition UI.
                                         ThermalTrainingMaskStore(db).includeRange(sensorId, range.first, range.last)
                                     }
+                                    if (changed > 0) trainedModelStore.markDirty("Sélection d’apprentissage modifiée")
                                     reloadToken++
                                     busy = false
                                     snackbar.showSnackbar(
-                                        if (changed > 0) "Zone réintégrée à l'entraînement inertiel"
-                                        else "Zone déjà utilisée pour l'entraînement inertiel"
+                                        if (changed > 0) "Zone réintégrée · modèle à réentraîner"
+                                        else "Zone déjà utilisée pour l'entraînement"
                                     )
                                 }
                             }
@@ -779,9 +782,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                             "Sélection bandeau global"
                                         )
                                     }
+                                    trainedModelStore.markDirty("Sélection d’apprentissage modifiée")
                                     reloadToken++
                                     busy = false
-                                    snackbar.showSnackbar("Zone exclue de l'entraînement inertiel · RAW conservées")
+                                    snackbar.showSnackbar("Zone exclue · RAW conservées · modèle à réentraîner")
                                 }
                             }
                         },

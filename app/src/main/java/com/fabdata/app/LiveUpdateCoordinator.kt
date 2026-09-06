@@ -44,6 +44,7 @@ fun FabLiveUpdateCoordinator(
     val modelPrefs = remember {
         context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
     }
+    val trainedModelStore = remember { ThermalTrainedModelStore(context) }
     val lyonWeather = remember { LyonWeatherSync(db) }
     val meteoOfficial = remember { MeteoFranceOfficialClient(context, lyonLab, credentials) }
     val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
@@ -116,27 +117,19 @@ fun FabLiveUpdateCoordinator(
                 val profile = profileStore.load()
                 val mode = profileStore.forecastMode()
                 val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
-                val rebuildExisting = rebuildFromMeasured || referenceChanged
 
-                if (rebuildExisting) {
-                    selectedSensorId?.let { id ->
-                        val firstReal = coherenceStore.firstMeasuredTimestamp(id)
-                        val existing = PointSourceStore.reconstructedBounds(db, id)
-                        if (firstReal != null && existing != null) {
-                            val recentStart = firstReal - 366L * 24L * 60L * 60L * 1000L
-                            if (existing.first < recentStart) {
-                                val reason = if (referenceChanged) {
-                                    "Auto protection : changement de station météo, historique antérieur aux 12 derniers mois à remettre à jour"
-                                } else {
-                                    "Nouvelle mesure réelle : historique antérieur aux 12 derniers mois à remettre à jour"
-                                }
-                                historyDebtStore.recordDebt(reference.key, id, existing.first, recentStart, reason)
-                            }
-                        }
-                    }
-                    engine.refreshExistingReconstructions(reference, profile, selectedSensorId, maxHistoryDays = 366)
+                // v0.19.8: measured arrivals never retrain and never recalculate the past.
+                // Live mode only refreshes the future with the explicitly trained model.
+                if (referenceChanged) {
+                    trainedModelStore.markDirty("Référence météo modifiée")
                 }
-                engine.refreshForecasts(reference, selectedSensorId, profile, mode)
+                val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                if (trainedModel != null) {
+                    engine.refreshForecasts(
+                        reference, trainedModel.sensorId, profile, mode,
+                        precalibratedModel = trainedModel
+                    )
+                }
             }
             onDataChanged()
             true

@@ -120,6 +120,84 @@ class ThermalInertiaEstimator(
     private var cachedKey: String? = null
     private var cached: ThermalInertiaEstimate? = null
 
+    /**
+     * v0.19.8: render the learned bi-mass model without fitting it again.
+     * This is intentionally O(n) propagation only; no parameter search runs during chart loading.
+     */
+    fun projectTrained(reference: WeatherReference, model: ThermalModel): ThermalInertiaEstimate? {
+        if (model.referenceKey != reference.key) return null
+        val sensor = db.sensors().firstOrNull { it.id == model.sensorId } ?: return null
+        val measured = measuredHourly(model.sensorId)
+        if (measured.size < 2) return null
+        val weatherBounds = referenceStore.historyBounds(reference.key) ?: return null
+        val from = max(measured.first().timestamp, weatherBounds.first)
+        val to = min(measured.last().timestamp, weatherBounds.last)
+        if (to <= from) return null
+        val outside = outsideHourly(reference.key, from - 3L * INERTIA_HOUR_MS, to)
+        val outMap = outside.associateBy { it.first }
+        val indoor = measured.filter { it.timestamp in from..to }
+        if (indoor.size < 2) return null
+        val smooth = smoothAir(indoor.map { it.temperature })
+        val hours = indoor.mapIndexedNotNull { index, p ->
+            val outsideT = outsideAt(outMap, p.timestamp) ?: return@mapIndexedNotNull null
+            InertiaHour(p.timestamp, p.temperature, p.humidity, outsideT, smooth[index])
+        }
+        if (hours.size < 2) return null
+
+        val mass = propagateDisplay(
+            hours,
+            model.inertiaSurfaceTauHours,
+            model.inertiaDeepTauHours,
+            model.inertiaDeepShare,
+            model.inertiaOutsideWeight
+        )
+        val exclusions = ThermalTrainingMaskStore(db).query(model.sensorId, from, to)
+        val plateau = masks(hours, exclusions).second
+        val surface = propagateSurfaceDisplay(
+            hours,
+            model.inertiaSurfaceTauHours,
+            model.inertiaDeepTauHours,
+            model.inertiaOutsideWeight,
+            plateau
+        )
+        val confidence = model.confidence.coerceIn(0.08, 0.95)
+        val hiddenPoints = hours.mapIndexed { i, h ->
+            SamplePoint(
+                THERMAL_INERTIA_SENSOR_ID, h.timestamp, mass[i], h.humidity,
+                PointSource.RECONSTRUCTED, confidence
+            )
+        }
+        val visiblePoints = hours.mapIndexed { i, h ->
+            SamplePoint(
+                THERMAL_INERTIA_SENSOR_ID, h.timestamp, surface[i], h.humidity,
+                PointSource.RECONSTRUCTED, confidence
+            )
+        }
+        val trend = trendPerDay(hours, mass)
+        val currentAir = hours.last().smoothAir
+        val currentFlux = model.inertiaCouplingPerHour * (mass.last() - currentAir)
+        val diagnostics = ThermalInertiaDiagnostics(
+            sourceSensorId = model.sensorId,
+            sourceRoom = sensor.room,
+            currentC = round2(mass.last()),
+            trendCPerDay = trend,
+            tauHours = model.tauHours,
+            couplingPerHour = model.inertiaCouplingPerHour,
+            outsideWeight = model.inertiaOutsideWeight,
+            confidence = confidence,
+            cleanHours = model.inertiaCleanHours,
+            plateauHours = model.inertiaPlateauHours,
+            fitRmse = model.inertiaFitRmse,
+            currentFluxCPerHour = currentFlux,
+            tangentPenalty = model.inertiaTangentPenalty,
+            regimeHours = model.inertiaRegimeHours,
+            surfaceTauHours = model.inertiaSurfaceTauHours,
+            deepTauHours = model.inertiaDeepTauHours,
+            deepShare = model.inertiaDeepShare
+        )
+        return ThermalInertiaEstimate(hiddenPoints, diagnostics, visiblePoints)
+    }
+
     fun estimate(reference: WeatherReference, sensorId: Long? = null, includeHistory: Boolean = true): ThermalInertiaEstimate? {
         val measuredRevision = db.physicalMeasuredRevision() ?: return null
         val weatherSignature = weatherSignature(reference.key) ?: return null
