@@ -222,26 +222,47 @@ class ThermalEngine(
         selectedSensorId: Long? = null,
         trainedModel: ThermalModel? = null
     ): ThermalStatus {
+        fun measuredInventory(sensorId: Long): Pair<Int, Int> {
+            PointSourceStore.ensure(db.readableDatabase)
+            return db.readableDatabase.rawQuery(
+                """
+                SELECT COUNT(DISTINCT (p.timestamp / 86400000)),
+                       COUNT(DISTINCT (p.timestamp / 3600000))
+                FROM samples p
+                LEFT JOIN point_sources ps
+                  ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+                WHERE p.sensor_id=? AND (ps.source IS NULL OR ps.source='measured')
+                """.trimIndent(),
+                arrayOf(sensorId.toString())
+            ).use { c ->
+                if (!c.moveToFirst()) 0 to 0 else c.getInt(0) to c.getInt(1)
+            }
+        }
+
         val sensors = physicalSensors()
         val statuses = sensors.map { sensor ->
+            val (realDays, measuredHours) = measuredInventory(sensor.id)
             val linked = trainedModel?.takeIf {
                 it.sensorId == sensor.id && it.referenceKey == reference.key
             }
+            val transitions = (measuredHours - 1).coerceAtLeast(0)
+            val usable = linked?.usablePoints?.coerceAtMost(transitions) ?: 0
             ThermalSensorStatus(
                 sensor = sensor,
-                realDays = linked?.realDays ?: 0,
+                realDays = realDays,
                 model = linked,
-                measuredHours = linked?.usablePoints ?: 0,
-                ignoredHours = 0
+                measuredHours = measuredHours,
+                ignoredHours = if (linked == null) 0 else (transitions - usable).coerceAtLeast(0)
             )
         }
         val preferred = statuses.firstOrNull { it.sensor.id == selectedSensorId }
             ?: trainedModel?.let { m -> statuses.firstOrNull { it.sensor.id == m.sensorId } }
-            ?: statuses.firstOrNull()
+            ?: statuses.maxByOrNull { it.realDays }
         val message = when {
             trainedModel == null -> "Modèle thermique non entraîné · lancer Entraîner modèle"
             trainedModel.referenceKey != reference.key -> "Référence météo différente · réentraînement manuel requis"
-            selectedSensorId != null && trainedModel.sensorId != selectedSensorId -> "Sonde modèle différente · réentraînement manuel requis"
+            selectedSensorId != null && trainedModel.sensorId != selectedSensorId ->
+                "Sonde modèle différente · réentraînement manuel requis"
             else -> "Modèle figé chargé · aucun réentraînement automatique"
         }
         return ThermalStatus(reference, statuses, preferred, message)
