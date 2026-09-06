@@ -161,7 +161,7 @@ fun ThermalReferenceCard(
 
     LaunchedEffect(busy) { onBusyChanged(busy) }
     var status by remember { mutableStateOf<ThermalStatus?>(null) }
-    var info by remember { mutableStateOf("Référence prête à être chargée") }
+    var info by remember { mutableStateOf("État thermique prêt") }
     LaunchedEffect(busy, info) { onProgressChanged(if (busy) info else null) }
     var weatherHistoryDialog by remember { mutableStateOf(false) }
     var weatherHistoryDays by remember { mutableIntStateOf(30) }
@@ -176,6 +176,7 @@ fun ThermalReferenceCard(
     var coherenceBaselineReady by remember { mutableStateOf(false) }
     var observedReferenceKey by remember { mutableStateOf(selectedKey) }
     var observedDataVersion by remember { mutableIntStateOf(dataVersion) }
+    var observedForecastMode by remember { mutableStateOf(forecastMode) }
     var debtSnapshot by remember { mutableStateOf(historyDebtStore.loadDebt()) }
     var continuationWork by remember { mutableStateOf<ThermalHistoryWork?>(null) }
 
@@ -272,9 +273,9 @@ fun ThermalReferenceCard(
 
     suspend fun refresh(
         allHistory: Boolean,
-        triggerChartReload: Boolean,
-        rebuildHistoryFromNewMeasured: Boolean = false
+        triggerChartReload: Boolean
     ) {
+        info = if (allHistory) "Actualisation complète de la référence météo…" else "Actualisation météo récente et futur…"
         busy = true
         val result = withContext(Dispatchers.IO) {
             runCatching {
@@ -286,7 +287,6 @@ fun ThermalReferenceCard(
                     else manager.ensureLocalCache(reference, from, to)
                 val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
                 val thermalStatus = engine.statusFromTrainedModel(reference, selectedSensorId, activeModel)
-                val activeSensor = selectedSensorId ?: thermalStatus.preferred?.sensor?.id
 
                 // v0.19.8: refresh never recalculates the past and never retrains.
                 val forecast = if (activeModel?.acceptableForForecast == true) {
@@ -315,10 +315,12 @@ fun ThermalReferenceCard(
                 }
             },
             onFailure = { error ->
-                // Même le fallback d'état peut recalibrer/hacher beaucoup de points : jamais sur UI.
-                status = withContext(Dispatchers.IO) {
-                    runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull()
+                val passive = withContext(Dispatchers.IO) {
+                    val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                    activeModel to engine.statusFromTrainedModel(reference, selectedSensorId, activeModel)
                 }
+                trainedModel = passive.first
+                status = passive.second
                 info = error.message ?: "Référence météo indisponible"
             }
         )
@@ -492,12 +494,11 @@ fun ThermalReferenceCard(
         )
     }
 
-    // v0.16 : le premier affichage ne détruit jamais une ancienne sauvegarde inconnue.
-    // Après cette baseline, mesure/référence changée = chaîne aval rationalisée.
+    // v0.19.8+ : la carte ne lance plus de chargement/calibration à sa première composition.
+    // Les mises à jour de focus sont gérées par FabLiveUpdateCoordinator avec le modèle figé.
     LaunchedEffect(dataVersion, selectedKey, selectedSensorId, profile, forecastMode) {
-        // La station peut avoir changé automatiquement lors du resondage de secteur
-        // effectué au retour au premier plan. Synchroniser d'abord l'état Compose,
-        // puis seulement lancer les calculs pour éviter de recharger l'ancienne station.
+        // Une station peut changer uniquement après validation explicite dans l'écran de choix.
+        // Synchroniser alors l'état Compose avec la préférence persistée.
         val persistedKey = prefs.selectedKey()
         if (persistedKey != selectedKey) {
             selectedKey = persistedKey
@@ -508,13 +509,26 @@ fun ThermalReferenceCard(
         val measuredChanged = measuredRevision != null && currentMeasuredRevision != measuredRevision
         val referenceChanged = coherenceBaselineReady && selectedKey != observedReferenceKey
         val dataChanged = coherenceBaselineReady && dataVersion != observedDataVersion
+        val forecastModeChanged = coherenceBaselineReady && forecastMode != observedForecastMode
         measuredRevision = currentMeasuredRevision
         observedReferenceKey = selectedKey
         observedDataVersion = dataVersion
+        observedForecastMode = forecastMode
 
         if (!coherenceBaselineReady) {
             coherenceBaselineReady = true
-            refresh(allHistory = false, triggerChartReload = true)
+            val passive = withContext(Dispatchers.IO) {
+                val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                activeModel to engine.statusFromTrainedModel(reference, selectedSensorId, activeModel)
+            }
+            trainedModel = passive.first
+            status = passive.second
+            info = if (passive.first != null) {
+                "Modèle figé chargé · futur géré par le mode live"
+            } else {
+                trainedModelStore.dirtyReason()?.let { "Modèle à réentraîner · $it" }
+                    ?: "Modèle thermique non entraîné"
+            }
         } else if (suppressNextAuto) {
             suppressNextAuto = false
         } else {
@@ -526,14 +540,27 @@ fun ThermalReferenceCard(
                     info = "Référence météo modifiée · modèle à réentraîner · aucun calcul du passé lancé"
                 }
                 measuredChanged -> {
-                    // Le coordinateur global, toujours composé, traite la chaîne lourde.
-                    // Cette carte ne lance pas un second recalcul concurrent.
+                    // Le coordinateur global, toujours composé, traite météo + futur.
+                    // Cette carte ne lance aucun second calcul concurrent.
                     info = "Nouvelle mesure réelle détectée · futur actualisé sans réentraîner le modèle"
                 }
                 dataChanged -> {
-                    status = withContext(Dispatchers.IO) { runCatching { engine.status(reference, selectedSensorId, profile) }.getOrNull() }
+                    val passive = withContext(Dispatchers.IO) {
+                        val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                        activeModel to engine.statusFromTrainedModel(reference, selectedSensorId, activeModel)
+                    }
+                    trainedModel = passive.first
+                    status = passive.second
                 }
-                else -> refresh(allHistory = false, triggerChartReload = true)
+                forecastModeChanged -> refresh(allHistory = false, triggerChartReload = true)
+                else -> {
+                    val passive = withContext(Dispatchers.IO) {
+                        val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                        activeModel to engine.statusFromTrainedModel(reference, selectedSensorId, activeModel)
+                    }
+                    trainedModel = passive.first
+                    status = passive.second
+                }
             }
         }
     }

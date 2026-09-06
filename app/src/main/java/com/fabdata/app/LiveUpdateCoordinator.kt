@@ -19,10 +19,12 @@ import kotlinx.coroutines.withContext
  * Orchestrateur toujours composé, indépendant des cartes LazyColumn.
  *
  * - uniquement quand l'app est réellement au premier plan ;
- * - ouverture / retour au focus : resondage Auto du secteur puis météo fraîche ;
+ * - ouverture / retour au focus : météo fraîche de la référence déjà sélectionnée, jamais de rescan ;
+ * - le scan des stations proches vit uniquement dans l'écran Sondes proches / Auto protection ;
  * - ensuite toutes les 5 minutes tant que l'utilisateur regarde l'app ;
- * - lorsqu'une vraie mesure intérieure change : météo fraîche -> inertie/reconstruction -> forecast ;
+ * - lorsqu'une vraie mesure intérieure change : météo fraîche puis futur avec le modèle figé ;
  * - un changement reçu en arrière-plan est seulement mémorisé, aucun calcul n'y est lancé ;
+ * - ne réentraîne jamais le modèle et ne recalcule jamais le passé ;
  * - ne modifie jamais directement une mesure MEASURED.
  */
 @Composable
@@ -36,8 +38,6 @@ fun FabLiveUpdateCoordinator(
     val context = LocalContext.current
     val activity = context as? ComponentActivity
     val weatherPrefs = remember { WeatherReferencePrefs(context) }
-    val sectorPrefs = remember { WeatherStationSectorPrefs(context) }
-    val discovery = remember { WeatherStationDiscovery(context, credentials) }
     val manager = remember { WeatherReferenceManager(context, db, lyonLab, credentials) }
     val engine = remember { ThermalEngine(db, manager.store()) }
     val profileStore = remember { ThermalProfileStore(context) }
@@ -47,8 +47,6 @@ fun FabLiveUpdateCoordinator(
     val trainedModelStore = remember { ThermalTrainedModelStore(context) }
     val lyonWeather = remember { LyonWeatherSync(db) }
     val meteoOfficial = remember { MeteoFranceOfficialClient(context, lyonLab, credentials) }
-    val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
-    val coherenceStore = remember { ThermalCoherenceStore(db) }
 
     var foreground by remember {
         mutableStateOf(activity?.lifecycle?.currentState?.isAtLeast(Lifecycle.State.RESUMED) == true)
@@ -70,38 +68,14 @@ fun FabLiveUpdateCoordinator(
         onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
-    suspend fun updateLive(rebuildFromMeasured: Boolean, reevaluateAuto: Boolean = false): Boolean {
+    suspend fun updateLive(): Boolean {
         if (!foreground || working) return false
         working = true
         return try {
             withContext(Dispatchers.IO) {
-                val initialReference = weatherPrefs.selectedReference()
-                var reference = initialReference
-                var referenceChanged = false
-
-                // v0.18.1 : à chaque ouverture/retour au premier plan, Auto protection
-                // relit réellement l'index du secteur mémorisé. Les statistiques historiques
-                // sont cachées 7 jours dans WeatherStationDiscovery, donc ce sondage reste léger.
-                if (reevaluateAuto && weatherPrefs.autoProtection()) {
-                    val sector = sectorPrefs.load()
-                    if (sector != null) {
-                        runCatching { discovery.discover(sector.anchor(), sector.radiusKm) }
-                            .onSuccess { scan ->
-                                sectorPrefs.save(scan.anchor, scan.radiusKm)
-                                sectorPrefs.recordScan(scan.candidates.size, scan.autoCandidate?.reference?.key)
-                                val selected = scan.autoCandidate?.reference
-                                if (selected != null && selected.key != reference.key) {
-                                    weatherPrefs.select(selected)
-                                    weatherPrefs.setAutoProtection(true)
-                                    reference = selected
-                                    referenceChanged = true
-                                }
-                            }
-                            .onFailure { error ->
-                                sectorPrefs.recordScan(0, null, error.message)
-                            }
-                    }
-                }
+                // Important : le focus ne choisit jamais une autre station.
+                // La référence ne peut changer que depuis l'écran de choix explicite.
+                val reference = weatherPrefs.selectedReference()
 
                 if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
                     if (credentials.hasCredential()) {
@@ -118,11 +92,8 @@ fun FabLiveUpdateCoordinator(
                 val mode = profileStore.forecastMode()
                 val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
 
-                // v0.19.8: measured arrivals never retrain and never recalculate the past.
-                // Live mode only refreshes the future with the explicitly trained model.
-                if (referenceChanged) {
-                    trainedModelStore.markDirty("Référence météo modifiée")
-                }
+                // v0.19.8+ : seul le modèle explicitement entraîné et persisté peut servir au live.
+                // Une nouvelle mesure ne le remplace pas et aucun historique n'est recalculé ici.
                 val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
                 if (trainedModel != null) {
                     engine.refreshForecasts(
@@ -144,28 +115,27 @@ fun FabLiveUpdateCoordinator(
         measuredRevision = current
         if (previous != null && current != previous) {
             pendingMeasuredRefresh = true
-            if (foreground && updateLive(rebuildFromMeasured = true, reevaluateAuto = false)) {
+            if (foreground && updateLive()) {
                 pendingMeasuredRefresh = false
             }
         }
     }
 
-    // Chaque retour au premier plan = un nouveau sondage du secteur en mode Auto.
-    // Les boucles de 5 minutes ne resondent pas l'index : elles rafraîchissent seulement
-    // la station déjà retenue et les calculs courants.
+    // Le retour au premier plan rafraîchit uniquement la référence déjà choisie.
+    // Aucun scan de secteur et aucun changement automatique de station ne sont autorisés ici.
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
 
-        val rebuildNow = pendingMeasuredRefresh
-        if (updateLive(rebuildFromMeasured = rebuildNow, reevaluateAuto = true) && rebuildNow) {
+        val hadPendingMeasured = pendingMeasuredRefresh
+        if (updateLive() && hadPendingMeasured) {
             pendingMeasuredRefresh = false
         }
 
         while (true) {
             delay(300_000L)
             if (!foreground) break
-            val rebuild = pendingMeasuredRefresh
-            if (updateLive(rebuildFromMeasured = rebuild, reevaluateAuto = false) && rebuild) {
+            val hadPending = pendingMeasuredRefresh
+            if (updateLive() && hadPending) {
                 pendingMeasuredRefresh = false
             }
         }
