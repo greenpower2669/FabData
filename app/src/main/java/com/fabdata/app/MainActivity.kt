@@ -281,6 +281,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val weatherReferenceManager = remember { WeatherReferenceManager(context, db, lyonLab, meteoCredentials) }
     val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
     val trainedModelStore = remember { ThermalTrainedModelStore(context) }
+    val inertiaHistoryStore = remember { ThermalInertiaHistoryStore(context, db) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
@@ -532,7 +533,23 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     .takeIf { it >= 0L }
                 val trainedModel = trainedModelStore.loadUsable(selectedWeatherReference.key, modelSensorId)
                 val inertia = trainedModel?.let { model ->
-                    runCatching { inertiaEstimator.projectTrained(selectedWeatherReference, model) }.getOrNull()
+                    runCatching {
+                        val measuredProjection = inertiaEstimator.projectTrained(selectedWeatherReference, model)
+                            ?: return@runCatching null
+                        val validatedHistory = inertiaHistoryStore.query(
+                            selectedWeatherReference.key,
+                            model.sensorId,
+                            model.stableSignature(),
+                            all.first,
+                            all.last
+                        )
+                        measuredProjection.copy(
+                            surfacePoints = (validatedHistory + measuredProjection.surfacePoints)
+                                .associateBy { it.timestamp }
+                                .values
+                                .sortedBy { it.timestamp }
+                        )
+                    }.getOrNull()
                 }
                 LoadedData(
                     s, all, chosen, samples, overviewWithReference, stat,
@@ -624,7 +641,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         id = THERMAL_INERTIA_SENSOR_ID,
         stableKey = THERMAL_INERTIA_STABLE_KEY,
         name = "Sol inertiel estimé",
-        room = "Surface / sol équivalent · réel",
+        room = "Surface / sol équivalent · réel + historique validé",
         colorIndex = 4,
         latestTimestamp = inertiaEstimate?.surfacePoints?.lastOrNull()?.timestamp
     )

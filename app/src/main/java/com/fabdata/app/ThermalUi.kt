@@ -81,7 +81,9 @@ private data class RationalizeResult(
 private data class ThermalUiRuntime(
     val manager: WeatherReferenceManager,
     val engine: ThermalEngine,
-    val coherenceStore: ThermalCoherenceStore
+    val coherenceStore: ThermalCoherenceStore,
+    val inertiaHistoryStore: ThermalInertiaHistoryStore,
+    val inertiaHistoryProjector: ThermalInertiaHistoryProjector
 )
 
 @Composable
@@ -117,7 +119,15 @@ fun ThermalReferenceCard(
                 val manager = WeatherReferenceManager(context, db, lyonLab, credentials)
                 val engine = ThermalEngine(db, manager.store())
                 val coherenceStore = ThermalCoherenceStore(db)
-                ThermalUiRuntime(manager, engine, coherenceStore)
+                val inertiaHistoryStore = ThermalInertiaHistoryStore(context, db)
+                val inertiaHistoryProjector = ThermalInertiaHistoryProjector(db, manager.store())
+                ThermalUiRuntime(
+                    manager,
+                    engine,
+                    coherenceStore,
+                    inertiaHistoryStore,
+                    inertiaHistoryProjector
+                )
             }
         }
         built.fold(
@@ -151,6 +161,8 @@ fun ThermalReferenceCard(
     val manager = readyRuntime.manager
     val engine = readyRuntime.engine
     val coherenceStore = readyRuntime.coherenceStore
+    val inertiaHistoryStore = readyRuntime.inertiaHistoryStore
+    val inertiaHistoryProjector = readyRuntime.inertiaHistoryProjector
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
     val reference = remember(selectedKey) { prefs.selectedReference() }
@@ -167,6 +179,9 @@ fun ThermalReferenceCard(
     var weatherHistoryDays by remember { mutableIntStateOf(30) }
     var historyDialog by remember { mutableStateOf(false) }
     var historyDays by remember { mutableIntStateOf(30) }
+    var inertiaHistoryDialog by remember { mutableStateOf(false) }
+    var inertiaHistoryDays by remember { mutableIntStateOf(30) }
+    var inertiaPending by remember { mutableStateOf<ThermalInertiaPendingChunk?>(null) }
     var suppressNextAuto by remember { mutableStateOf(false) }
     var selectedSensorId by remember {
         mutableStateOf(modelSensorPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L })
@@ -269,6 +284,130 @@ fun ThermalReferenceCard(
         )
         refreshDebtState()
         processNextHistoryChunk()
+    }
+
+
+    suspend fun processNextInertiaChunk() {
+        val work = inertiaHistoryStore.loadWork() ?: return
+        inertiaHistoryStore.resumeWork()
+        if (work.referenceKey != reference.key) {
+            inertiaHistoryStore.pauseWork()
+            info = "Sol inertiel en pause · référence météo différente"
+            return
+        }
+        val range = work.nextRange() ?: run {
+            inertiaHistoryStore.clearWork()
+            info = "Sol inertiel historique terminé"
+            return
+        }
+        busy = true
+        info = "Sol inertiel · mois ${work.nextChunk + 1}/${work.totalChunks} · contrôle des prérequis…"
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                val activeModel = trainedModelStore.loadUsable(reference.key, work.sensorId)
+                    ?: error("Modèle entraîné requis pour cette sonde")
+                if (activeModel.stableSignature() != work.modelSignature) {
+                    error("Le modèle a changé · relancer l'extension du sol inertiel")
+                }
+                val prepared = manager.prepareHistoryRange(reference, range.first, range.last)
+                if (!prepared.coverage.ready) {
+                    error(
+                        "${reference.city} incomplet sur ce mois : couverture " +
+                            "${(prepared.coverage.coverage * 100).toInt()} %"
+                    )
+                }
+                inertiaHistoryProjector.projectChunk(
+                    reference = reference,
+                    model = activeModel,
+                    range = range,
+                    seed = work.seedState()
+                )
+            }
+        }
+        busy = false
+        result.fold(
+            onSuccess = { chunk ->
+                inertiaPending = ThermalInertiaPendingChunk(work, range, chunk)
+                info = "Sol inertiel · mois ${work.nextChunk + 1}/${work.totalChunks} calculé · validation utilisateur requise"
+            },
+            onFailure = { error ->
+                inertiaHistoryStore.pauseWork()
+                inertiaPending = null
+                info = error.message ?: "Sol inertiel impossible · session mise en pause"
+            }
+        )
+    }
+
+    suspend fun beginInertiaHistoryWork(days: Int) {
+        val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+            ?: run {
+                info = "Modèle entraîné requis avant de prolonger le sol inertiel"
+                return
+            }
+        val firstReal = withContext(Dispatchers.IO) {
+            coherenceStore.firstMeasuredTimestamp(activeModel.sensorId)
+        } ?: run {
+            info = "Aucune vraie mesure intérieure pour borner le sol inertiel"
+            return
+        }
+        inertiaHistoryStore.pruneOtherModels(
+            reference.key,
+            activeModel.sensorId,
+            activeModel.stableSignature()
+        )
+        inertiaHistoryStore.beginWork(
+            referenceKey = reference.key,
+            sensorId = activeModel.sensorId,
+            modelSignature = activeModel.stableSignature(),
+            requestedDays = days.coerceIn(1, 1464),
+            firstMeasuredTimestamp = firstReal
+        )
+        inertiaPending = null
+        processNextInertiaChunk()
+    }
+
+    suspend fun validateInertiaChunk(pauseAfter: Boolean) {
+        val pending = inertiaPending ?: return
+        val activeModel = trainedModelStore.loadUsable(
+            pending.work.referenceKey,
+            pending.work.sensorId
+        ) ?: run {
+            inertiaHistoryStore.pauseWork()
+            inertiaPending = null
+            info = "Modèle devenu indisponible · sol inertiel mis en pause"
+            return
+        }
+        if (activeModel.stableSignature() != pending.work.modelSignature) {
+            inertiaHistoryStore.pauseWork()
+            inertiaPending = null
+            info = "Le modèle a changé · sol inertiel mis en pause"
+            return
+        }
+
+        withContext(Dispatchers.IO) {
+            inertiaHistoryStore.replaceChunk(
+                pending.work.referenceKey,
+                pending.work.sensorId,
+                pending.work.modelSignature,
+                pending.range,
+                pending.result.points
+            )
+            inertiaHistoryStore.advanceWork(pending.result.endState)
+        }
+        val advanced = inertiaHistoryStore.loadWork()
+        inertiaPending = null
+        suppressNextAuto = true
+        onDataChanged()
+
+        if (advanced == null || advanced.nextChunk >= advanced.totalChunks) {
+            inertiaHistoryStore.clearWork()
+            info = "Sol inertiel historique terminé · tous les mois validés sont conservés"
+        } else if (pauseAfter) {
+            inertiaHistoryStore.pauseWork()
+            info = "Sol inertiel mis en pause · ${advanced.nextChunk}/${advanced.totalChunks} mois validé(s)"
+        } else {
+            processNextInertiaChunk()
+        }
     }
 
     suspend fun refresh(
@@ -577,6 +716,25 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            val interruptedInertiaWork = inertiaHistoryStore.loadWork()
+            if (interruptedInertiaWork != null && inertiaPending == null) {
+                Button(
+                    onClick = {
+                        scope.launch {
+                            inertiaHistoryStore.resumeWork()
+                            processNextInertiaChunk()
+                        }
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "⚠ Reprendre sol inertiel · " +
+                            "${interruptedInertiaWork.nextChunk}/${interruptedInertiaWork.totalChunks}"
+                    )
+                }
+            }
+
             val interruptedWork = historyDebtStore.loadWork()
             if (interruptedWork != null) {
                 Button(
@@ -692,7 +850,12 @@ fun ThermalReferenceCard(
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                "Conservé ${(preferred.retainedRatio * 100).toInt()} % · ignoré ${preferred.ignoredHours} h",
+                                if (preferred.model != null) {
+                                    "Conservé ${(preferred.retainedRatio * 100).toInt()} % · " +
+                                        "ignoré ${preferred.ignoredHours} h"
+                                } else {
+                                    "Modèle non entraîné pour cette sonde"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -812,6 +975,19 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            OutlinedButton(
+                onClick = { inertiaHistoryDialog = true },
+                enabled = !busy && trainedModel != null,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Prolonger le sol inertiel") }
+            Text(
+                "Uniquement le sol/surface inertiel : exige un modèle entraîné et de la " +
+                    "température intérieure RECONSTRUCTED. Calcul du plus ancien vers le présent, " +
+                    "un mois à la fois, sans réentraînement.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { scope.launch { refresh(allHistory = true, triggerChartReload = true) } },
@@ -874,6 +1050,92 @@ fun ThermalReferenceCard(
                     trainedModel = null
                     status = engine.statusFromTrainedModel(reference, selectedSensorId, null)
                     info = "Profil réinitialisé · modèle à réentraîner manuellement"
+                }
+            }
+        )
+    }
+
+
+    if (inertiaHistoryDialog) {
+        AlertDialog(
+            onDismissRequest = { inertiaHistoryDialog = false },
+            title = { Text("Prolonger uniquement le sol inertiel ?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Aucun réentraînement et aucune reconstruction de l'air intérieur : " +
+                            "FabData utilise uniquement le modèle figé et les températures " +
+                            "intérieures déjà RECONSTRUCTED."
+                    )
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        THERMAL_HISTORY_CHOICES.forEach { choice ->
+                            FilterChip(
+                                selected = inertiaHistoryDays == choice.days,
+                                onClick = { inertiaHistoryDays = choice.days },
+                                label = { Text(choice.label) }
+                            )
+                        }
+                    }
+                    Text(
+                        "Sélection : ${thermalHistoryLabel(inertiaHistoryDays)}. Chaque mois est " +
+                            "calculé du passé vers le présent puis attend ta validation.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    inertiaHistoryDialog = false
+                    scope.launch { beginInertiaHistoryWork(inertiaHistoryDays) }
+                }) { Text("Commencer") }
+            },
+            dismissButton = {
+                TextButton(onClick = { inertiaHistoryDialog = false }) { Text("Annuler") }
+            }
+        )
+    }
+
+    inertiaPending?.let { pending ->
+        val nextNumber = pending.work.nextChunk + 1
+        val lastChunk = nextNumber >= pending.work.totalChunks
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Sol inertiel · mois $nextNumber/${pending.work.totalChunks}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "${pending.result.points.size} point(s) calculé(s) · " +
+                            "${pending.result.reconstructedHours} h intérieures reconstruites · " +
+                            "couverture ${(pending.result.coverage * 100).toInt()} %."
+                    )
+                    Text(
+                        "Rien de ce mois n'est enregistré tant que tu ne le valides pas. " +
+                            "Après validation, son état final devient le départ physique du mois suivant."
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    scope.launch { validateInertiaChunk(pauseAfter = false) }
+                }) {
+                    Text(if (lastChunk) "Valider et terminer" else "Valider et continuer")
+                }
+            },
+            dismissButton = {
+                Row {
+                    if (!lastChunk) {
+                        TextButton(onClick = {
+                            scope.launch { validateInertiaChunk(pauseAfter = true) }
+                        }) { Text("Valider et pause") }
+                    }
+                    TextButton(onClick = {
+                        inertiaHistoryStore.clearWork()
+                        inertiaPending = null
+                        info = "Sol inertiel annulé · les mois déjà validés restent conservés"
+                    }) { Text("Annuler") }
                 }
             }
         )
