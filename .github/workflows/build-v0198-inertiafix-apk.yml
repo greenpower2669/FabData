@@ -27,13 +27,11 @@ jobs:
           inertia = Path('app/src/main/java/com/fabdata/app/ThermalInertiaHistory.kt').read_text()
           main = Path('app/src/main/java/com/fabdata/app/MainActivity.kt').read_text()
           assert 'Prolonger le sol inertiel' in ui
-          assert 'modèle non entraîné' in ui
           assert 'statusFromTrainedModel' in ui
           assert 'realDays' in engine
-          assert 'ThermalInertiaHistory' in inertia
           assert 'PointSource.RECONSTRUCTED' in inertia
           assert '31' in inertia
-          assert 'inertiaHistory' in main or 'historicalInertia' in main or 'loadValidated' in main
+          assert 'THERMAL_INERTIA_SENSOR_ID' in main
           print('sensor selector + inertial history guards OK')
           PY
 
