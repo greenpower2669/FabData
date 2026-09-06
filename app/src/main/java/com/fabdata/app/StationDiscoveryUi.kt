@@ -63,8 +63,8 @@ fun StationDiscoveryDialog(
     var busy by remember { mutableStateOf(false) }
     var info by remember {
         mutableStateOf(
-            savedSector?.let { "Secteur mémorisé · ${it.label} · resondage automatique à l'ouverture." }
-                ?: "Choisis un lieu puis FabData cherchera toutes les stations du secteur."
+            savedSector?.let { "Secteur mémorisé · ${it.label} · scan à l'ouverture de cet écran." }
+                ?: "FabData scanne les sondes disponibles à l'ouverture de cet écran."
         )
     }
     var result by remember { mutableStateOf<StationDiscoveryResult?>(null) }
@@ -118,8 +118,16 @@ fun StationDiscoveryDialog(
         }
     }
 
+    // Le scan automatique est volontairement limité à l'ouverture de cet écran.
+    // Un simple retour au premier plan de FabData ne rescanne plus et ne change jamais la station active.
     LaunchedEffect(Unit) {
-        savedSector?.let { memory -> runScan(anchorProvider = { memory.anchor() }) }
+        val initialAnchor = savedSector?.anchor() ?: StationSearchAnchor(
+            "Autour de ${currentReference.label}",
+            currentReference.latitude,
+            currentReference.longitude,
+            currentReference.departmentId
+        )
+        runScan(anchorProvider = { initialAnchor })
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -141,9 +149,23 @@ fun StationDiscoveryDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    "Auto protection privilégie la station du secteur historiquement la plus chaude. Le secteur et le rayon restent mémorisés ; l'index est resondé à chaque retour dans l'app.",
+                    "Auto protection privilégie la station du secteur historiquement la plus chaude. Le secteur et le rayon restent mémorisés. Le scan se fait à l'ouverture de cet écran ou sur demande, jamais au simple retour dans l'app ; aucune station n'est changée sans validation de l'utilisateur.",
                     style = MaterialTheme.typography.bodySmall
                 )
+
+                OutlinedButton(
+                    onClick = {
+                        val anchor = result?.anchor ?: savedSector?.anchor() ?: StationSearchAnchor(
+                            "Autour de ${currentReference.label}",
+                            currentReference.latitude,
+                            currentReference.longitude,
+                            currentReference.departmentId
+                        )
+                        runScan(anchorProvider = { anchor })
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (busy) "Scan en cours…" else "⚠ Rescanner les sondes disponibles") }
 
                 OutlinedTextField(
                     value = query,
