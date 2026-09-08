@@ -1,0 +1,136 @@
+name: Build FabData v0.20.6 training target selector
+
+on:
+  push:
+    branches:
+      - 'agent/v0.20.6-training-target-selector'
+    paths:
+      - '.github/workflows/build-v0206-training-target-selector.yml'
+      - 'tools/fix_v0206_training_target_selector.py'
+      - 'app/src/main/java/com/fabdata/app/ThermalTrainingScope.kt'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.20.6-training-target-selector
+          fetch-depth: 0
+
+      - name: Apply v0.20.6 training target fix
+        run: python3 tools/fix_v0206_training_target_selector.py
+
+      - name: Diff and regression guard
+        run: |
+          git diff --check
+          git diff --stat
+          grep -q 'Choisir / classer une sonde intérieure' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'Mur / solaire' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'ThermalTrainingScopedPolicyStore' app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          grep -q 'ThermalTrainingSubject.solar' app/src/main/java/com/fabdata/app/ThermalWallSolarService.kt
+          grep -q 'role == ThermalSensorRole.INDOOR || role == ThermalSensorRole.UNDEFINED' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'météo = présent → passé' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'thermique intérieur = passé → présent' app/src/main/java/com/fabdata/app/ThermalUi.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit patched source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/fabdata/app/ThermalTrainingScope.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt \
+            app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
+            app/src/main/java/com/fabdata/app/ThermalWallSolarService.kt \
+            app/src/main/java/com/fabdata/app/MainActivity.kt \
+            app/src/main/java/com/fabdata/app/ThermalUi.kt \
+            app/src/main/java/com/fabdata/app/BackupV3Layer.kt 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Restore explicit training target selection and scope ranges per model"
+            git push origin HEAD:agent/v0.20.6-training-target-selector
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.20.6-training-target-selector-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.20.6-training-target-selector-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.20.6-training-target-selector-signing-mode.txt
+          sha256sum artifacts/FabData-v0.20.6-training-target-selector-release.apk artifacts/FabData-v0.20.6-training-target-selector-release.aab > artifacts/FabData-v0.20.6-training-target-selector-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.20.6-training-target-selector
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.20.6-training-target-selector --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.20.6-training-target-selector \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.20.6 training target selector" \
+            --notes "Restaure un sélecteur explicite toujours visible pour l'entraînement. Sol/inertie : choix ou classement d'une sonde intérieure, sans jamais proposer une sonde extérieure. Mur/solaire : choix du pan puis de la sonde extérieure liée. Le bouton Entraîner agit sur la cible affichée. Les plages Utiliser/Exclure/Exclure tout sauf sont désormais isolées par sonde inertielle ou par pan solaire via une table scoped, avec fallback compatible vers les anciennes sélections globales. Le moteur solaire accepte une sonde liée explicitement. Les invariants météo présent→passé et thermique intérieur passé→présent de v0.20.5 restent protégés." \
+            artifacts/FabData-v0.20.6-training-target-selector-release.apk \
+            artifacts/FabData-v0.20.6-training-target-selector-release.aab \
+            artifacts/FabData-v0.20.6-training-target-selector-signing-mode.txt \
+            artifacts/FabData-v0.20.6-training-target-selector-sha256.txt
