@@ -95,8 +95,10 @@ jobs:
             app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt \
             app/src/main/java/com/fabdata/app/ThermalWallSolarService.kt \
             app/src/main/java/com/fabdata/app/MainActivity.kt \
-            app/src/main/java/com/fabdata/app/ThermalUi.kt \
-            app/src/main/java/com/fabdata/app/BackupV3Layer.kt 2>/dev/null || true
+            app/src/main/java/com/fabdata/app/ThermalUi.kt
+          if [ -f app/src/main/java/com/fabdata/app/BackupV3Layer.kt ]; then
+            git add app/src/main/java/com/fabdata/app/BackupV3Layer.kt
+          fi
           if git diff --cached --quiet; then
             echo "No source patch to commit"
           else
