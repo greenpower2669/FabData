@@ -174,6 +174,7 @@ fun ThermalReferenceCard(
     LaunchedEffect(busy) { onBusyChanged(busy) }
     var status by remember { mutableStateOf<ThermalStatus?>(null) }
     var info by remember { mutableStateOf("État thermique prêt") }
+    var trainingFeedback by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(busy, info) { onProgressChanged(if (busy) info else null) }
     var weatherHistoryDialog by remember { mutableStateOf(false) }
     var weatherHistoryDays by remember { mutableIntStateOf(30) }
@@ -469,6 +470,7 @@ fun ThermalReferenceCard(
     suspend fun trainPersistedModel() {
         if (busy) return
         busy = true
+        trainingFeedback = "⏳ Entraînement en cours…"
         info = "Entraînement du modèle · préparation des mesures réelles…"
         val result = withContext(Dispatchers.IO) {
             runCatching {
@@ -485,6 +487,7 @@ fun ThermalReferenceCard(
         }
         result.fold(
             onSuccess = { model ->
+                trainingFeedback = "✓ Modèle entraîné · ${model.usablePoints} h utilisées · ${model.realDays} j"
                 trainedModel = model
                 selectedSensorId = model.sensorId
                 modelSensorPrefs.edit().putLong("selected_sensor_id", model.sensorId).apply()
@@ -495,7 +498,9 @@ fun ThermalReferenceCard(
                 onDataChanged()
             },
             onFailure = { error ->
-                info = error.message ?: "Entraînement impossible"
+                val message = error.message ?: "Entraînement impossible"
+                info = message
+                trainingFeedback = "⚠ $message"
             }
         )
         busy = false
@@ -986,6 +991,16 @@ fun ThermalReferenceCard(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            trainingFeedback?.let { feedback ->
+                Text(
+                    feedback,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (feedback.startsWith("✓")) MaterialTheme.colorScheme.primary
+                    else if (feedback.startsWith("⚠")) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
 
             OutlinedButton(
                 onClick = { inertiaHistoryDialog = true },

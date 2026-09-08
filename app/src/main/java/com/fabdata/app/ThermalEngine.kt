@@ -290,25 +290,11 @@ class ThermalEngine(
         preferLongHorizon: Boolean = false
     ): ThermalModel {
         val measured = measuredHourly(sensor.id)
-        val realDays = distinctDays(measured)
-        require(realDays >= MIN_REAL_DAYS) { "Moins de 16 jours réels exploitables" }
-        require(measured.size >= 180) { "Pas assez de points horaires réels" }
+        require(measured.size >= 2) { "Pas assez de mesures réelles" }
 
-        val from = measured.first().timestamp - 18L * THERMAL_HOUR_MS
-        val to = measured.last().timestamp
-        val outside = referenceHourly(reference.key, from, to, includeForecast = false)
-        require(outside.size >= 120) { "Référence météo extérieure insuffisante" }
-        require(referenceCoverageReady(outside, from, to)) {
-            "Référence météo extérieure incomplète : reconstruire/compléter ${reference.city} avant de calibrer le bâtiment"
-        }
-        val outMap = outside.associateBy { hourBucket(it.timestamp) }
-        val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
-            ?: error("Température inertielle estimée indisponible pour ${sensor.room}")
-        val inertiaMap = inertia.points.associateBy { hourBucket(it.timestamp) }
-        val medianDeltas = buildingMedianDeltaByHour(measured.first().timestamp, measured.last().timestamp)
-
-        // User selections are training masks, never data deletion. Legacy inertia
-        // exclusions stay valid; v0.20.1 adds a positive EXCLUSIVE whitelist per engine.
+        // Resolve the user's training policy first. The selected policy controls the
+        // calibration inventory AND the weather span required for training. Data outside
+        // the policy remain in the database and can still be used later for propagation.
         val legacyTrainingExclusions = ThermalTrainingMaskStore(db).query(
             sensor.id, measured.first().timestamp, measured.last().timestamp
         )
@@ -320,10 +306,36 @@ class ThermalEngine(
             return exclusive.isEmpty() || exclusive.any { it.contains(timestamp) }
         }
 
+        val acceptedMeasured = measured.filter { trainingTimestampAccepted(it.timestamp) }
+        val realDays = distinctDays(acceptedMeasured)
+        require(realDays >= MIN_REAL_DAYS) {
+            "Sélection inertielle trop courte : $realDays jour(s) réel(s) retenu(s), minimum $MIN_REAL_DAYS jours"
+        }
+        require(acceptedMeasured.size >= 180) {
+            "Sélection inertielle insuffisante : ${acceptedMeasured.size} point(s) horaires retenus, minimum 180"
+        }
+
+        val selectedFrom = acceptedMeasured.first().timestamp
+        val selectedTo = acceptedMeasured.last().timestamp
+        val from = selectedFrom - 18L * THERMAL_HOUR_MS
+        val to = selectedTo
+        val outside = referenceHourly(reference.key, from, to, includeForecast = false)
+        require(outside.size >= 120) { "Référence météo extérieure insuffisante sur la sélection" }
+        require(referenceCoverageReady(outside, from, to)) {
+            "Référence météo extérieure incomplète sur la sélection : actualiser ${reference.city} puis réessayer"
+        }
+        val outMap = outside.associateBy { hourBucket(it.timestamp) }
+        val inertia = inertiaEstimator.estimate(reference, sensor.id, includeHistory = false)
+            ?: error("Température inertielle estimée indisponible pour ${sensor.room} sur la sélection")
+        val inertiaMap = inertia.points.associateBy { hourBucket(it.timestamp) }
+        val medianDeltas = buildingMedianDeltaByHour(selectedFrom, selectedTo)
+
         var best: ThermalModel? = null
+        var maxUsableRows = 0
         for (lag in 0..12) {
             val rows = buildTrainingRows(measured, outMap, inertiaMap, medianDeltas, lag)
                 .filter { trainingTimestampAccepted(it.timestamp) }
+            maxUsableRows = maxOf(maxUsableRows, rows.size)
             if (rows.size < 120) continue
             val split = (rows.size * 0.80).toInt().coerceIn(80, rows.size - 24)
             val train = rows.take(split)
@@ -363,7 +375,11 @@ class ThermalEngine(
             }
             if (better) best = model
         }
-        return best ?: error("Aucun facteur de projection inertielle stable n'a passé la calibration")
+        return best ?: if (maxUsableRows < 120) {
+            error("Sélection inertielle trop courte après garde-fous : $maxUsableRows h utilisables, minimum 120 h")
+        } else {
+            error("Aucun facteur de projection inertielle stable n'a passé la calibration sur la sélection")
+        }
     }
 
     /**
