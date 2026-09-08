@@ -81,7 +81,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/src/main/java/com/fabdata/app/MainActivity.kt app/src/main/java/com/fabdata/app/ThermalTrainingPolicy.kt
+          git add app/src/main/java/com/fabdata/app/MainActivity.kt app/src/main/java/com/fabdata/app/ThermalTrainingPolicy.kt app/src/main/java/com/fabdata/app/ThermalEngine.kt
           if git diff --cached --quiet; then
             echo "No source patch to commit"
           else
@@ -114,7 +114,7 @@ jobs:
           gh release create v0.20.3-whitelist-selection \
             --target "$TARGET_SHA" \
             --title "FabData v0.20.3 whitelist selection" \
-            --notes "Sélection d'apprentissage clarifiée : 'Exclure tout sauf cette zone' initialise/remplace la base autorisée pour le moteur choisi. Ensuite chaque nouvelle sélection est ajoutée avec 'Ajouter / utiliser cette zone'. Une seule zone est manipulée à la fois. Inertie et solaire utilisent désormais le même moteur de politique de sélection. Les RAW restent intouchables." \
+            --notes "Sélection d'apprentissage clarifiée : 'Exclure tout sauf cette zone' initialise/remplace la base autorisée pour le moteur choisi. Ensuite chaque nouvelle sélection est ajoutée avec 'Ajouter / utiliser cette zone'. Une seule zone est manipulée à la fois. Inertie et solaire utilisent le même moteur de politique ; dès que cette nouvelle politique est utilisée, les anciens masques inertiels legacy ne peuvent plus trouer silencieusement une zone choisie. Les RAW restent intouchables." \
             artifacts/FabData-v0.20.3-whitelist-selection-release.apk \
             artifacts/FabData-v0.20.3-whitelist-selection-release.aab \
             artifacts/FabData-v0.20.3-whitelist-selection-signing-mode.txt \
