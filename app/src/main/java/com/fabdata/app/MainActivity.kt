@@ -823,9 +823,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                     ThermalTrainingTarget.BOTH -> "inertie + solaire"
                                 }
                                 val modeLabel = when (mode) {
-                                    ThermalTrainingRangeMode.INCLUDE -> "zone utilisée"
-                                    ThermalTrainingRangeMode.EXCLUDE -> "zone exclue"
-                                    ThermalTrainingRangeMode.EXCLUSIVE -> "zone exclusive"
+                                    ThermalTrainingRangeMode.INCLUDE -> "zone ajoutée / utilisée"
+                                    ThermalTrainingRangeMode.EXCLUDE -> "zone retirée / exclue"
+                                    ThermalTrainingRangeMode.EXCLUSIVE -> "tout le reste exclu · cette zone devient la base"
                                 }
                                 snackbar.showSnackbar("$modeLabel · $targetLabel · RAW conservées")
                             }
@@ -1625,7 +1625,7 @@ private fun HistoryOverviewCard(
                 }
                 if (rangeSelectionMode) {
                     Text(
-                        "↔ Glisse horizontalement dans le bandeau puis choisis l'action. Tu peux recommencer pour plusieurs zones.",
+                        "↔ Une seule zone à la fois : glisse, valide l'action, puis refais une sélection pour en ajouter une autre.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -1933,25 +1933,25 @@ private fun HistoryOverviewCard(
                         ) {
                             pendingRange?.let { selectedRange ->
                                 DropdownMenuItem(
-                                    text = { Text("Utiliser · inertie / sol") },
+                                    text = { Text("Ajouter / utiliser cette zone · inertie / sol") },
                                     onClick = {
                                         rangeMenuOpen = false
-                                        onUseForInertia(selectedRange)
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.INERTIA, ThermalTrainingRangeMode.INCLUDE)
                                         rangeStart = null
                                         rangeEnd = null
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Exclure · inertie / sol") },
+                                    text = { Text("Retirer / exclure cette zone · inertie / sol") },
                                     onClick = {
                                         rangeMenuOpen = false
-                                        onExcludeFromInertia(selectedRange)
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.INERTIA, ThermalTrainingRangeMode.EXCLUDE)
                                         rangeStart = null
                                         rangeEnd = null
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Utiliser · solaire / mur") },
+                                    text = { Text("Ajouter / utiliser cette zone · solaire / mur") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onTrainingPolicy(selectedRange, ThermalTrainingTarget.SOLAR, ThermalTrainingRangeMode.INCLUDE)
@@ -1960,7 +1960,7 @@ private fun HistoryOverviewCard(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Exclure · solaire / mur") },
+                                    text = { Text("Retirer / exclure cette zone · solaire / mur") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onTrainingPolicy(selectedRange, ThermalTrainingTarget.SOLAR, ThermalTrainingRangeMode.EXCLUDE)
@@ -1969,7 +1969,7 @@ private fun HistoryOverviewCard(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Exclusivement · inertie / sol") },
+                                    text = { Text("Exclure tout sauf cette zone · inertie / sol") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onTrainingPolicy(selectedRange, ThermalTrainingTarget.INERTIA, ThermalTrainingRangeMode.EXCLUSIVE)
@@ -1978,7 +1978,7 @@ private fun HistoryOverviewCard(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Exclusivement · solaire / mur") },
+                                    text = { Text("Exclure tout sauf cette zone · solaire / mur") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onTrainingPolicy(selectedRange, ThermalTrainingTarget.SOLAR, ThermalTrainingRangeMode.EXCLUSIVE)
@@ -1987,7 +1987,7 @@ private fun HistoryOverviewCard(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Exclusivement · les deux moteurs") },
+                                    text = { Text("Exclure tout sauf cette zone · les deux moteurs") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onTrainingPolicy(selectedRange, ThermalTrainingTarget.BOTH, ThermalTrainingRangeMode.EXCLUSIVE)

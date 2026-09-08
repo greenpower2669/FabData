@@ -25,10 +25,11 @@ data class ThermalTrainingPolicyRange(
 /**
  * Engine-specific training policy.
  *
- * EXCLUSIVE is a positive whitelist: as soon as one exclusive range exists for an
- * engine, every timestamp outside the union of those ranges is ignored for fitting.
- * EXCLUDE always wins. INCLUDE removes exclusions; when an exclusive whitelist is
- * already active it also adds the selected range to that whitelist.
+ * EXCLUSIVE is kept as the persisted name for compatibility, but it is an operation,
+ * not a third per-zone state: "exclude everything except this zone". Applying it resets
+ * the positive whitelist to the current single selection. Once that whitelist mode is
+ * active, INCLUDE adds another selected zone to the whitelist, one selection at a time.
+ * EXCLUDE removes/blocks a selected slice. Everything outside the whitelist is ignored.
  *
  * RAW data are never deleted or modified. Physical state propagation can continue
  * through ignored ranges; only the parameter fit/validation is masked.
@@ -65,7 +66,7 @@ class ThermalTrainingPolicyStore(private val db: FabDataDb) {
             when (mode) {
                 ThermalTrainingRangeMode.INCLUDE -> includeRange(actual, from, to)
                 ThermalTrainingRangeMode.EXCLUDE -> addMerged(actual, ThermalTrainingRangeMode.EXCLUDE, from, to)
-                ThermalTrainingRangeMode.EXCLUSIVE -> addMerged(actual, ThermalTrainingRangeMode.EXCLUSIVE, from, to)
+                ThermalTrainingRangeMode.EXCLUSIVE -> startOnlySelected(actual, from, to)
             }
         }
     }
@@ -171,6 +172,37 @@ class ThermalTrainingPolicyStore(private val db: FabDataDb) {
                 updatedAt = 0L
             )
         }
+    }
+
+    /**
+     * Activates/restarts "only selected zones" mode with exactly the current range.
+     * This is deliberately NOT additive: the wording "exclude everything except this
+     * zone" means this selection becomes the new base whitelist. The user can then make
+     * another single selection and use INCLUDE to add it to the allowed union.
+     */
+    private fun startOnlySelected(target: ThermalTrainingTarget, from: Long, to: Long) {
+        val start = minOf(from, to)
+        val end = maxOf(from, to)
+        val sql = db.writableDatabase
+        val now = System.currentTimeMillis()
+        sql.beginTransaction()
+        try {
+            // Reset only the whitelist rows for this engine; explicit exclusions outside
+            // the new allowed range may stay because they are irrelevant while whitelist
+            // mode is active. Any exclusion overlapping the chosen range is removed below.
+            sql.delete(
+                "thermal_training_policy",
+                "target=? AND mode=?",
+                arrayOf(target.name, ThermalTrainingRangeMode.EXCLUSIVE.name)
+            )
+            insert(target, ThermalTrainingRangeMode.EXCLUSIVE, start, end, now, now)
+            sql.setTransactionSuccessful()
+        } finally {
+            sql.endTransaction()
+        }
+        // The selected base zone must really be usable: clear any old explicit exclusion
+        // that intersects it. RAW data are never touched.
+        removeSlice(target, ThermalTrainingRangeMode.EXCLUDE, start, end)
     }
 
     private fun includeRange(target: ThermalTrainingTarget, from: Long, to: Long) {

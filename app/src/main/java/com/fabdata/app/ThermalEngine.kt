@@ -299,8 +299,9 @@ class ThermalEngine(
             sensor.id, measured.first().timestamp, measured.last().timestamp
         )
         val inertiaPolicy = trainingPolicyStore.ranges(ThermalTrainingTarget.INERTIA)
+        val newPolicyActive = inertiaPolicy.isNotEmpty()
         fun trainingTimestampAccepted(timestamp: Long): Boolean {
-            if (legacyTrainingExclusions.any { it.contains(timestamp) }) return false
+            if (!newPolicyActive && legacyTrainingExclusions.any { it.contains(timestamp) }) return false
             if (inertiaPolicy.any { it.mode == ThermalTrainingRangeMode.EXCLUDE && it.contains(timestamp) }) return false
             val exclusive = inertiaPolicy.filter { it.mode == ThermalTrainingRangeMode.EXCLUSIVE && it.enabled }
             return exclusive.isEmpty() || exclusive.any { it.contains(timestamp) }
