@@ -38,10 +38,20 @@ data class PointProvenance(
     val sigmaC: Double? = null,
     val analogCount: Int? = null,
     val profileHash: String? = null,
-    val dependencyHash: String? = null
+    val dependencyHash: String? = null,
+    // Présent lors d'un réimport FabData : empêche un ancien export calculé
+    // de remplacer silencieusement une reconstruction plus récente.
+    val sourceUpdatedAt: Long? = null
 )
 
 enum class PriorityWriteResult { INSERTED, REPLACED, UNCHANGED, REJECTED }
+
+private data class ExistingPriorityPoint(
+    val temperature: Double,
+    val humidity: Double,
+    val source: PointSource,
+    val sourceUpdatedAt: Long?
+)
 
 data class PriorityPointWrite(
     val sensorId: Long,
@@ -120,7 +130,7 @@ object PointSourceStore {
             """
             SELECT source, confidence, reference_key, reference_station_id, reference_city,
                    calibration_from, calibration_to, model_version, sigma_c, analog_count,
-                   profile_hash, dependency_hash
+                   profile_hash, dependency_hash, updated_at
             FROM point_sources
             WHERE sensor_id=? AND timestamp=? LIMIT 1
             """.trimIndent(),
@@ -139,7 +149,8 @@ object PointSourceStore {
                 sigmaC = if (c.isNull(8)) null else c.getDouble(8),
                 analogCount = if (c.isNull(9)) null else c.getInt(9),
                 profileHash = if (c.isNull(10)) null else c.getString(10),
-                dependencyHash = if (c.isNull(11)) null else c.getString(11)
+                dependencyHash = if (c.isNull(11)) null else c.getString(11),
+                sourceUpdatedAt = if (c.isNull(12)) null else c.getLong(12)
             )
         }
     }
@@ -253,7 +264,7 @@ object PointSourceStore {
             provenance.modelVersion?.let { put("model_version", it) }
             provenance.profileHash?.let { put("profile_hash", it) }
             provenance.dependencyHash?.let { put("dependency_hash", it) }
-            put("updated_at", System.currentTimeMillis())
+            put("updated_at", provenance.sourceUpdatedAt ?: System.currentTimeMillis())
         }
         db.writableDatabase.insertWithOnConflict(
             "point_sources", null, values, SQLiteDatabase.CONFLICT_REPLACE
@@ -277,7 +288,7 @@ object PointSourceStore {
 
         val existing = db.readableDatabase.rawQuery(
             """
-            SELECT p.temperature, p.humidity, ps.source
+            SELECT p.temperature, p.humidity, ps.source, ps.updated_at
             FROM samples p
             LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
             WHERE p.sensor_id=? AND p.timestamp=? LIMIT 1
@@ -285,7 +296,12 @@ object PointSourceStore {
             arrayOf(sensorId.toString(), timestamp.toString())
         ).use { c ->
             if (!c.moveToFirst()) null
-            else Triple(c.getDouble(0), c.getDouble(1), PointSource.fromDb(if (c.isNull(2)) null else c.getString(2)))
+            else ExistingPriorityPoint(
+                temperature = c.getDouble(0),
+                humidity = c.getDouble(1),
+                source = PointSource.fromDb(if (c.isNull(2)) null else c.getString(2)),
+                sourceUpdatedAt = if (c.isNull(3)) null else c.getLong(3)
+            )
         }
 
         if (existing == null) {
@@ -303,13 +319,22 @@ object PointSourceStore {
             return PriorityWriteResult.INSERTED
         }
 
-        val existingSource = existing.third
+        val existingSource = existing.source
         if (provenance.source.priority < existingSource.priority) {
             return PriorityWriteResult.REJECTED
         }
 
-        val sameValues = kotlin.math.abs(existing.first - temperature) < 0.001 &&
-            kotlin.math.abs(existing.second - humidity) < 0.001
+        // Un export ancien RECONSTRUCTED/FORECAST ne doit jamais faire régresser une
+        // courbe recalculée depuis. MEASURED garde de toute façon la priorité absolue.
+        if (provenance.source == existingSource && provenance.source != PointSource.MEASURED &&
+            provenance.sourceUpdatedAt != null && existing.sourceUpdatedAt != null &&
+            provenance.sourceUpdatedAt < existing.sourceUpdatedAt
+        ) {
+            return PriorityWriteResult.REJECTED
+        }
+
+        val sameValues = kotlin.math.abs(existing.temperature - temperature) < 0.001 &&
+            kotlin.math.abs(existing.humidity - humidity) < 0.001
 
         if (provenance.source.priority == existingSource.priority && sameValues) {
             // La vraie mesure doit quand même effacer une ancienne provenance calculée.

@@ -5,6 +5,8 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -175,6 +177,30 @@ fun ThermalReferenceCard(
     var status by remember { mutableStateOf<ThermalStatus?>(null) }
     var info by remember { mutableStateOf("État thermique prêt") }
     var trainingFeedback by remember { mutableStateOf<String?>(null) }
+    val sensorHistoryExporter = remember { FabDataSourceExporter(context, db) }
+    var pendingHistoryExportSensor by remember { mutableStateOf<Sensor?>(null) }
+    val historyExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        val sensor = pendingHistoryExportSensor
+        pendingHistoryExportSensor = null
+        if (uri != null && sensor != null) {
+            scope.launch {
+                busy = true
+                info = "${sensor.name} · export réel + reconstruit…"
+                val result = withContext(Dispatchers.IO) {
+                    runCatching { sensorHistoryExporter.exportSensorHistory(uri, sensor.id) }
+                }
+                busy = false
+                info = result.fold(
+                    onSuccess = {
+                        "${sensor.name} · exporté : ${it.rows} point(s), dont ${it.reconstructed} reconstruit(s)"
+                    },
+                    onFailure = { "Export impossible : ${it.message ?: "erreur inconnue"}" }
+                )
+            }
+        }
+    }
     LaunchedEffect(busy, info) { onProgressChanged(if (busy) info else null) }
     var weatherHistoryDialog by remember { mutableStateOf(false) }
     var weatherHistoryDays by remember { mutableIntStateOf(30) }
@@ -256,8 +282,17 @@ fun ThermalReferenceCard(
                     suppressNextAuto = true
                     onDataChanged()
                 } else if (next != null) {
-                    continuationWork = next
-                    info = "Mois ${next.nextChunk}/${next.totalChunks} validé · choisir Continuer, Pause ou Annuler"
+                    if (next.stepDays <= 90) {
+                        continuationWork = null
+                        info = "Bloc +${next.stepDays} j · étape ${next.nextChunk}/${next.totalChunks} préparée · suite automatique…"
+                        // Une action utilisateur = au plus 90 jours. Les ~3 sous-morceaux
+                        // ne demandent plus trois confirmations ; le texte de progression
+                        // montre néanmoins clairement que FabData travaille.
+                        scope.launch { processNextHistoryChunk() }
+                    } else {
+                        continuationWork = next
+                        info = "Mois ${next.nextChunk}/${next.totalChunks} validé · choisir Continuer, Pause ou Annuler"
+                    }
                 }
             },
             onFailure = { error ->
@@ -270,21 +305,60 @@ fun ThermalReferenceCard(
         )
     }
 
-    suspend fun beginHistoryWork(days: Int, reason: String) {
+    suspend fun beginHistoryWork(days: Int, reason: String, existingDepthDays: Int = 0) {
         val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
             ?: run { info = "Modèle vide ou à réentraîner"; return }
         val activeId = activeModel.sensorId
         val firstReal = withContext(Dispatchers.IO) { coherenceStore.firstMeasuredTimestamp(activeId) }
             ?: run { info = "Aucune vraie mesure pour initialiser l'historique"; return }
         val boundedDays = days.coerceIn(1, 1464)
-        historyDebtStore.beginWork(reference.key, activeId, boundedDays, firstReal, reason)
+        val existing = existingDepthDays.coerceIn(0, (boundedDays - 1).coerceAtLeast(0))
+        historyDebtStore.beginWork(
+            reference.key, activeId, boundedDays, firstReal, reason, existingDepthDays = existing
+        )
+        val dayMs = 24L * 60L * 60L * 1000L
         historyDebtStore.recordDebt(
             reference.key, activeId,
-            firstReal - boundedDays.toLong() * 24L * 60L * 60L * 1000L,
-            firstReal, reason, HistoricalDebtState.PENDING
+            firstReal - boundedDays.toLong() * dayMs,
+            firstReal - existing.toLong() * dayMs,
+            reason, HistoricalDebtState.PENDING
         )
         refreshDebtState()
         processNextHistoryChunk()
+    }
+
+    /**
+     * L'utilisateur n'engage jamais plus de 90 jours à la fois. Si une tranche
+     * RECONSTRUCTED existe déjà avant la première mesure réelle, on ajoute 90 jours
+     * plus anciens ; sinon on crée la première tranche de 90 jours.
+     */
+    suspend fun beginNext90DayHistory(reason: String) {
+        val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+            ?: run { info = "Modèle vide ou à réentraîner"; return }
+        val firstReal = withContext(Dispatchers.IO) {
+            coherenceStore.firstMeasuredTimestamp(activeModel.sensorId)
+        } ?: run {
+            info = "Aucune vraie mesure pour initialiser l'historique"
+            return
+        }
+        val dayMs = 24L * 60L * 60L * 1000L
+        val existingDepth = withContext(Dispatchers.IO) {
+            val bounds = PointSourceStore.reconstructedBounds(db, activeModel.sensorId)
+            val oldest = bounds?.first?.takeIf { it < firstReal } ?: return@withContext 0
+            (((firstReal - oldest) + dayMs - 1L) / dayMs).toInt().coerceIn(0, 1464)
+        }
+        if (existingDepth >= 1464) {
+            info = "Historique déjà au maximum de 48 mois"
+            return
+        }
+        val added = minOf(90, 1464 - existingDepth)
+        val targetDepth = existingDepth + added
+        info = if (existingDepth == 0) {
+            "Première reconstruction · $added jours · 3 étapes maximum"
+        } else {
+            "Extension de $added jours · profondeur cible ~$targetDepth jours · 3 étapes maximum"
+        }
+        beginHistoryWork(targetDepth, reason, existingDepthDays = existingDepth)
     }
 
 
@@ -974,7 +1048,7 @@ fun ThermalReferenceCard(
                     onClick = { weatherHistoryDialog = true },
                     enabled = !busy && trainedModel != null,
                     modifier = Modifier.weight(1f)
-                ) { Text("Étendre historique") }
+                ) { Text("Étendre historique +90 j") }
                 Button(
                     onClick = { scope.launch { trainPersistedModel() } },
                     enabled = !busy,
@@ -1025,8 +1099,30 @@ fun ThermalReferenceCard(
                     onClick = { historyDialog = true },
                     enabled = !busy && status?.canReconstruct == true,
                     modifier = Modifier.weight(1f)
-                ) { Text("Estimer historique") }
+                ) { Text("Reconstruire +90 j") }
             }
+
+            val exportSensor = status?.preferred?.sensor
+            OutlinedButton(
+                onClick = {
+                    exportSensor?.let { sensor ->
+                        pendingHistoryExportSensor = sensor
+                        val safe = sensor.name
+                            .replace(Regex("[^A-Za-z0-9._-]+"), "_")
+                            .trim('_')
+                            .ifBlank { sensor.stableKey }
+                            .take(72)
+                        historyExportLauncher.launch("FabData_${safe}_historique.csv")
+                    }
+                },
+                enabled = !busy && exportSensor != null,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Exporter cette sonde · réel + reconstruit") }
+            Text(
+                "Le CSV garde le nom ET l'identifiant stable de la sonde d'origine. Les points calculés restent RECONSTRUCTED : une vraie mesure importée plus tard les écrase automatiquement, et un ancien export calculé ne peut pas remplacer une reconstruction plus récente.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
 
             Text(
                 "Garde-fou : apprentissage uniquement sur MEASURED propres. Clim probable, fenêtre, saut brutal ou donnée douteuse restent visibles mais sont exclues de l’apprentissage. Météo + inertie sont obligatoires pour prolonger le passé.",
@@ -1174,27 +1270,15 @@ fun ThermalReferenceCard(
             title = { Text("Étendre l’historique complet ?") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("FabData prépare automatiquement les deux petits loups : météo extérieure + inertie bâtiment, puis reconstruit l’air intérieur sur la même profondeur. Pas de courbe historique intérieure sans inertie.")
-                    Row(
-                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        THERMAL_HISTORY_CHOICES.forEach { choice ->
-                            FilterChip(
-                                selected = weatherHistoryDays == choice.days,
-                                onClick = { weatherHistoryDays = choice.days },
-                                label = { Text(choice.label) }
-                            )
-                        }
-                    }
-                    Text("Sélection : ${thermalHistoryLabel(weatherHistoryDays)} avant la première vraie mesure intérieure.", style = MaterialTheme.typography.bodySmall)
+                    Text("FabData ajoute au maximum 90 jours avant la partie déjà reconstruite. La météo est préparée en trois morceaux d’environ un mois avec progression visible, puis l’app s’arrête. Tu relances +90 j seulement si tu en as envie.")
+                    Text("Les points créés restent RECONSTRUCTED et pourront être raffinés ou remplacés par de vraies mesures.", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
                 Button(onClick = {
                     weatherHistoryDialog = false
-                    scope.launch { beginHistoryWork(weatherHistoryDays, "Extension historique demandée") }
-                }) { Text("Étendre") }
+                    scope.launch { beginNext90DayHistory("Extension historique +90 j demandée") }
+                }) { Text("Ajouter +90 j") }
             },
             dismissButton = { TextButton(onClick = { weatherHistoryDialog = false }) { Text("Annuler") } }
         )
@@ -1240,27 +1324,14 @@ fun ThermalReferenceCard(
             title = { Text("Estimer l'historique thermique ?") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("FabData prolonge ensemble la météo, l’état inertiel du bâtiment puis l’air intérieur. Les paramètres sont appris uniquement sur les mesures réelles propres.")
-                    Text("Choisis une limite maximale :")
-                    Row(
-                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        THERMAL_HISTORY_CHOICES.forEach { choice ->
-                            FilterChip(
-                                selected = historyDays == choice.days,
-                                onClick = { historyDays = choice.days },
-                                label = { Text(choice.label) }
-                            )
-                        }
-                    }
-                    Text("Sélection : ${thermalHistoryLabel(historyDays)} · maximum 48 mois.", style = MaterialTheme.typography.bodySmall)
+                    Text("FabData reconstruit une seule sonde intérieure à la fois. Une action ajoute au maximum 90 jours, préparés en trois morceaux d’environ un mois pour rendre la progression visible.")
+                    Text("Après ces 90 jours, rien ne continue tout seul : utilise à nouveau +90 j si tu veux remonter plus loin.", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
                 Button(onClick = {
                     historyDialog = false
-                    scope.launch { beginHistoryWork(historyDays, "Reconstruction historique demandée") }
+                    scope.launch { beginNext90DayHistory("Reconstruction historique +90 j demandée") }
                 }) { Text("Estimer") }
             },
             dismissButton = { TextButton(onClick = { historyDialog = false }) { Text("Annuler") } }

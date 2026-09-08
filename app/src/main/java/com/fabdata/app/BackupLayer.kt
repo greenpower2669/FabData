@@ -136,7 +136,13 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                                         referenceCity = col(fields, "Reference_Ville").trim().ifBlank { null },
                                         calibrationFrom = col(fields, "Calibration_Debut_ms").trim().toLongOrNull(),
                                         calibrationTo = col(fields, "Calibration_Fin_ms").trim().toLongOrNull(),
-                                        modelVersion = col(fields, "Model_Version").trim().ifBlank { null }
+                                        modelVersion = col(fields, "Model_Version").trim().ifBlank { null },
+                                        referenceKey = col(fields, "Reference_Key").trim().ifBlank { null },
+                                        sigmaC = parseNumber(col(fields, "Sigma_C")),
+                                        analogCount = col(fields, "Analog_Count").trim().toIntOrNull(),
+                                        profileHash = col(fields, "Profile_Hash").trim().ifBlank { null },
+                                        dependencyHash = col(fields, "Dependency_Hash").trim().ifBlank { null },
+                                        sourceUpdatedAt = col(fields, "Source_UpdatedAt_ms").trim().toLongOrNull()
                                     )
                                     val write = PointSourceStore.upsertByPriority(
                                         db, sensor.id, timestamp, temperature, humidity, provenance

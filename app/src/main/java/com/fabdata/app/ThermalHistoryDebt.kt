@@ -27,6 +27,10 @@ data class ThermalHistoryWork(
     val sensorId: Long,
     val requestedDays: Int,
     val firstMeasuredTimestamp: Long,
+    // Profondeur déjà reconstruite au démarrage de CE bloc. Les nouveaux travaux
+    // v0.20.4 ajoutent au maximum 90 jours sans retraiter la préparation météo déjà faite.
+    val existingDepthDays: Int,
+    val stepDays: Int,
     val nextChunk: Int,
     val totalChunks: Int,
     val reason: String,
@@ -35,11 +39,14 @@ data class ThermalHistoryWork(
     val oldestRequestedTimestamp: Long
         get() = firstMeasuredTimestamp - requestedDays.toLong() * HISTORY_DAY_MS
 
+    val newestStepExclusiveTimestamp: Long
+        get() = firstMeasuredTimestamp - existingDepthDays.toLong() * HISTORY_DAY_MS
+
     fun nextRange(): LongRange? {
         if (nextChunk !in 0 until totalChunks) return null
         val start = oldestRequestedTimestamp + nextChunk.toLong() * HISTORY_MONTH_DAYS * HISTORY_DAY_MS
         val endExclusive = minOf(
-            firstMeasuredTimestamp,
+            newestStepExclusiveTimestamp,
             start + HISTORY_MONTH_DAYS.toLong() * HISTORY_DAY_MS
         )
         if (endExclusive <= start) return null
@@ -124,15 +131,20 @@ class ThermalHistoryDebtStore(context: Context) {
         sensorId: Long,
         requestedDays: Int,
         firstMeasuredTimestamp: Long,
-        reason: String
+        reason: String,
+        existingDepthDays: Int = 0
     ): ThermalHistoryWork {
         val days = requestedDays.coerceAtLeast(1)
-        val chunks = ceil(days.toDouble() / HISTORY_MONTH_DAYS.toDouble()).toInt().coerceAtLeast(1)
+        val existing = existingDepthDays.coerceIn(0, (days - 1).coerceAtLeast(0))
+        val step = (days - existing).coerceAtLeast(1)
+        val chunks = ceil(step.toDouble() / HISTORY_MONTH_DAYS.toDouble()).toInt().coerceAtLeast(1)
         val work = ThermalHistoryWork(
             referenceKey = referenceKey,
             sensorId = sensorId,
             requestedDays = days,
             firstMeasuredTimestamp = firstMeasuredTimestamp,
+            existingDepthDays = existing,
+            stepDays = step,
             nextChunk = 0,
             totalChunks = chunks,
             reason = reason,
@@ -148,11 +160,17 @@ class ThermalHistoryDebtStore(context: Context) {
         val first = prefs.getLong("work_first_measured", Long.MIN_VALUE)
         val total = prefs.getInt("work_total_chunks", 0)
         if (requestedDays <= 0 || first == Long.MIN_VALUE || total <= 0) return null
+        val existingDepth = prefs.getInt("work_existing_depth_days", 0)
+            .coerceIn(0, (requestedDays - 1).coerceAtLeast(0))
+        val stepDays = prefs.getInt("work_step_days", (requestedDays - existingDepth).coerceAtLeast(1))
+            .coerceAtLeast(1)
         return ThermalHistoryWork(
             referenceKey = referenceKey,
             sensorId = prefs.getLong("work_sensor", -1L),
             requestedDays = requestedDays,
             firstMeasuredTimestamp = first,
+            existingDepthDays = existingDepth,
+            stepDays = stepDays,
             nextChunk = prefs.getInt("work_next_chunk", 0).coerceIn(0, total),
             totalChunks = total,
             reason = prefs.getString("work_reason", "Extension historique") ?: "Extension historique",
@@ -181,6 +199,8 @@ class ThermalHistoryDebtStore(context: Context) {
             .remove("work_sensor")
             .remove("work_days")
             .remove("work_first_measured")
+            .remove("work_existing_depth_days")
+            .remove("work_step_days")
             .remove("work_next_chunk")
             .remove("work_total_chunks")
             .remove("work_reason")
@@ -194,6 +214,8 @@ class ThermalHistoryDebtStore(context: Context) {
             .putLong("work_sensor", work.sensorId)
             .putInt("work_days", work.requestedDays)
             .putLong("work_first_measured", work.firstMeasuredTimestamp)
+            .putInt("work_existing_depth_days", work.existingDepthDays)
+            .putInt("work_step_days", work.stepDays)
             .putInt("work_next_chunk", work.nextChunk)
             .putInt("work_total_chunks", work.totalChunks)
             .putString("work_reason", work.reason)
