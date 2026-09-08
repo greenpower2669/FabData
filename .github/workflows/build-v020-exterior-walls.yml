@@ -6,6 +6,11 @@ on:
       - 'agent/v0.20-exterior-walls-foundation'
     paths:
       - '.github/workflows/build-v020-exterior-walls.yml'
+      - 'tools/integrate_v020.py'
+      - 'app/src/main/java/com/fabdata/app/ThermalWallConfig.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalWallSolarModel.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalWallSolarService.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalWallSettingsUi.kt'
 
 permissions:
   contents: write
