@@ -1,0 +1,127 @@
+name: Build FabData v0.20.5 weather migration
+
+on:
+  push:
+    branches:
+      - 'agent/v0.20.5-weather-migration-actions'
+    paths:
+      - '.github/workflows/build-v0205-weather-migration.yml'
+      - 'tools/fix_v0205_weather_migration.py'
+      - 'app/src/main/java/com/fabdata/app/WeatherReferenceMigration.kt'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.20.5-weather-migration-actions
+          fetch-depth: 0
+
+      - name: Apply v0.20.5 weather migration fix
+        run: python3 tools/fix_v0205_weather_migration.py
+
+      - name: Diff and regression guard
+        run: |
+          git diff --check
+          git diff --stat
+          python3 tools/fix_v0205_weather_migration.py
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit patched source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+            app/src/main/java/com/fabdata/app/BackupV3Support.kt \
+            app/src/main/java/com/fabdata/app/ThermalUi.kt \
+            app/src/main/java/com/fabdata/app/ThermalEngine.kt
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Persist weather reference history and migration actions"
+            git push origin HEAD:agent/v0.20.5-weather-migration-actions
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.20.5-weather-migration-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.20.5-weather-migration-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.20.5-weather-migration-signing-mode.txt
+          sha256sum artifacts/FabData-v0.20.5-weather-migration-release.apk artifacts/FabData-v0.20.5-weather-migration-release.aab > artifacts/FabData-v0.20.5-weather-migration-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.20.5-weather-migration
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.20.5-weather-migration --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.20.5-weather-migration \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.20.5 weather migration" \
+            --notes "Changement de station météo non destructif : les historiques restent identifiés par station. Après un changement, les 3 actions persistent dans l'UI, y compris après redémarrage : conserver l'ancien historique, effacer l'ancien historique, ou reconstruire la nouvelle météo manuellement par +90 jours du présent vers le passé. L'actualisation météo ordinaire est limitée aux 90 derniers jours. Les courbes intérieures ne sont jamais recalculées par ces actions et gardent l'invariant passé vers présent. Ajout d'un garde de régression CI et sauvegarde v3 des métadonnées de toutes les références météo." \
+            artifacts/FabData-v0.20.5-weather-migration-release.apk \
+            artifacts/FabData-v0.20.5-weather-migration-release.aab \
+            artifacts/FabData-v0.20.5-weather-migration-signing-mode.txt \
+            artifacts/FabData-v0.20.5-weather-migration-sha256.txt
