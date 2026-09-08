@@ -73,7 +73,7 @@ data class ImportResult(
     val lastTimestamp: Long?
 )
 
-class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 5) {
+class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 6) {
     private val appContext = context.applicationContext
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -125,6 +125,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         WeatherReferenceStore.ensure(db)
         ThermalWallConfigStore.ensure(db)
         ThermalWallSolarModelStore.ensure(db)
+        ThermalTrainingPolicyStore.ensure(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -147,6 +148,10 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             // v0.20 : rôles de sondes + pans de mur + modèles solaires, migration additive uniquement.
             ThermalWallConfigStore.ensure(db)
             ThermalWallSolarModelStore.ensure(db)
+        }
+        if (oldVersion < 6) {
+            // v0.20.1 : sélections d’apprentissage séparées inertie / solaire.
+            ThermalTrainingPolicyStore.ensure(db)
         }
     }
 

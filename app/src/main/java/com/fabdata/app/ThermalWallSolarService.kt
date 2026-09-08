@@ -128,6 +128,7 @@ class ThermalWallSolarService(
     private val configStore = ThermalWallConfigStore(db)
     private val modelStore = ThermalWallSolarModelStore(db)
     private val trainer = ThermalWallSolarTrainer()
+    private val trainingPolicyStore = ThermalTrainingPolicyStore(db)
 
     fun train(reference: WeatherReference, wallId: String): WallSolarModel {
         val wall = configStore.wallById(wallId) ?: error("Pan de mur introuvable")
@@ -135,7 +136,8 @@ class ThermalWallSolarService(
             .maxByOrNull { measuredPoints(it.id).size }
             ?: error("Aucune sonde extérieure réelle associée à ${wall.name}")
         val measured = measuredPoints(sensor.id)
-        require(measured.size >= 6) { "Au moins 6 heures réelles sont nécessaires" }
+            .filter { trainingPolicyStore.accepts(ThermalTrainingTarget.SOLAR, it.timestamp) }
+        require(measured.size >= 6) { "Au moins 6 heures réelles sélectionnées sont nécessaires" }
         val from = measured.first().timestamp - 2L * WALL_SERVICE_HOUR_MS
         val to = measured.last().timestamp + WALL_SERVICE_HOUR_MS
         val official = referenceStore.query(reference.key, from, to)

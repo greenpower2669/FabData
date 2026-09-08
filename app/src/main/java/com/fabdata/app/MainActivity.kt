@@ -806,6 +806,30 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 }
                             }
                         },
+                        onTrainingPolicy = { range, target, mode ->
+                            scope.launch {
+                                busy = true
+                                withContext(Dispatchers.IO) {
+                                    ThermalTrainingPolicyStore(db).apply(target, mode, range.first, range.last)
+                                }
+                                if (target == ThermalTrainingTarget.INERTIA || target == ThermalTrainingTarget.BOTH) {
+                                    trainedModelStore.markDirty("Sélection d’apprentissage inertiel modifiée")
+                                }
+                                reloadToken++
+                                busy = false
+                                val targetLabel = when (target) {
+                                    ThermalTrainingTarget.INERTIA -> "inertie / sol"
+                                    ThermalTrainingTarget.SOLAR -> "solaire / mur"
+                                    ThermalTrainingTarget.BOTH -> "inertie + solaire"
+                                }
+                                val modeLabel = when (mode) {
+                                    ThermalTrainingRangeMode.INCLUDE -> "zone utilisée"
+                                    ThermalTrainingRangeMode.EXCLUDE -> "zone exclue"
+                                    ThermalTrainingRangeMode.EXCLUSIVE -> "zone exclusive"
+                                }
+                                snackbar.showSnackbar("$modeLabel · $targetLabel · RAW conservées")
+                            }
+                        },
                         onZoomRange = { range ->
                             val span = (range.last - range.first).coerceAtLeast(60L * 60L * 1000L)
                             val center = range.first + span / 2L
@@ -962,10 +986,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 item {
                     ThermalInertiaExperimentCard(inertiaEstimate)
-                }
-
-                item {
-                    SourceAwareExportCard(db)
                 }
 
                 selectedAnnotation?.let { note ->
@@ -1485,6 +1505,7 @@ private fun HistoryOverviewCard(
     onNavigate: (Long) -> Unit,
     onUseForInertia: (LongRange) -> Unit,
     onExcludeFromInertia: (LongRange) -> Unit,
+    onTrainingPolicy: (LongRange, ThermalTrainingTarget, ThermalTrainingRangeMode) -> Unit,
     onZoomRange: (LongRange) -> Unit
 ) {
     Card(shape = RoundedCornerShape(18.dp)) {
@@ -1912,7 +1933,7 @@ private fun HistoryOverviewCard(
                         ) {
                             pendingRange?.let { selectedRange ->
                                 DropdownMenuItem(
-                                    text = { Text("Utiliser cette zone pour entraîner l'inertie") },
+                                    text = { Text("Utiliser · inertie / sol") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onUseForInertia(selectedRange)
@@ -1921,10 +1942,55 @@ private fun HistoryOverviewCard(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Exclure cette zone du modèle d'inertie") },
+                                    text = { Text("Exclure · inertie / sol") },
                                     onClick = {
                                         rangeMenuOpen = false
                                         onExcludeFromInertia(selectedRange)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Utiliser · solaire / mur") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.SOLAR, ThermalTrainingRangeMode.INCLUDE)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Exclure · solaire / mur") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.SOLAR, ThermalTrainingRangeMode.EXCLUDE)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Exclusivement · inertie / sol") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.INERTIA, ThermalTrainingRangeMode.EXCLUSIVE)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Exclusivement · solaire / mur") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.SOLAR, ThermalTrainingRangeMode.EXCLUSIVE)
+                                        rangeStart = null
+                                        rangeEnd = null
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Exclusivement · les deux moteurs") },
+                                    onClick = {
+                                        rangeMenuOpen = false
+                                        onTrainingPolicy(selectedRange, ThermalTrainingTarget.BOTH, ThermalTrainingRangeMode.EXCLUSIVE)
                                         rangeStart = null
                                         rangeEnd = null
                                     }

@@ -174,6 +174,7 @@ class ThermalEngine(
     private val inertiaEstimator = ThermalInertiaEstimator(db, referenceStore)
     private val coherenceStore = ThermalCoherenceStore(db)
     private val wallConfigStore = ThermalWallConfigStore(db)
+    private val trainingPolicyStore = ThermalTrainingPolicyStore(db)
 
     fun status(reference: WeatherReference, selectedSensorId: Long? = null, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalStatus {
         val candidates = physicalSensors().map { sensor ->
@@ -306,9 +307,23 @@ class ThermalEngine(
         val inertiaMap = inertia.points.associateBy { hourBucket(it.timestamp) }
         val medianDeltas = buildingMedianDeltaByHour(measured.first().timestamp, measured.last().timestamp)
 
+        // User selections are training masks, never data deletion. Legacy inertia
+        // exclusions stay valid; v0.20.1 adds a positive EXCLUSIVE whitelist per engine.
+        val legacyTrainingExclusions = ThermalTrainingMaskStore(db).query(
+            sensor.id, measured.first().timestamp, measured.last().timestamp
+        )
+        val inertiaPolicy = trainingPolicyStore.ranges(ThermalTrainingTarget.INERTIA)
+        fun trainingTimestampAccepted(timestamp: Long): Boolean {
+            if (legacyTrainingExclusions.any { it.contains(timestamp) }) return false
+            if (inertiaPolicy.any { it.mode == ThermalTrainingRangeMode.EXCLUDE && it.contains(timestamp) }) return false
+            val exclusive = inertiaPolicy.filter { it.mode == ThermalTrainingRangeMode.EXCLUSIVE && it.enabled }
+            return exclusive.isEmpty() || exclusive.any { it.contains(timestamp) }
+        }
+
         var best: ThermalModel? = null
         for (lag in 0..12) {
             val rows = buildTrainingRows(measured, outMap, inertiaMap, medianDeltas, lag)
+                .filter { trainingTimestampAccepted(it.timestamp) }
             if (rows.size < 120) continue
             val split = (rows.size * 0.80).toInt().coerceIn(80, rows.size - 24)
             val train = rows.take(split)

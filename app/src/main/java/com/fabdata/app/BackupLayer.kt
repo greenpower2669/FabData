@@ -51,7 +51,7 @@ fun ImportResult.toFabDataImportSummary() = FabDataImportSummary(
  */
 class FabDataBackup(private val context: Context, private val db: FabDataDb) {
     companion object {
-        const val FORMAT_VERSION = "2"
+        const val FORMAT_VERSION = "3"
         const val HEADER = "FabData_Record,Format_Version,Capteur_ID,Capteur,Piece,Couleur,Temps_Epoch_ms,Temps,Temperature_Celsius,Humidite_relative_Pourcentage,Titre,Note,Type,UpdatedAt_Epoch_ms,Source,Confiance,Reference_Station_ID,Reference_Ville,Calibration_Debut_ms,Calibration_Fin_ms,Model_Version"
     }
 
@@ -81,6 +81,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
             var invalid = 0
 
             val records = splitCsvRecords(reader.readText())
+            val v3Support = FabDataBackupV3Support(context, db)
             db.inTransaction {
                 records.forEach { line ->
                     if (line.isBlank()) return@forEach
@@ -88,7 +89,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                         val fields = splitCsv(line, ',')
                         val record = col(fields, "FabData_Record").trim().uppercase(Locale.ROOT)
                         val formatVersion = col(fields, "Format_Version").trim()
-                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", FORMAT_VERSION)) {
+                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", "2", FORMAT_VERSION)) {
                             invalid++
                             return@forEach
                         }
@@ -193,7 +194,12 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                                 // Réservé aux évolutions futures du format.
                             }
 
-                            else -> invalid++
+                            else -> {
+                                val rowMap = header.mapIndexed { i, name ->
+                                    name.trim() to fields.getOrNull(i).orEmpty()
+                                }.toMap()
+                                if (!v3Support.importRecord(record, rowMap)) invalid++
+                            }
                         }
                     } catch (_: Exception) {
                         invalid++
@@ -317,6 +323,8 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                     eventCount++
                 }
             }
+            // v3 state is appended after the ordinary human-readable records.
+            FabDataBackupV3Support(context, db).writeExtraRows(writer)
         }
 
         return FabDataBackupExportResult(sensorCount, measurementCount, eventCount)

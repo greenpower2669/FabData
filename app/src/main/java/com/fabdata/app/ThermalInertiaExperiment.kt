@@ -118,6 +118,7 @@ class ThermalInertiaEstimator(
     private val referenceStore: WeatherReferenceStore
 ) {
     private val wallConfigStore = ThermalWallConfigStore(db)
+    private val trainingPolicyStore = ThermalTrainingPolicyStore(db)
     private var cachedKey: String? = null
     private var cached: ThermalInertiaEstimate? = null
 
@@ -152,7 +153,8 @@ class ThermalInertiaEstimator(
             model.inertiaDeepShare,
             model.inertiaOutsideWeight
         )
-        val exclusions = ThermalTrainingMaskStore(db).query(model.sensorId, from, to)
+        val exclusions = ThermalTrainingMaskStore(db).query(model.sensorId, from, to) +
+            trainingPolicyStore.asExclusions(ThermalTrainingTarget.INERTIA, from, to, model.sensorId)
         val plateau = masks(hours, exclusions).second
         val surface = propagateSurfaceDisplay(
             hours,
@@ -206,7 +208,8 @@ class ThermalInertiaEstimator(
         // Une modification d'une zone utilisateur invalide immédiatement le cache,
         // même si aucune donnée RAW n'a changé.
         val trainingMaskSignature = trainingMaskStore.signature(sensorId)
-        val key = "$measuredRevision|${reference.key}|$weatherSignature|${sensorId ?: -1L}|$includeHistory|$trainingMaskSignature"
+        val trainingPolicySignature = trainingPolicyStore.signature(ThermalTrainingTarget.INERTIA)
+        val key = "$measuredRevision|${reference.key}|$weatherSignature|${sensorId ?: -1L}|$includeHistory|$trainingMaskSignature|$trainingPolicySignature"
         if (key == cachedKey) return cached
 
         val sensors = wallConfigStore.indoorSensors().filter { s ->
@@ -238,7 +241,8 @@ class ThermalInertiaEstimator(
 
         // Le masque utilisateur ne supprime rien : il retire seulement ces heures du fit.
         // La propagation de l'état latent traverse toujours les périodes exclues.
-        val manualExclusions = trainingMaskStore.query(sensor.id, from, to)
+        val manualExclusions = trainingMaskStore.query(sensor.id, from, to) +
+            trainingPolicyStore.asExclusions(ThermalTrainingTarget.INERTIA, from, to, sensor.id)
         val best = search(hours, manualExclusions) ?: fallback(hours, manualExclusions)
         val confidence = confidence(best)
 
