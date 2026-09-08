@@ -34,6 +34,17 @@ class FabDataBackupV3Support(
         WeatherReferenceStore.ensure(db.writableDatabase)
 
         writeJson(writer, "WEATHER_META", weatherMetaJson())
+        WeatherReferenceStore(db).allReferenceMetadata().forEach { meta ->
+            writeJson(writer, "WEATHER_REFERENCE_META", JSONObject().apply {
+                put("key", meta.key)
+                put("city", meta.city)
+                put("stationName", meta.stationName)
+                put("stationId", meta.stationId)
+                put("latitude", meta.latitude)
+                put("longitude", meta.longitude)
+                put("departmentId", meta.departmentId)
+            })
+        }
         writeJson(writer, "THERMAL_PROFILE", profileJson())
         ThermalTrainedModelStore(context).loadAny()?.let { writeJson(writer, "TRAINED_MODEL", trainedModelJson(it)) }
 
@@ -124,6 +135,7 @@ class FabDataBackupV3Support(
         return runCatching {
             when (record) {
                 "WEATHER_META" -> restoreWeatherMeta(json(values))
+                "WEATHER_REFERENCE_META" -> restoreWeatherReferenceMeta(json(values))
                 "THERMAL_PROFILE" -> restoreProfile(json(values))
                 "TRAINED_MODEL" -> restoreTrainedModel(json(values))
                 "WALL" -> restoreWall(json(values))
@@ -226,6 +238,20 @@ class FabDataBackupV3Support(
             departmentId = o.optString("departmentId", "")
         )
         WeatherReferencePrefs(context).select(ref)
+    }
+
+    private fun restoreWeatherReferenceMeta(o: JSONObject) {
+        WeatherReferenceStore(db).rememberReference(
+            WeatherReference(
+                key = o.getString("key"),
+                city = o.getString("city"),
+                stationName = o.getString("stationName"),
+                stationId = o.getString("stationId"),
+                latitude = o.getDouble("latitude"),
+                longitude = o.getDouble("longitude"),
+                departmentId = o.optString("departmentId", "")
+            )
+        )
     }
 
     private fun restoreProfile(o: JSONObject) {

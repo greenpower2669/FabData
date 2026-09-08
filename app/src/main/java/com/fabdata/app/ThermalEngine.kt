@@ -435,6 +435,8 @@ class ThermalEngine(
             }
             val requestedStart = first.timestamp - days.toLong() * THERMAL_DAY_MS
             val startAt = max(requestedStart, refBounds.first)
+            // v0.20.5 anti-régression : une courbe intérieure dépend d'un état thermique
+            // antérieur. Toute reconstruction intérieure est donc FORWARD, passé -> présent.
             if (startAt >= first.timestamp) {
                 skipped++
                 if (diagnostic == null) diagnostic = "${reference.city} ne remonte pas avant la première mesure intérieure."

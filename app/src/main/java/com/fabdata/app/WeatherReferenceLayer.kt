@@ -114,6 +114,18 @@ data class WeatherReferencePoint(
     val confidence: Double = 1.0
 )
 
+data class WeatherReferenceMetadata(
+    val key: String,
+    val city: String,
+    val stationName: String,
+    val stationId: String,
+    val latitude: Double,
+    val longitude: Double,
+    val departmentId: String
+) {
+    fun asReference() = WeatherReference(key, city, stationName, stationId, latitude, longitude, departmentId)
+}
+
 class WeatherReferenceStore(private val db: FabDataDb) {
     init { ensure(db.writableDatabase) }
 
@@ -134,12 +146,77 @@ class WeatherReferenceStore(private val db: FabDataDb) {
                 """.trimIndent()
             )
             sql.execSQL("CREATE INDEX IF NOT EXISTS idx_weather_reference_time ON weather_reference_samples(reference_key, timestamp)")
+            sql.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS weather_reference_meta (
+                    reference_key TEXT PRIMARY KEY,
+                    city TEXT NOT NULL,
+                    station_name TEXT NOT NULL,
+                    station_id TEXT NOT NULL,
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    department_id TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
         }
     }
 
-    /** Une seule référence temporelle reste en cache, conformément au choix utilisateur. */
-    fun keepOnly(referenceKey: String) {
-        db.writableDatabase.delete("weather_reference_samples", "reference_key<>?", arrayOf(referenceKey))
+    /**
+     * v0.20.5 regression invariant: switching weather reference MUST NOT erase another
+     * station's history. Kept for source compatibility with older callers, intentionally no-op.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun keepOnly(referenceKey: String) = Unit
+
+    fun rememberReference(reference: WeatherReference) {
+        val v = ContentValues().apply {
+            put("reference_key", reference.key)
+            put("city", reference.city)
+            put("station_name", reference.stationName)
+            put("station_id", reference.stationId)
+            put("latitude", reference.latitude)
+            put("longitude", reference.longitude)
+            put("department_id", reference.departmentId)
+            put("updated_at", System.currentTimeMillis())
+        }
+        db.writableDatabase.insertWithOnConflict(
+            "weather_reference_meta", null, v, SQLiteDatabase.CONFLICT_REPLACE
+        )
+    }
+
+    fun referenceMetadata(referenceKey: String): WeatherReferenceMetadata? {
+        db.readableDatabase.rawQuery(
+            """
+            SELECT city, station_name, station_id, latitude, longitude, department_id
+            FROM weather_reference_meta WHERE reference_key=? LIMIT 1
+            """.trimIndent(), arrayOf(referenceKey)
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            return WeatherReferenceMetadata(
+                referenceKey, c.getString(0), c.getString(1), c.getString(2),
+                c.getDouble(3), c.getDouble(4), c.getString(5)
+            )
+        }
+    }
+
+    fun allReferenceMetadata(): List<WeatherReferenceMetadata> {
+        val out = mutableListOf<WeatherReferenceMetadata>()
+        db.readableDatabase.rawQuery(
+            """
+            SELECT reference_key, city, station_name, station_id, latitude, longitude, department_id
+            FROM weather_reference_meta ORDER BY updated_at DESC
+            """.trimIndent(), null
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += WeatherReferenceMetadata(
+                    c.getString(0), c.getString(1), c.getString(2), c.getString(3),
+                    c.getDouble(4), c.getDouble(5), c.getString(6)
+                )
+            }
+        }
+        return out
     }
 
     fun upsert(referenceKey: String, point: WeatherReferencePoint) {
@@ -304,6 +381,7 @@ class WeatherReferenceManager(
      * seulement de reconstruction de secours pour obtenir une entrée longue/continue.
      */
     fun refreshSelected(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
+        store.rememberReference(reference)
         store.keepOnly(reference.key)
 
         // v0.13.1 : l'archive Open-Meteo est volontairement arrêtée avant sa zone
@@ -385,6 +463,25 @@ class WeatherReferenceManager(
         return WeatherReferencePreparation(sync, coverage, days)
     }
 
+    /**
+     * Manual weather-history extension. Direction is intentionally PRESENT -> PAST.
+     * Each call adds at most 90 older days and NEVER triggers indoor reconstruction.
+     * Indoor thermal curves keep their opposite invariant: PAST -> PRESENT.
+     */
+    fun extendHistoryBackward(
+        reference: WeatherReference,
+        alreadyLoadedDays: Int,
+        requestedStepDays: Int = 90
+    ): WeatherReferencePreparation {
+        val depth = alreadyLoadedDays.coerceAtLeast(0)
+        val step = requestedStepDays.coerceIn(1, 90)
+        val dayMs = 24L * hourMs
+        val now = roundHour(System.currentTimeMillis())
+        val to = now - depth.toLong() * dayMs
+        val from = to - step.toLong() * dayMs
+        return prepareHistoryRange(reference, from, to)
+    }
+
     fun coverage(referenceKey: String, from: Long, to: Long): WeatherReferenceCoverage {
         val start = roundHour(from)
         val end = roundHour(to)
@@ -440,6 +537,7 @@ class WeatherReferenceManager(
      * appelé au focus puis selon la cadence premier-plan sans relancer une reconstruction historique.
      */
     fun refreshRecent(reference: WeatherReference): WeatherReferenceSyncResult {
+        store.rememberReference(reference)
         store.keepOnly(reference.key)
         val now = System.currentTimeMillis()
         val from = now - 36L * hourMs
@@ -484,6 +582,7 @@ class WeatherReferenceManager(
     }
 
     fun ensureLocalCache(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
+        store.rememberReference(reference)
         store.keepOnly(reference.key)
         val existing = store.query(reference.key, from, to)
         val measured = existing.count { it.source == PointSource.MEASURED }

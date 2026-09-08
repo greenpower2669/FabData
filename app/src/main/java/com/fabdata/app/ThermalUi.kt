@@ -102,6 +102,7 @@ fun ThermalReferenceCard(
     val prefs = remember { WeatherReferencePrefs(context) }
     val profileStore = remember { ThermalProfileStore(context) }
     val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
+    val weatherMigrationStore = remember { WeatherReferenceMigrationStore(context) }
     val trainedModelStore = remember { ThermalTrainedModelStore(context) }
     val modelSensorPrefs = remember {
         context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
@@ -168,6 +169,7 @@ fun ThermalReferenceCard(
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
     val reference = remember(selectedKey) { prefs.selectedReference() }
+    var weatherMigration by remember { mutableStateOf(weatherMigrationStore.load()) }
     var trainedModel by remember { mutableStateOf<ThermalModel?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var stationDiscoveryOpen by remember { mutableStateOf(false) }
@@ -222,12 +224,54 @@ fun ThermalReferenceCard(
     var debtSnapshot by remember { mutableStateOf(historyDebtStore.loadDebt()) }
     var continuationWork by remember { mutableStateOf<ThermalHistoryWork?>(null) }
 
+    fun switchWeatherReference(next: WeatherReference, auto: Boolean) {
+        val previous = reference
+        if (previous.key != next.key) {
+            weatherMigrationStore.recordSwitch(previous, next)
+        }
+        prefs.setAutoProtection(auto)
+        prefs.select(next)
+        selectedKey = next.key
+        weatherMigration = weatherMigrationStore.load()
+    }
+
     LaunchedEffect(selectedKey, selectedSensorId, dataVersion) {
         trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
         status = engine.statusFromTrainedModel(reference, selectedSensorId, trainedModel)
     }
 
     fun refreshDebtState() { debtSnapshot = historyDebtStore.loadDebt() }
+
+    suspend fun extendWeatherBackward90() {
+        val migration = weatherMigrationStore.load()?.takeIf { it.newKey == reference.key }
+            ?: run { info = "Aucun changement de station météo à traiter"; return }
+        if (busy) return
+        busy = true
+        info = "${reference.label} · météo : +90 j vers le passé…"
+        val result = withContext(Dispatchers.IO) {
+            runCatching {
+                manager.extendHistoryBackward(
+                    reference = reference,
+                    alreadyLoadedDays = migration.reconstructedDepthDays,
+                    requestedStepDays = 90
+                )
+            }
+        }
+        busy = false
+        result.fold(
+            onSuccess = { prepared ->
+                weatherMigrationStore.addReconstructedDepth(90)
+                weatherMigration = weatherMigrationStore.load()
+                val depth = weatherMigration?.reconstructedDepthDays ?: 90
+                info = "${reference.label} · météo étendue à ~$depth j vers le passé · couverture ${(prepared.coverage.coverage * 100).toInt()} %"
+                suppressNextAuto = true
+                onDataChanged()
+            },
+            onFailure = { error ->
+                info = error.message ?: "Extension météo 90 j impossible"
+            }
+        )
+    }
 
     suspend fun processNextHistoryChunk() {
         val work = historyDebtStore.loadWork() ?: return
@@ -495,8 +539,13 @@ fun ThermalReferenceCard(
             runCatching {
                 val bounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
                     ?: error("Aucune donnée intérieure")
-                val from = if (allHistory) bounds.first - 90L * 24L * 60L * 60L * 1000L else bounds.first - 18L * 60L * 60L * 1000L
-                val to = maxOf(bounds.last, System.currentTimeMillis() + (forecastMode.maxHours + 2L) * 60L * 60L * 1000L)
+                val now = System.currentTimeMillis()
+                // v0.20.5: "Actualiser météo" no longer dives to the oldest indoor point.
+                // A full click means at most the latest 90 weather days. Older weather is
+                // added only with the explicit +90 j migration action (present -> past).
+                val from = if (allHistory) now - 90L * 24L * 60L * 60L * 1000L
+                    else bounds.first - 18L * 60L * 60L * 1000L
+                val to = maxOf(bounds.last, now + (forecastMode.maxHours + 2L) * 60L * 60L * 1000L)
                 val sync = if (allHistory) manager.refreshSelected(reference, from, to)
                     else manager.ensureLocalCache(reference, from, to)
                 val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
@@ -844,9 +893,7 @@ fun ThermalReferenceCard(
                             DropdownMenuItem(
                                 text = { Text(station.label) },
                                 onClick = {
-                                    prefs.setAutoProtection(false)
-                                    prefs.select(station.key)
-                                    selectedKey = station.key
+                                    switchWeatherReference(station, auto = false)
                                     menuOpen = false
                                 }
                             )
@@ -863,12 +910,89 @@ fun ThermalReferenceCard(
                 ) { Text("Sondes proches · Auto") }
                 TextButton(
                     onClick = {
-                        prefs.setAutoProtection(false)
-                        prefs.select(WeatherReferenceCatalog.DEFAULT_KEY)
-                        selectedKey = WeatherReferenceCatalog.DEFAULT_KEY
+                        switchWeatherReference(
+                            WeatherReferenceCatalog.byKey(WeatherReferenceCatalog.DEFAULT_KEY),
+                            auto = false
+                        )
                     },
                     enabled = !busy
                 ) { Text("Réinitialiser") }
+            }
+
+            weatherMigration?.takeIf { it.newKey == reference.key }?.let { migration ->
+                Card(shape = RoundedCornerShape(14.dp)) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Text("Changement de station météo", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "${migration.oldLabel} → ${migration.newLabel}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            "Les 3 actions restent disponibles ici, même après redémarrage. " +
+                                "Aucune courbe intérieure n'est recalculée automatiquement.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            "⚠ Invariant anti-régression : météo = présent → passé par +90 j ; " +
+                                "thermique intérieur = passé → présent uniquement.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.tertiary
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                weatherMigrationStore.markKeepOld()
+                                weatherMigration = weatherMigrationStore.load()
+                                info = "Ancien historique météo conservé · nouvelle station utilisée en live"
+                            },
+                            enabled = !busy && !migration.oldHistoryDeleted,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (migration.keepOldChosen) "✓ Conserver l'ancien historique" else "Conserver l'ancien historique")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    busy = true
+                                    val result = withContext(Dispatchers.IO) {
+                                        runCatching { manager.store().clear(migration.oldKey) }
+                                    }
+                                    busy = false
+                                    result.fold(
+                                        onSuccess = {
+                                            weatherMigrationStore.markOldDeleted()
+                                            weatherMigration = weatherMigrationStore.load()
+                                            info = "${migration.oldLabel} · ancien historique météo effacé"
+                                            suppressNextAuto = true
+                                            onDataChanged()
+                                        },
+                                        onFailure = { info = it.message ?: "Suppression météo impossible" }
+                                    )
+                                }
+                            },
+                            enabled = !busy && !migration.oldHistoryDeleted,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (migration.oldHistoryDeleted) "✓ Ancien historique effacé" else "Effacer l'ancien historique")
+                        }
+                        Button(
+                            onClick = { scope.launch { extendWeatherBackward90() } },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Reconstruire nouvelle météo · +90 j")
+                        }
+                        Text(
+                            "Profondeur nouvelle station : ~${migration.reconstructedDepthDays} j. " +
+                                "Les courbes intérieures existantes gardent leur station/provenance d'origine tant que tu ne demandes pas leur recalcul.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
 
             debtSnapshot?.let { debt ->
@@ -1094,7 +1218,7 @@ fun ThermalReferenceCard(
                     onClick = { scope.launch { refresh(allHistory = true, triggerChartReload = true) } },
                     enabled = !busy,
                     modifier = Modifier.weight(1f)
-                ) { Text(if (busy) "Chargement…" else "Actualiser référence") }
+                ) { Text(if (busy) "Chargement…" else "Actualiser météo · 90 j") }
                 Button(
                     onClick = { historyDialog = true },
                     enabled = !busy && status?.canReconstruct == true,
@@ -1138,9 +1262,7 @@ fun ThermalReferenceCard(
             credentials = credentials,
             onDismiss = { stationDiscoveryOpen = false },
             onSelect = { station, auto ->
-                prefs.setAutoProtection(auto)
-                prefs.select(station)
-                selectedKey = station.key
+                switchWeatherReference(station, auto)
                 stationDiscoveryOpen = false
             }
         )
