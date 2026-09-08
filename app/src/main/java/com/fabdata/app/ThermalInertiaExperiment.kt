@@ -119,6 +119,7 @@ class ThermalInertiaEstimator(
 ) {
     private val wallConfigStore = ThermalWallConfigStore(db)
     private val trainingPolicyStore = ThermalTrainingPolicyStore(db)
+    private val scopedTrainingPolicyStore = ThermalTrainingScopedPolicyStore(db)
     private var cachedKey: String? = null
     private var cached: ThermalInertiaEstimate? = null
 
@@ -153,8 +154,15 @@ class ThermalInertiaEstimator(
             model.inertiaDeepShare,
             model.inertiaOutsideWeight
         )
-        val exclusions = ThermalTrainingMaskStore(db).query(model.sensorId, from, to) +
+        val scopedSubject = ThermalTrainingSubject.inertia(model.sensorId)
+        val policyExclusions = if (scopedTrainingPolicyStore.hasAny(ThermalTrainingTarget.INERTIA, scopedSubject)) {
+            scopedTrainingPolicyStore.asExclusions(
+                ThermalTrainingTarget.INERTIA, scopedSubject, from, to, model.sensorId
+            )
+        } else {
             trainingPolicyStore.asExclusions(ThermalTrainingTarget.INERTIA, from, to, model.sensorId)
+        }
+        val exclusions = ThermalTrainingMaskStore(db).query(model.sensorId, from, to) + policyExclusions
         val plateau = masks(hours, exclusions).second
         val surface = propagateSurfaceDisplay(
             hours,
@@ -208,7 +216,14 @@ class ThermalInertiaEstimator(
         // Une modification d'une zone utilisateur invalide immédiatement le cache,
         // même si aucune donnée RAW n'a changé.
         val trainingMaskSignature = trainingMaskStore.signature(sensorId)
-        val trainingPolicySignature = trainingPolicyStore.signature(ThermalTrainingTarget.INERTIA)
+        val requestedScopedSubject = sensorId?.let(ThermalTrainingSubject::inertia)
+        val trainingPolicySignature = if (requestedScopedSubject != null &&
+            scopedTrainingPolicyStore.hasAny(ThermalTrainingTarget.INERTIA, requestedScopedSubject)
+        ) {
+            scopedTrainingPolicyStore.signature(ThermalTrainingTarget.INERTIA, requestedScopedSubject)
+        } else {
+            trainingPolicyStore.signature(ThermalTrainingTarget.INERTIA)
+        }
         val key = "$measuredRevision|${reference.key}|$weatherSignature|${sensorId ?: -1L}|$includeHistory|$trainingMaskSignature|$trainingPolicySignature"
         if (key == cachedKey) return cached
 
@@ -241,8 +256,18 @@ class ThermalInertiaEstimator(
 
         // Le masque utilisateur ne supprime rien : il retire seulement ces heures du fit.
         // La propagation de l'état latent traverse toujours les périodes exclues.
-        val manualExclusions = trainingMaskStore.query(sensor.id, from, to) +
+        val selectedScopedSubject = ThermalTrainingSubject.inertia(sensor.id)
+        val selectedPolicyExclusions = if (scopedTrainingPolicyStore.hasAny(
+                ThermalTrainingTarget.INERTIA, selectedScopedSubject
+            )
+        ) {
+            scopedTrainingPolicyStore.asExclusions(
+                ThermalTrainingTarget.INERTIA, selectedScopedSubject, from, to, sensor.id
+            )
+        } else {
             trainingPolicyStore.asExclusions(ThermalTrainingTarget.INERTIA, from, to, sensor.id)
+        }
+        val manualExclusions = trainingMaskStore.query(sensor.id, from, to) + selectedPolicyExclusions
         val best = search(hours, manualExclusions) ?: fallback(hours, manualExclusions)
         val confidence = confidence(best)
 

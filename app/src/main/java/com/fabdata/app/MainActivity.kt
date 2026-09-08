@@ -281,6 +281,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val weatherReferenceManager = remember { WeatherReferenceManager(context, db, lyonLab, meteoCredentials) }
     val inertiaEstimator = remember { ThermalInertiaEstimator(db, weatherReferenceStore) }
     val trainedModelStore = remember { ThermalTrainedModelStore(context) }
+    val trainingTargetPrefs = remember { ThermalTrainingTargetPrefs(context) }
     val inertiaHistoryStore = remember { ThermalInertiaHistoryStore(context, db) }
     val remoteSensorStore = remember { RemoteSensorStore(context) }
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
@@ -808,9 +809,37 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         },
                         onTrainingPolicy = { range, target, mode ->
                             scope.launch {
+                                val inertiaId = trainingTargetPrefs.indoorSensorId()
+                                    ?: inertiaEstimate?.diagnostics?.sourceSensorId
+                                val wallId = trainingTargetPrefs.wallId()
+                                val missing = when (target) {
+                                    ThermalTrainingTarget.INERTIA -> inertiaId == null
+                                    ThermalTrainingTarget.SOLAR -> wallId == null
+                                    ThermalTrainingTarget.BOTH -> inertiaId == null || wallId == null
+                                }
+                                if (missing) {
+                                    snackbar.showSnackbar(
+                                        "Choisis d'abord la sonde sol/inertie et/ou le pan mur dans Modèle à entraîner"
+                                    )
+                                    return@launch
+                                }
                                 busy = true
                                 withContext(Dispatchers.IO) {
-                                    ThermalTrainingPolicyStore(db).apply(target, mode, range.first, range.last)
+                                    val scoped = ThermalTrainingScopedPolicyStore(db)
+                                    if (target == ThermalTrainingTarget.INERTIA || target == ThermalTrainingTarget.BOTH) {
+                                        val id = inertiaId ?: error("Sonde inertielle manquante")
+                                        scoped.apply(
+                                            ThermalTrainingTarget.INERTIA, ThermalTrainingSubject.inertia(id),
+                                            mode, range.first, range.last
+                                        )
+                                    }
+                                    if (target == ThermalTrainingTarget.SOLAR || target == ThermalTrainingTarget.BOTH) {
+                                        val id = wallId ?: error("Pan solaire manquant")
+                                        scoped.apply(
+                                            ThermalTrainingTarget.SOLAR, ThermalTrainingSubject.solar(id),
+                                            mode, range.first, range.last
+                                        )
+                                    }
                                 }
                                 if (target == ThermalTrainingTarget.INERTIA || target == ThermalTrainingTarget.BOTH) {
                                     trainedModelStore.markDirty("Sélection d’apprentissage inertiel modifiée")
@@ -818,9 +847,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 reloadToken++
                                 busy = false
                                 val targetLabel = when (target) {
-                                    ThermalTrainingTarget.INERTIA -> "inertie / sol"
-                                    ThermalTrainingTarget.SOLAR -> "solaire / mur"
-                                    ThermalTrainingTarget.BOTH -> "inertie + solaire"
+                                    ThermalTrainingTarget.INERTIA -> "inertie / sol · sonde ciblée"
+                                    ThermalTrainingTarget.SOLAR -> "solaire / mur · pan ciblé"
+                                    ThermalTrainingTarget.BOTH -> "inertie + solaire · cibles séparées"
                                 }
                                 val modeLabel = when (mode) {
                                     ThermalTrainingRangeMode.INCLUDE -> "zone ajoutée / utilisée"

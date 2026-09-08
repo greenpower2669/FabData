@@ -175,6 +175,7 @@ class ThermalEngine(
     private val coherenceStore = ThermalCoherenceStore(db)
     private val wallConfigStore = ThermalWallConfigStore(db)
     private val trainingPolicyStore = ThermalTrainingPolicyStore(db)
+    private val scopedTrainingPolicyStore = ThermalTrainingScopedPolicyStore(db)
 
     fun status(reference: WeatherReference, selectedSensorId: Long? = null, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalStatus {
         val candidates = physicalSensors().map { sensor ->
@@ -298,10 +299,17 @@ class ThermalEngine(
         val legacyTrainingExclusions = ThermalTrainingMaskStore(db).query(
             sensor.id, measured.first().timestamp, measured.last().timestamp
         )
+        val scopedSubject = ThermalTrainingSubject.inertia(sensor.id)
+        val scopedPolicyActive = scopedTrainingPolicyStore.hasAny(ThermalTrainingTarget.INERTIA, scopedSubject)
         val inertiaPolicy = trainingPolicyStore.ranges(ThermalTrainingTarget.INERTIA)
-        val newPolicyActive = inertiaPolicy.isNotEmpty()
+        val globalPolicyActive = inertiaPolicy.isNotEmpty()
         fun trainingTimestampAccepted(timestamp: Long): Boolean {
-            if (!newPolicyActive && legacyTrainingExclusions.any { it.contains(timestamp) }) return false
+            if (scopedPolicyActive) {
+                return scopedTrainingPolicyStore.accepts(
+                    ThermalTrainingTarget.INERTIA, scopedSubject, timestamp
+                )
+            }
+            if (!globalPolicyActive && legacyTrainingExclusions.any { it.contains(timestamp) }) return false
             if (inertiaPolicy.any { it.mode == ThermalTrainingRangeMode.EXCLUDE && it.contains(timestamp) }) return false
             val exclusive = inertiaPolicy.filter { it.mode == ThermalTrainingRangeMode.EXCLUSIVE && it.enabled }
             return exclusive.isEmpty() || exclusive.any { it.contains(timestamp) }

@@ -85,7 +85,9 @@ private data class ThermalUiRuntime(
     val engine: ThermalEngine,
     val coherenceStore: ThermalCoherenceStore,
     val inertiaHistoryStore: ThermalInertiaHistoryStore,
-    val inertiaHistoryProjector: ThermalInertiaHistoryProjector
+    val inertiaHistoryProjector: ThermalInertiaHistoryProjector,
+    val wallConfig: ThermalWallConfigStore,
+    val wallSolar: ThermalWallSolarService
 )
 
 @Composable
@@ -104,6 +106,7 @@ fun ThermalReferenceCard(
     val historyDebtStore = remember { ThermalHistoryDebtStore(context) }
     val weatherMigrationStore = remember { WeatherReferenceMigrationStore(context) }
     val trainedModelStore = remember { ThermalTrainedModelStore(context) }
+    val trainingTargetPrefs = remember { ThermalTrainingTargetPrefs(context) }
     val modelSensorPrefs = remember {
         context.getSharedPreferences("fabdata_thermal_model", android.content.Context.MODE_PRIVATE)
     }
@@ -124,12 +127,16 @@ fun ThermalReferenceCard(
                 val coherenceStore = ThermalCoherenceStore(db)
                 val inertiaHistoryStore = ThermalInertiaHistoryStore(context, db)
                 val inertiaHistoryProjector = ThermalInertiaHistoryProjector(db, manager.store())
+                val wallConfig = ThermalWallConfigStore(db)
+                val wallSolar = ThermalWallSolarService(db, manager.store())
                 ThermalUiRuntime(
                     manager,
                     engine,
                     coherenceStore,
                     inertiaHistoryStore,
-                    inertiaHistoryProjector
+                    inertiaHistoryProjector,
+                    wallConfig,
+                    wallSolar
                 )
             }
         }
@@ -166,6 +173,8 @@ fun ThermalReferenceCard(
     val coherenceStore = readyRuntime.coherenceStore
     val inertiaHistoryStore = readyRuntime.inertiaHistoryStore
     val inertiaHistoryProjector = readyRuntime.inertiaHistoryProjector
+    val wallConfig = readyRuntime.wallConfig
+    val wallSolar = readyRuntime.wallSolar
 
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
     val reference = remember(selectedKey) { prefs.selectedReference() }
@@ -213,8 +222,16 @@ fun ThermalReferenceCard(
     var inertiaPending by remember { mutableStateOf<ThermalInertiaPendingChunk?>(null) }
     var suppressNextAuto by remember { mutableStateOf(false) }
     var selectedSensorId by remember {
-        mutableStateOf(modelSensorPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L })
+        mutableStateOf(
+            trainingTargetPrefs.indoorSensorId()
+                ?: modelSensorPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
+        )
     }
+    var trainingFocus by remember { mutableStateOf(trainingTargetPrefs.focus()) }
+    var selectedWallId by remember { mutableStateOf(trainingTargetPrefs.wallId()) }
+    var selectedWallSensorId by remember { mutableStateOf(trainingTargetPrefs.wallSensorId()) }
+    var chooseIndoorDialog by remember { mutableStateOf(false) }
+    var trainingTopologyVersion by remember { mutableIntStateOf(0) }
     var profileDialog by remember { mutableStateOf(false) }
     var measuredRevision by remember { mutableStateOf<String?>(null) }
     var coherenceBaselineReady by remember { mutableStateOf(false) }
@@ -235,7 +252,8 @@ fun ThermalReferenceCard(
         weatherMigration = weatherMigrationStore.load()
     }
 
-    LaunchedEffect(selectedKey, selectedSensorId, dataVersion) {
+    LaunchedEffect(selectedKey, selectedSensorId, dataVersion, trainingTopologyVersion) {
+        selectedSensorId?.let(trainingTargetPrefs::setIndoorSensorId)
         trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
         status = engine.statusFromTrainedModel(reference, selectedSensorId, trainedModel)
     }
@@ -624,6 +642,30 @@ fun ThermalReferenceCard(
                 val message = error.message ?: "Entraînement impossible"
                 info = message
                 trainingFeedback = "⚠ $message"
+            }
+        )
+        busy = false
+    }
+
+    suspend fun trainSelectedWallSolar(wallId: String) {
+        if (busy) return
+        busy = true
+        trainingFeedback = "⏳ Apprentissage solaire du pan…"
+        info = "Mur / solaire · préparation des mesures réelles…"
+        val result = withContext(Dispatchers.IO) {
+            runCatching { wallSolar.train(reference, wallId, selectedWallSensorId) }
+        }
+        result.fold(
+            onSuccess = { model ->
+                trainingFeedback = "✓ Mur entraîné · ${model.trainingHours} h · confiance ${(model.confidence * 100).toInt()} %"
+                info = "Mur / solaire entraîné · orientation ${orientationLabel(model.orientationDeg)} · RMSE ${fmt(model.fitRmseC)} °C"
+                trainingTopologyVersion++
+                onDataChanged()
+            },
+            onFailure = { error ->
+                val message = error.message ?: "Apprentissage solaire impossible"
+                trainingFeedback = "⚠ $message"
+                info = message
             }
         )
         busy = false
@@ -1131,10 +1173,139 @@ fun ThermalReferenceCard(
                 onChanged = {
                     trainedModelStore.markDirty("Sondes ou pans extérieurs modifiés")
                     trainedModel = null
+                    trainingTopologyVersion++
                     status = engine.statusFromTrainedModel(reference, selectedSensorId, null)
-                    info = "Configuration thermique modifiée · réentraînement intérieur manuel requis"
+                    info = "Configuration thermique modifiée · réentraînement manuel requis"
                 }
             )
+
+            val targetWalls = remember(trainingTopologyVersion, dataVersion) { wallConfig.walls() }
+            val activeWallId = selectedWallId?.takeIf { id -> targetWalls.any { it.id == id } }
+                ?: targetWalls.firstOrNull()?.id
+            val activeWall = targetWalls.firstOrNull { it.id == activeWallId }
+            val linkedWallSensors = remember(trainingTopologyVersion, activeWallId, dataVersion) {
+                if (activeWallId == null) emptyList() else wallConfig.outdoorSensors().filter { sensor ->
+                    wallConfig.sensorConfig(sensor.id).wallId == activeWallId &&
+                        !sensor.stableKey.startsWith("wall-reconstructed-")
+                }
+            }
+            val activeWallSensorId = selectedWallSensorId?.takeIf { wanted ->
+                linkedWallSensors.any { it.id == wanted }
+            } ?: linkedWallSensors.firstOrNull()?.id
+
+            Card(shape = RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Modèle à entraîner", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Choisis d'abord le modèle puis sa sonde/pan. Les plages d'apprentissage sont mémorisées séparément pour chaque cible.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = trainingFocus == ThermalTrainingFocus.INERTIA,
+                            onClick = {
+                                trainingFocus = ThermalTrainingFocus.INERTIA
+                                trainingTargetPrefs.setFocus(trainingFocus)
+                                trainingFeedback = null
+                            },
+                            label = { Text("Sol / inertie") }
+                        )
+                        FilterChip(
+                            selected = trainingFocus == ThermalTrainingFocus.SOLAR,
+                            onClick = {
+                                trainingFocus = ThermalTrainingFocus.SOLAR
+                                trainingTargetPrefs.setFocus(trainingFocus)
+                                trainingFeedback = null
+                            },
+                            label = { Text("Mur / solaire") }
+                        )
+                    }
+
+                    if (trainingFocus == ThermalTrainingFocus.INERTIA) {
+                        val indoorTargets = status?.sensors?.map { it.sensor }.orEmpty()
+                        if (indoorTargets.isEmpty()) {
+                            Text(
+                                "⚠ Aucune sonde intérieure sélectionnée. Les RAW existent peut-être, mais aucune n'est autorisée à entraîner l'inertie.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        } else {
+                            Text("Sonde intérieure", style = MaterialTheme.typography.labelMedium)
+                            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                indoorTargets.forEach { sensor ->
+                                    FilterChip(
+                                        selected = selectedSensorId == sensor.id,
+                                        onClick = {
+                                            selectedSensorId = sensor.id
+                                            modelSensorPrefs.edit().putLong("selected_sensor_id", sensor.id).apply()
+                                            trainingTargetPrefs.setIndoorSensorId(sensor.id)
+                                            trainingFeedback = null
+                                        },
+                                        label = { Text(sensor.room.ifBlank { sensor.name }) }
+                                    )
+                                }
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = { chooseIndoorDialog = true },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text(if (indoorTargets.isEmpty()) "Choisir / classer une sonde intérieure" else "Changer / classer une sonde") }
+                    } else {
+                        if (targetWalls.isEmpty()) {
+                            Text(
+                                "⚠ Aucun pan de mur configuré. Ajoute d'abord un pan dans Sondes & pans extérieurs.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        } else {
+                            Text("Pan de mur", style = MaterialTheme.typography.labelMedium)
+                            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                targetWalls.forEach { wall ->
+                                    FilterChip(
+                                        selected = activeWallId == wall.id,
+                                        onClick = {
+                                            selectedWallId = wall.id
+                                            selectedWallSensorId = null
+                                            trainingTargetPrefs.setWallId(wall.id)
+                                            trainingTargetPrefs.setWallSensorId(null)
+                                            trainingFeedback = null
+                                        },
+                                        label = { Text(wall.name) }
+                                    )
+                                }
+                            }
+                            if (linkedWallSensors.isEmpty()) {
+                                Text(
+                                    "⚠ ${activeWall?.name ?: "Ce pan"} n'a aucune sonde extérieure réelle associée.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            } else {
+                                Text("Sonde extérieure du pan", style = MaterialTheme.typography.labelMedium)
+                                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    linkedWallSensors.forEach { sensor ->
+                                        FilterChip(
+                                            selected = activeWallSensorId == sensor.id,
+                                            onClick = {
+                                                selectedWallId = activeWallId
+                                                selectedWallSensorId = sensor.id
+                                                activeWallId?.let(trainingTargetPrefs::setWallId)
+                                                trainingTargetPrefs.setWallSensorId(sensor.id)
+                                                trainingFeedback = null
+                                            },
+                                            label = { Text(sensor.name) }
+                                        )
+                                    }
+                                }
+                            }
+                            activeWallId?.let { trainingTargetPrefs.setWallId(it) }
+                            activeWallSensorId?.let { trainingTargetPrefs.setWallSensorId(it) }
+                        }
+                    }
+                }
+            }
 
             Card(shape = RoundedCornerShape(14.dp)) {
                 Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -1159,7 +1330,17 @@ fun ThermalReferenceCard(
                 }
             }
 
-            val trainingRequired = trainedModel == null
+            val selectedWallModel = activeWallId?.let { wallSolar.model(it) }
+            val trainingRequired = if (trainingFocus == ThermalTrainingFocus.INERTIA) {
+                trainedModel == null
+            } else {
+                selectedWallModel == null
+            }
+            val trainingTargetReady = if (trainingFocus == ThermalTrainingFocus.INERTIA) {
+                selectedSensorId != null && status?.sensors?.any { it.sensor.id == selectedSensorId } == true
+            } else {
+                activeWallId != null && linkedWallSensors.isNotEmpty()
+            }
             val blinkTransition = rememberInfiniteTransition(label = "model-training-blink")
             val trainAlpha by blinkTransition.animateFloat(
                 initialValue = 0.45f,
@@ -1174,17 +1355,43 @@ fun ThermalReferenceCard(
                     modifier = Modifier.weight(1f)
                 ) { Text("Étendre historique +90 j") }
                 Button(
-                    onClick = { scope.launch { trainPersistedModel() } },
-                    enabled = !busy,
+                    onClick = {
+                        scope.launch {
+                            if (trainingFocus == ThermalTrainingFocus.INERTIA) {
+                                trainPersistedModel()
+                            } else {
+                                activeWallId?.let { trainSelectedWallSolar(it) }
+                            }
+                        }
+                    },
+                    enabled = !busy && trainingTargetReady,
                     modifier = Modifier.weight(1f).graphicsLayer(alpha = if (trainingRequired) trainAlpha else 1f)
-                ) { Text(if (trainingRequired) "⚠ Entraîner modèle" else "Réentraîner modèle") }
+                ) {
+                    Text(
+                        when {
+                            trainingFocus == ThermalTrainingFocus.INERTIA && trainingRequired -> "⚠ Entraîner sol"
+                            trainingFocus == ThermalTrainingFocus.INERTIA -> "Réentraîner sol"
+                            trainingRequired -> "⚠ Entraîner mur"
+                            else -> "Réentraîner mur"
+                        }
+                    )
+                }
             }
             Text(
-                if (trainingRequired) {
-                    trainedModelStore.dirtyReason()?.let { "Modèle à entraîner · $it" }
-                        ?: "Modèle vide : aucun calcul du passé ne part automatiquement."
+                if (!trainingTargetReady) {
+                    if (trainingFocus == ThermalTrainingFocus.INERTIA)
+                        "Choisis/classifie une sonde intérieure avant l'entraînement."
+                    else "Choisis un pan avec une sonde extérieure associée avant l'entraînement."
+                } else if (trainingFocus == ThermalTrainingFocus.INERTIA) {
+                    if (trainingRequired) {
+                        trainedModelStore.dirtyReason()?.let { "Sol / inertie à entraîner · $it" }
+                            ?: "Sol / inertie vide : aucun calcul du passé ne part automatiquement."
+                    } else {
+                        "Sol / inertie figé : réutilisé jusqu'à un réentraînement explicite."
+                    }
                 } else {
-                    "Modèle figé : réutilisé pour le futur jusqu'à un réentraînement explicite."
+                    if (trainingRequired) "Mur / solaire à entraîner · ${activeWall?.name ?: "pan"}"
+                    else "Mur / solaire entraîné · ${activeWall?.name ?: "pan"} · confiance ${(selectedWallModel?.confidence?.times(100))?.toInt() ?: 0} %"
                 },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1254,6 +1461,67 @@ fun ThermalReferenceCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+    }
+
+    if (chooseIndoorDialog) {
+        val classifiableSensors = remember(trainingTopologyVersion, dataVersion) {
+            db.sensors().filter { sensor ->
+                if (sensor.id < 0L) return@filter false
+                val role = wallConfig.sensorConfig(sensor.id).role
+                role == ThermalSensorRole.INDOOR || role == ThermalSensorRole.UNDEFINED
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { if (!busy) chooseIndoorDialog = false },
+            title = { Text("Choisir la sonde sol / inertie") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (classifiableSensors.isEmpty()) {
+                        Text("Aucune sonde intérieure ou non définie disponible. Les sondes extérieures liées à un mur ne sont jamais proposées ici.")
+                    } else {
+                        classifiableSensors.forEach { sensor ->
+                            val role = wallConfig.sensorConfig(sensor.id).role
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        busy = true
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                if (role == ThermalSensorRole.UNDEFINED) {
+                                                    wallConfig.setSensorRole(sensor.id, ThermalSensorRole.INDOOR)
+                                                }
+                                                sensor.id
+                                            }
+                                        }
+                                        busy = false
+                                        result.fold(
+                                            onSuccess = { id ->
+                                                selectedSensorId = id
+                                                modelSensorPrefs.edit().putLong("selected_sensor_id", id).apply()
+                                                trainingTargetPrefs.setIndoorSensorId(id)
+                                                trainedModelStore.markDirty("Sonde sol / inertie modifiée")
+                                                trainedModel = null
+                                                trainingTopologyVersion++
+                                                chooseIndoorDialog = false
+                                                info = "${sensor.name} · choisie pour sol / inertie"
+                                            },
+                                            onFailure = { info = it.message ?: "Sélection impossible" }
+                                        )
+                                    }
+                                },
+                                enabled = !busy,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text((if (role == ThermalSensorRole.UNDEFINED) "Classer intérieure · " else "Utiliser · ") + sensor.name)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { chooseIndoorDialog = false }, enabled = !busy) { Text("Fermer") }
+            }
+        )
     }
 
     if (stationDiscoveryOpen) {
