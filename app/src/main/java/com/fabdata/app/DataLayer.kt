@@ -73,7 +73,7 @@ data class ImportResult(
     val lastTimestamp: Long?
 )
 
-class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 4) {
+class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null, 5) {
     private val appContext = context.applicationContext
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -123,6 +123,8 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         ensureLyonLabSchema(db)
         PointSourceStore.ensure(db)
         WeatherReferenceStore.ensure(db)
+        ThermalWallConfigStore.ensure(db)
+        ThermalWallSolarModelStore.ensure(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -140,6 +142,11 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             // v0.10 : métadonnées additives uniquement. Les anciennes lignes restent measured par défaut.
             PointSourceStore.ensure(db)
             WeatherReferenceStore.ensure(db)
+        }
+        if (oldVersion < 5) {
+            // v0.20 : rôles de sondes + pans de mur + modèles solaires, migration additive uniquement.
+            ThermalWallConfigStore.ensure(db)
+            ThermalWallSolarModelStore.ensure(db)
         }
     }
 
@@ -305,8 +312,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             SELECT MIN(p.timestamp), MAX(p.timestamp)
             FROM samples p
             JOIN sensors s ON s.id = p.sensor_id
-            WHERE s.stable_key NOT LIKE 'meteo-%'
-              AND s.stable_key NOT LIKE 'http-get-%'
+            WHERE s.id IN (SELECT sensor_id FROM sensor_thermal_config WHERE role='INDOOR')
             """.trimIndent(), null
         ).use { c ->
             if (!c.moveToFirst() || c.isNull(0) || c.isNull(1)) return null
@@ -323,8 +329,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             FROM samples p
             JOIN sensors s ON s.id = p.sensor_id
             LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
-            WHERE s.stable_key NOT LIKE 'meteo-%'
-              AND s.stable_key NOT LIKE 'http-get-%'
+            WHERE s.id IN (SELECT sensor_id FROM sensor_thermal_config WHERE role='INDOOR')
               AND (ps.source IS NULL OR ps.source='measured')
             """.trimIndent(), null
         ).use { c ->
@@ -348,8 +353,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
             FROM samples p
             JOIN sensors s ON s.id = p.sensor_id
             LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
-            WHERE s.stable_key NOT LIKE 'meteo-%'
-              AND s.stable_key NOT LIKE 'http-get-%'
+            WHERE s.id IN (SELECT sensor_id FROM sensor_thermal_config WHERE role='INDOOR')
               AND (ps.source IS NULL OR ps.source='measured')
             """.trimIndent(), null
         ).use { c ->

@@ -921,6 +921,18 @@ fun ThermalReferenceCard(
                 }
             }
 
+            ThermalWallSettingsCard(
+                db = db,
+                reference = reference,
+                enabled = !busy,
+                onChanged = {
+                    trainedModelStore.markDirty("Sondes ou pans extérieurs modifiés")
+                    trainedModel = null
+                    status = engine.statusFromTrainedModel(reference, selectedSensorId, null)
+                    info = "Configuration thermique modifiée · réentraînement intérieur manuel requis"
+                }
+            )
+
             Card(shape = RoundedCornerShape(14.dp)) {
                 Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
                     Text("Prévision adaptative", fontWeight = FontWeight.SemiBold)

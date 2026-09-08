@@ -115,10 +115,10 @@ class ThermalCoherenceStore(private val db: FabDataDb) {
             SELECT DISTINCT ps.sensor_id
             FROM point_sources ps
             JOIN sensors s ON s.id=ps.sensor_id
+            JOIN sensor_thermal_config tc ON tc.sensor_id=s.id
             WHERE ps.source IN ('reconstructed','forecast')
               AND ps.sensor_id>=0
-              AND s.stable_key NOT LIKE 'meteo-%'
-              AND s.stable_key NOT LIKE 'http-get-%'
+              AND tc.role='INDOOR'
             ORDER BY ps.sensor_id
             """.trimIndent(), null
         ).use { c -> while (c.moveToNext()) out += c.getLong(0) }

@@ -117,6 +117,7 @@ class ThermalInertiaEstimator(
     private val db: FabDataDb,
     private val referenceStore: WeatherReferenceStore
 ) {
+    private val wallConfigStore = ThermalWallConfigStore(db)
     private var cachedKey: String? = null
     private var cached: ThermalInertiaEstimate? = null
 
@@ -208,9 +209,8 @@ class ThermalInertiaEstimator(
         val key = "$measuredRevision|${reference.key}|$weatherSignature|${sensorId ?: -1L}|$includeHistory|$trainingMaskSignature"
         if (key == cachedKey) return cached
 
-        val sensors = db.sensors().filter { s ->
-            (sensorId == null || s.id == sensorId) &&
-                s.id >= 0L && !s.stableKey.startsWith("meteo-") && !s.stableKey.startsWith("http-get-")
+        val sensors = wallConfigStore.indoorSensors().filter { s ->
+            sensorId == null || s.id == sensorId
         }
         val measuredBySensor = sensors.mapNotNull { sensor ->
             val pts = measuredHourly(sensor.id)

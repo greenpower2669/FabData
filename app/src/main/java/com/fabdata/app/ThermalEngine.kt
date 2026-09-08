@@ -173,6 +173,7 @@ class ThermalEngine(
     private val zone = ZoneId.of("Europe/Paris")
     private val inertiaEstimator = ThermalInertiaEstimator(db, referenceStore)
     private val coherenceStore = ThermalCoherenceStore(db)
+    private val wallConfigStore = ThermalWallConfigStore(db)
 
     fun status(reference: WeatherReference, selectedSensorId: Long? = null, profile: ThermalBuildingProfile = ThermalBuildingProfile()): ThermalStatus {
         val candidates = physicalSensors().map { sensor ->
@@ -1350,9 +1351,7 @@ class ThermalEngine(
         }
     }
 
-    private fun physicalSensors(): List<Sensor> = db.sensors().filter { s ->
-        !s.stableKey.startsWith("meteo-") && !s.stableKey.startsWith("http-get-") && s.id >= 0L
-    }
+    private fun physicalSensors(): List<Sensor> = wallConfigStore.indoorSensors()
 
     private fun distinctDays(points: List<HourPoint>): Int = points.map {
         Instant.ofEpochMilli(it.timestamp).atZone(zone).toLocalDate()
