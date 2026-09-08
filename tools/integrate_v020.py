@@ -132,14 +132,10 @@ def main():
         t = t.replace(forecast_anchor, wall_card, 1)
     ui.write_text(t)
 
-    # Missing extension import in standalone Compose UI.
+    # Compose exposes Modifier.weight from the Row/Column scope here; importing the
+    # internal parent-data property explicitly breaks compilation on this Compose version.
     wall_ui = Path('app/src/main/java/com/fabdata/app/ThermalWallSettingsUi.kt')
-    t = wall_ui.read_text()
-    if 'import androidx.compose.foundation.layout.weight\n' not in t:
-        t = t.replace(
-            'import androidx.compose.foundation.layout.size\n',
-            'import androidx.compose.foundation.layout.size\nimport androidx.compose.foundation.layout.weight\n'
-        )
+    t = wall_ui.read_text().replace('import androidx.compose.foundation.layout.weight\n', '')
     wall_ui.write_text(t)
 
     assert 'wallConfigStore.indoorSensors()' in engine.read_text()
