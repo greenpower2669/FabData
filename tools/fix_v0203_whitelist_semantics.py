@@ -97,6 +97,31 @@ def main():
     policy.write_text(t)
 
     # ------------------------------------------------------------------
+    # ThermalEngine: as soon as the new v0.20.x policy has at least one INERTIA row,
+    # it becomes authoritative. Legacy per-sensor exclusions are kept only for old
+    # databases that have never used the new policy. This prevents an old exclusion
+    # from silently punching a hole inside a newly selected whitelist zone.
+    # ------------------------------------------------------------------
+    engine = Path('app/src/main/java/com/fabdata/app/ThermalEngine.kt')
+    t = engine.read_text()
+    t = replace_once(
+        t,
+        '''        val inertiaPolicy = trainingPolicyStore.ranges(ThermalTrainingTarget.INERTIA)
+        fun trainingTimestampAccepted(timestamp: Long): Boolean {
+            if (legacyTrainingExclusions.any { it.contains(timestamp) }) return false
+            if (inertiaPolicy.any { it.mode == ThermalTrainingRangeMode.EXCLUDE && it.contains(timestamp) }) return false
+''',
+        '''        val inertiaPolicy = trainingPolicyStore.ranges(ThermalTrainingTarget.INERTIA)
+        val newPolicyActive = inertiaPolicy.isNotEmpty()
+        fun trainingTimestampAccepted(timestamp: Long): Boolean {
+            if (!newPolicyActive && legacyTrainingExclusions.any { it.contains(timestamp) }) return false
+            if (inertiaPolicy.any { it.mode == ThermalTrainingRangeMode.EXCLUDE && it.contains(timestamp) }) return false
+''',
+        'legacy mask precedence'
+    )
+    engine.write_text(t)
+
+    # ------------------------------------------------------------------
     # UI wording + unify inertia actions on the new engine-specific policy store.
     # There is only one dragged range at a time. Repeating the gesture is how the user
     # adds another allowed zone after starting the whitelist mode.
