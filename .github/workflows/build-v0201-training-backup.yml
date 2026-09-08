@@ -1,0 +1,129 @@
+name: Build FabData v0.20.1 training backup APK
+
+on:
+  push:
+    branches:
+      - 'agent/v0.20.1-training-backup-fix'
+    paths:
+      - '.github/workflows/build-v0201-training-backup.yml'
+      - 'tools/integrate_v0201.py'
+      - 'app/src/main/java/com/fabdata/app/ThermalTrainingPolicy.kt'
+      - 'app/src/main/java/com/fabdata/app/BackupV3Support.kt'
+      - 'app/src/main/java/com/fabdata/app/BackupLayer.kt'
+      - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalEngine.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalInertiaExperiment.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalWallSolarService.kt'
+      - 'app/src/main/java/com/fabdata/app/DataLayer.kt'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.20.1-training-backup-fix
+          fetch-depth: 0
+
+      - name: Integrate v0.20.1 source
+        run: python3 tools/integrate_v0201.py
+
+      - name: Diff guard
+        run: |
+          git diff --check
+          git diff --stat
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit integrated source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/fabdata/app
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Integrate v0.20.1 exact backup and per-engine training selections"
+            git push origin HEAD:agent/v0.20.1-training-backup-fix
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.20.1-training-backup-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.20.1-training-backup-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.20.1-training-backup-signing-mode.txt
+          sha256sum artifacts/FabData-v0.20.1-training-backup-release.apk artifacts/FabData-v0.20.1-training-backup-release.aab > artifacts/FabData-v0.20.1-training-backup-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.20.1-training-backup
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.20.1-training-backup --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.20.1-training-backup \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.20.1 training + backup fix" \
+            --notes "Sauvegarde v3 unique et restaurable : données, météo de référence exacte, profil bâtiment, pans/orientations, modèle inertiel, modèles solaires et sélections d'apprentissage. Le menu de sélection ajoute Utiliser/Exclure pour solaire et le troisième choix Exclusivement pour inertie, solaire ou les deux. Les RAW restent prioritaires et intouchables." \
+            artifacts/FabData-v0.20.1-training-backup-release.apk \
+            artifacts/FabData-v0.20.1-training-backup-release.aab \
+            artifacts/FabData-v0.20.1-training-backup-signing-mode.txt \
+            artifacts/FabData-v0.20.1-training-backup-sha256.txt
