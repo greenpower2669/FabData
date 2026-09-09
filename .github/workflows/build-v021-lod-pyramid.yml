@@ -7,7 +7,7 @@ on:
     paths:
       - '.github/workflows/build-v021-lod-pyramid.yml'
       - 'tools/fix_v021_lod_pyramid.py'
-      - 'tools/fix_v021_lod_compile_guards.py'
+      - 'tools/fix_v021_mainactivity_safe.py'
 
 permissions:
   contents: write
@@ -35,18 +35,21 @@ jobs:
           )
           p.write_text(s, encoding='utf-8')
           PY
+          # First patch the data/SQL/live layers. The original integration also touched
+          # MainActivity too broadly, so restore ONLY that file and apply the scoped patch.
           python3 tools/fix_v021_lod_pyramid.py
-          python3 tools/fix_v021_lod_compile_guards.py
+          git checkout HEAD -- app/src/main/java/com/fabdata/app/MainActivity.kt
+          python3 tools/fix_v021_mainactivity_safe.py
 
       - name: Regression diagnostics
         run: |
-          git diff --check || true
+          git diff --check
           echo '--- LOD symbols ---'
-          grep -n 'fun querySamplesLod' app/src/main/java/com/fabdata/app/DataLayer.kt || true
-          grep -n 'fun queryLod' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt || true
-          grep -n 'fun queryLod' app/src/main/java/com/fabdata/app/ThermalInertiaHistory.kt || true
-          grep -n 'Navigation giga\|Courbes du bandeau\|gigaOverviewSamples\|navigatorOverviewSamples\|explorationOverviewSamples' app/src/main/java/com/fabdata/app/MainActivity.kt || true
-          grep -n 'CancellationException' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt || true
+          grep -n 'fun querySamplesLod' app/src/main/java/com/fabdata/app/DataLayer.kt
+          grep -n 'fun queryLod' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'fun queryLod' app/src/main/java/com/fabdata/app/ThermalInertiaHistory.kt
+          grep -n 'Navigation giga\|Courbes des bandeaux\|gigaOverviewSamples\|navigatorOverviewSamples\|explorationOverviewSamples' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'CancellationException' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
           grep -n 'versionName = "0.21.0"' app/build.gradle.kts
 
       - name: Set up JDK 17
@@ -139,7 +142,7 @@ jobs:
           gh release create v0.21.0-lod-pyramid \
             --target "$TARGET_SHA" \
             --title "FabData v0.21.0 LOD pyramid" \
-            --notes "Nouvelle pyramide de navigation conçue pour alléger FabData : bandeau giga mensuel -> navigation intermédiaire journalière -> exploration 6 h -> graphe détaillé. Les agrégats sont calculés directement dans SQLite avant chargement en mémoire. Le bandeau d'exploration propose désormais 1 semaine, 1 mois, 3 mois puis les périodes longues. L'utilisateur choisit les courbes visibles dans les bandeaux ; par défaut FabData privilégie la température intérieure reconstruite et le sol inertiel quand ils existent. Les gros trous restent des trous. Les annulations normales de coroutine Compose ne sont plus affichées comme erreurs. Effets visuels v0.20.9, sauvegarde V4, sélection d'entraînement et historique météo continu sont conservés." \
+            --notes "Nouvelle pyramide de navigation conçue pour alléger FabData : bandeau giga mensuel -> navigation journalière -> exploration 6 h -> graphe détaillé. Les agrégats sont calculés directement dans SQLite avant chargement en mémoire. Le bandeau d'exploration propose désormais 1 semaine, 1 mois, 3 mois puis les périodes longues. L'utilisateur choisit les courbes visibles dans les bandeaux ; par défaut FabData privilégie la sonde intérieure cible et le sol inertiel quand ils existent. Les gros trous restent des trous. Les annulations normales de coroutine Compose ne sont plus affichées comme erreurs. Effets visuels v0.20.9, sauvegarde V4, sélection d'entraînement et historique météo continu sont conservés." \
             artifacts/FabData-v0.21.0-lod-pyramid-release.apk \
             artifacts/FabData-v0.21.0-lod-pyramid-release.aab \
             artifacts/FabData-v0.21.0-lod-pyramid-signing-mode.txt \
