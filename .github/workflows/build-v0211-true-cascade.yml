@@ -1,0 +1,136 @@
+name: Build FabData v0.21.1 true cascade
+
+on:
+  push:
+    branches:
+      - 'agent/v0.21-lod-pyramid'
+    paths:
+      - '.github/workflows/build-v0211-true-cascade.yml'
+      - 'tools/fix_v0211_cascade.py'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.21-lod-pyramid
+          fetch-depth: 0
+
+      - name: Apply true cascade
+        run: |
+          python3 tools/fix_v0211_cascade.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('versionName = "0.21.0"', 'versionName = "0.21.1"')
+          p.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Regression diagnostics
+        run: |
+          git diff --check
+          echo '--- true cascade markers ---'
+          grep -n 'True cascade' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'physicalLod(wideRange' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'physicalLod(exploreRange' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'withInertiaLod(navigatorOverview, wideRange' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'withInertiaLod(explorationOverview, exploreRange' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Giga global → zoom large → sélection → détail RAW' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'versionName = "0.21.1"' app/build.gradle.kts
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit integrated source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Make LOD navigation truly cascading"
+            git push origin HEAD:agent/v0.21-lod-pyramid
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.21.1-true-cascade-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.21.1-true-cascade-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.21.1-true-cascade-signing-mode.txt
+          sha256sum artifacts/FabData-v0.21.1-true-cascade-release.apk artifacts/FabData-v0.21.1-true-cascade-release.aab > artifacts/FabData-v0.21.1-true-cascade-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.21.1-true-cascade
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.21.1-true-cascade --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.21.1-true-cascade \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.21.1 True cascade" \
+            --notes "Corrige la pyramide LOD pour appliquer réellement la cascade : seul le giga-bandeau mensuel parcourt tout l'historique ; le bandeau zoom large journalier ne requête que la fenêtre choisie dans le giga ; le bandeau de sélection 6 h ne requête que la fenêtre choisie dans le zoom large ; le graphe détaillé reste limité à sa petite fenêtre RAW. Le sol inertiel suit exactement les mêmes bornes. Les fenêtres giga et exploration sont désormais indépendantes. Conservation de la sauvegarde V4, de l'historique météo continu, des effets visuels et du traitement normal des annulations Compose." \
+            artifacts/FabData-v0.21.1-true-cascade-release.apk \
+            artifacts/FabData-v0.21.1-true-cascade-release.aab \
+            artifacts/FabData-v0.21.1-true-cascade-signing-mode.txt \
+            artifacts/FabData-v0.21.1-true-cascade-sha256.txt
