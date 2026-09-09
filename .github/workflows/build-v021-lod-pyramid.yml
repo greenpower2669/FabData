@@ -25,6 +25,16 @@ jobs:
 
       - name: Apply v0.21 LOD pyramid
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tools/fix_v021_lod_pyramid.py')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace(
+              "t = replace_once(t, old, new, 'overview hint')",
+              "t = t.replace(old, new, 1) if old in t else t"
+          )
+          p.write_text(s, encoding='utf-8')
+          PY
           python3 tools/fix_v021_lod_pyramid.py
           python3 tools/fix_v021_lod_compile_guards.py
 
