@@ -330,6 +330,58 @@ class WeatherReferenceStore(private val db: FabDataDb) {
         }
     }
 
+    /**
+     * Portion réellement continue de la météo en remontant depuis le présent.
+     *
+     * On raisonne par heures distinctes (une station peut contenir plusieurs mesures
+     * dans la même heure). Jusqu'à 3 heures manquantes isolées sont tolérées, comme
+     * dans WeatherReferenceCoverage.ready. En revanche un îlot ancien séparé par un
+     * gros trou n'allonge JAMAIS artificiellement la profondeur.
+     */
+    fun continuousHistoryRange(
+        referenceKey: String,
+        now: Long = System.currentTimeMillis(),
+        maxMissingHours: Int = 3,
+        recentToleranceHours: Int = 36
+    ): LongRange? {
+        val hourMs = 60L * 60L * 1000L
+        val nowHour = (now / hourMs) * hourMs
+        val hours = ArrayList<Long>()
+        var previousHour: Long? = null
+        db.readableDatabase.rawQuery(
+            "SELECT timestamp FROM weather_reference_samples WHERE reference_key=? AND source<>'forecast' ORDER BY timestamp DESC",
+            arrayOf(referenceKey)
+        ).use { c ->
+            while (c.moveToNext()) {
+                val hour = (c.getLong(0) / hourMs) * hourMs
+                if (hour != previousHour) {
+                    hours += hour
+                    previousHour = hour
+                }
+            }
+        }
+        if (hours.isEmpty()) return null
+        val newest = hours.first()
+        if (nowHour - newest > recentToleranceHours.toLong() * hourMs) return null
+
+        var oldest = newest
+        val maximumStepHours = maxMissingHours.coerceAtLeast(0) + 1L
+        for (index in 1 until hours.size) {
+            val candidate = hours[index]
+            val stepHours = ((oldest - candidate) / hourMs).coerceAtLeast(0L)
+            if (stepHours > maximumStepHours) break
+            oldest = candidate
+        }
+        return oldest..newest
+    }
+
+    fun continuousHistoryDepthDays(referenceKey: String, now: Long = System.currentTimeMillis()): Int {
+        val range = continuousHistoryRange(referenceKey, now) ?: return 0
+        val dayMs = 24L * 60L * 60L * 1000L
+        val nowHour = (now / (60L * 60L * 1000L)) * (60L * 60L * 1000L)
+        return ((nowHour - range.first).coerceAtLeast(0L) / dayMs).toInt().coerceAtMost(3650)
+    }
+
     fun clear(referenceKey: String) {
         db.writableDatabase.delete("weather_reference_samples", "reference_key=?", arrayOf(referenceKey))
     }
@@ -358,7 +410,9 @@ data class WeatherReferenceCoverage(
 data class WeatherReferencePreparation(
     val sync: WeatherReferenceSyncResult,
     val coverage: WeatherReferenceCoverage,
-    val days: Int
+    val days: Int,
+    /** Profondeur réellement continue depuis le présent, jamais un compteur de clics. */
+    val continuousDepthDays: Int = 0
 )
 
 class WeatherReferenceManager(
@@ -470,17 +524,26 @@ class WeatherReferenceManager(
      */
     fun extendHistoryBackward(
         reference: WeatherReference,
-        alreadyLoadedDays: Int,
         requestedStepDays: Int = 90
     ): WeatherReferencePreparation {
-        val depth = alreadyLoadedDays.coerceAtLeast(0)
         val step = requestedStepDays.coerceIn(1, 90)
         val dayMs = 24L * hourMs
         val now = roundHour(System.currentTimeMillis())
-        val to = now - depth.toLong() * dayMs
+
+        // v0.20.9 anti-trou : le curseur n'est plus reconstructedDepthDays.
+        // Il part du bord le plus ancien de la portion réellement CONTINUE.
+        // Les îlots plus vieux sont conservés mais ignorés jusqu'à ce que le raccord
+        // soit effectivement rempli.
+        val contiguous = store.continuousHistoryRange(reference.key, now)
+        val to = contiguous?.first ?: now
         val from = to - step.toLong() * dayMs
-        return prepareHistoryRange(reference, from, to)
+        val prepared = prepareHistoryRange(reference, from, to)
+        val actualDepth = store.continuousHistoryDepthDays(reference.key, now)
+        return prepared.copy(continuousDepthDays = actualDepth)
     }
+
+    fun continuousHistoryDepthDays(referenceKey: String): Int =
+        store.continuousHistoryDepthDays(referenceKey)
 
     fun coverage(referenceKey: String, from: Long, to: Long): WeatherReferenceCoverage {
         val start = roundHour(from)

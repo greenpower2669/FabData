@@ -85,8 +85,14 @@ class WeatherReferenceMigrationStore(context: Context) {
     fun addReconstructedDepth(days: Int) {
         val current = load() ?: return
         val next = (current.reconstructedDepthDays + days.coerceAtLeast(0)).coerceAtMost(3650)
+        setReconstructedDepth(next)
+    }
+
+    /** v0.20.9 : cette valeur est un cache de la profondeur CONTINUE réellement observée. */
+    fun setReconstructedDepth(days: Int) {
+        if (load() == null) return
         prefs.edit()
-            .putInt("reconstructed_depth_days", next)
+            .putInt("reconstructed_depth_days", days.coerceIn(0, 3650))
             .putLong("last_action_at", System.currentTimeMillis())
             .apply()
     }

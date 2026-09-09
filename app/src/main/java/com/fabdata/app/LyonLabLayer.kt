@@ -47,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
@@ -118,6 +119,11 @@ data class CurveVisualPrefs(
     val styleB: String = "BASE",
     val auraA: String = "NONE",
     val auraB: String = "NONE",
+    /** Troisième couche : particules/objets animés autour de la courbe. */
+    val effectA: String = "NONE",
+    val effectB: String = "NONE",
+    val effectDensity: Float = 0.45f,
+    val effectOrbit: Float = 0.55f,
     val opacity: Float = 1f
 )
 
@@ -663,6 +669,10 @@ class CurveStyleStore(context: Context) {
         styleB = prefs.getString("$key.styleB", "BASE") ?: "BASE",
         auraA = prefs.getString("$key.auraA", "NONE") ?: "NONE",
         auraB = prefs.getString("$key.auraB", "NONE") ?: "NONE",
+        effectA = prefs.getString("$key.effectA", "NONE") ?: "NONE",
+        effectB = prefs.getString("$key.effectB", "NONE") ?: "NONE",
+        effectDensity = prefs.getFloat("$key.effectDensity", 0.45f).coerceIn(0.08f, 1f),
+        effectOrbit = prefs.getFloat("$key.effectOrbit", 0.55f).coerceIn(0f, 1f),
         opacity = prefs.getFloat("$key.opacity", 1f).coerceIn(0f, 1f)
     )
 
@@ -672,16 +682,28 @@ class CurveStyleStore(context: Context) {
             .putString("$key.styleB", value.styleB)
             .putString("$key.auraA", value.auraA)
             .putString("$key.auraB", value.auraB)
+            .putString("$key.effectA", value.effectA)
+            .putString("$key.effectB", value.effectB)
+            .putFloat("$key.effectDensity", value.effectDensity.coerceIn(0.08f, 1f))
+            .putFloat("$key.effectOrbit", value.effectOrbit.coerceIn(0f, 1f))
             .putFloat("$key.opacity", value.opacity.coerceIn(0f, 1f))
             .apply()
     }
 }
 
 private val STYLE_OPTIONS = listOf(
-    "BASE", "RED", "ORANGE", "YELLOW", "GREEN", "CYAN", "BLUE", "PURPLE",
-    "RAINBOW", "IRIDESCENT", "NONE"
+    "BASE", "RED", "ORANGE", "YELLOW", "GREEN", "LIME", "MINT", "CYAN", "TEAL",
+    "BLUE", "INDIGO", "PURPLE", "MAGENTA", "PINK", "CORAL", "GOLD", "BROWN", "SLATE",
+    "RAINBOW", "IRIDESCENT", "RANDOM_COLOR", "NONE"
 )
-private val AURA_OPTIONS = listOf("NONE", "SUN", "SHADOW", "ICE", "NATURE")
+private val AURA_OPTIONS = listOf(
+    "NONE", "SUN", "SHADOW", "ICE", "NATURE", "FIRE", "NEON", "MAGIC", "SMOKE", "ROSE"
+)
+private val EFFECT_OPTIONS = listOf(
+    "NONE", "SPARKLE", "FIREWORKS", "FLY", "DRIP", "SMOKE", "FISH", "BIRD",
+    "ORBIT", "COMET", "BUBBLES", "FIREFLY", "BUTTERFLY", "RAIN", "PLANET", "RANDOM"
+)
+private val RANDOM_EFFECT_POOL = EFFECT_OPTIONS.filterNot { it == "NONE" || it == "RANDOM" }
 
 fun resolveCurveColor(base: Color, prefs: CurveVisualPrefs, tickMs: Long, position: Float = 0f): Color? {
     val useB = prefs.styleA != prefs.styleB && ((tickMs / 2200L) % 2L == 1L)
@@ -694,9 +716,19 @@ fun resolveCurveColor(base: Color, prefs: CurveVisualPrefs, tickMs: Long, positi
         style == "ORANGE" -> Color(0xFFFB8C00).copy(alpha = alpha)
         style == "YELLOW" -> Color(0xFFFDD835).copy(alpha = alpha)
         style == "GREEN" -> Color(0xFF43A047).copy(alpha = alpha)
+        style == "LIME" -> Color(0xFFC0CA33).copy(alpha = alpha)
+        style == "MINT" -> Color(0xFF00BFA5).copy(alpha = alpha)
         style == "CYAN" -> Color(0xFF00ACC1).copy(alpha = alpha)
+        style == "TEAL" -> Color(0xFF00897B).copy(alpha = alpha)
         style == "BLUE" -> Color(0xFF1E88E5).copy(alpha = alpha)
+        style == "INDIGO" -> Color(0xFF3949AB).copy(alpha = alpha)
         style == "PURPLE" -> Color(0xFF8E24AA).copy(alpha = alpha)
+        style == "MAGENTA" -> Color(0xFFD81B60).copy(alpha = alpha)
+        style == "PINK" -> Color(0xFFF06292).copy(alpha = alpha)
+        style == "CORAL" -> Color(0xFFFF7043).copy(alpha = alpha)
+        style == "GOLD" -> Color(0xFFFFB300).copy(alpha = alpha)
+        style == "BROWN" -> Color(0xFF8D6E63).copy(alpha = alpha)
+        style == "SLATE" -> Color(0xFF546E7A).copy(alpha = alpha)
         style == "RAINBOW" -> {
             val hue = ((tickMs / 25L + (position * 360f).toLong()) % 360L).toFloat()
             Color.hsv(hue, 0.90f, 0.95f, alpha)
@@ -704,6 +736,11 @@ fun resolveCurveColor(base: Color, prefs: CurveVisualPrefs, tickMs: Long, positi
         style == "IRIDESCENT" -> {
             val hue = ((tickMs / 45L + (position * 160f).toLong()) % 360L).toFloat()
             Color.hsv(hue, 0.42f, 1f, alpha)
+        }
+        style == "RANDOM_COLOR" -> {
+            val seed = ((tickMs / 4200L) * 97L + (position * 1000f).toLong())
+            val hue = ((seed % 360L) + 360L).toFloat() % 360f
+            Color.hsv(hue, 0.78f, 0.96f, alpha)
         }
         style.startsWith("CUSTOM:") -> {
             runCatching { Color(AndroidColor.parseColor(style.removePrefix("CUSTOM:"))) }.getOrDefault(base).copy(alpha = alpha)
@@ -719,7 +756,159 @@ fun resolveAuraColor(prefs: CurveVisualPrefs, tickMs: Long): Color? {
         "SHADOW" -> Color.Black.copy(alpha = 0.18f * prefs.opacity)
         "ICE" -> Color(0xFF80DEEA).copy(alpha = 0.25f * prefs.opacity)
         "NATURE" -> Color(0xFF66BB6A).copy(alpha = 0.23f * prefs.opacity)
+        "FIRE" -> Color(0xFFFF5722).copy(alpha = 0.27f * prefs.opacity)
+        "NEON" -> Color(0xFF00E5FF).copy(alpha = 0.30f * prefs.opacity)
+        "MAGIC" -> Color(0xFFB388FF).copy(alpha = 0.29f * prefs.opacity)
+        "SMOKE" -> Color(0xFF78909C).copy(alpha = 0.20f * prefs.opacity)
+        "ROSE" -> Color(0xFFF48FB1).copy(alpha = 0.26f * prefs.opacity)
         else -> null
+    }
+}
+
+fun resolveCurveEffect(prefs: CurveVisualPrefs, tickMs: Long, seed: Int): String {
+    val useB = prefs.effectA != prefs.effectB && ((tickMs / 3300L) % 2L == 1L)
+    val raw = if (useB) prefs.effectB else prefs.effectA
+    if (raw != "RANDOM" || RANDOM_EFFECT_POOL.isEmpty()) return raw
+    val slot = tickMs / 5200L
+    val index = kotlin.math.abs((slot + seed.toLong() * 31L) % RANDOM_EFFECT_POOL.size.toLong()).toInt()
+    return RANDOM_EFFECT_POOL[index]
+}
+
+/**
+ * Décor procédural ultra-léger : aucun bitmap, aucun objet persistant, aucune incidence
+ * sur les données. Les positions sont déterministes à partir de la courbe + tick.
+ */
+fun DrawScope.drawCurveDecorations(
+    points: List<Offset>,
+    prefs: CurveVisualPrefs,
+    baseColor: Color,
+    tickMs: Long,
+    seed: Int
+) {
+    if (points.isEmpty() || prefs.opacity <= 0f) return
+    val effect = resolveCurveEffect(prefs, tickMs, seed)
+    if (effect == "NONE") return
+
+    val density = prefs.effectDensity.coerceIn(0.08f, 1f)
+    val wanted = (5f + density * 23f).toInt().coerceIn(4, 28)
+    val stride = (points.size / wanted).coerceAtLeast(1)
+    val selected = points.filterIndexed { index, _ -> index % stride == 0 }.take(wanted)
+    val orbit = (2.5f + 13f * prefs.effectOrbit.coerceIn(0f, 1f)).dp.toPx()
+    val time = tickMs / 1000.0
+    val alpha = (0.28f + 0.62f * prefs.opacity).coerceIn(0.18f, 0.92f)
+
+    fun orbited(p: Offset, index: Int, speed: Double = 2.0): Offset {
+        val phase = time * speed + index * 1.73 + seed * 0.117
+        return Offset(
+            p.x + kotlin.math.cos(phase).toFloat() * orbit,
+            p.y + kotlin.math.sin(phase).toFloat() * orbit
+        )
+    }
+
+    when (effect) {
+        "SPARKLE" -> selected.forEachIndexed { i, p ->
+            val q = orbited(p, i, 2.8)
+            val pulse = (0.45 + 0.55 * kotlin.math.abs(kotlin.math.sin(time * 4.0 + i))).toFloat()
+            val r = (1.4f + pulse * 3.2f).dp.toPx()
+            val c = baseColor.copy(alpha = alpha * pulse)
+            drawLine(c, Offset(q.x - r, q.y), Offset(q.x + r, q.y), 1.2.dp.toPx())
+            drawLine(c, Offset(q.x, q.y - r), Offset(q.x, q.y + r), 1.2.dp.toPx())
+            drawLine(c.copy(alpha = c.alpha * 0.75f), Offset(q.x - r * .65f, q.y - r * .65f), Offset(q.x + r * .65f, q.y + r * .65f), .8.dp.toPx())
+        }
+        "FIREWORKS" -> selected.filterIndexed { i, _ -> i % 5 == 0 }.forEachIndexed { i, p ->
+            val phase = ((tickMs + i * 211L) % 1500L) / 1500f
+            val radius = (3f + phase * 15f).dp.toPx()
+            val c = baseColor.copy(alpha = alpha * (1f - phase).coerceAtLeast(.15f))
+            repeat(8) { ray ->
+                val a = ray * Math.PI / 4.0
+                val end = Offset(p.x + kotlin.math.cos(a).toFloat() * radius, p.y + kotlin.math.sin(a).toFloat() * radius)
+                drawLine(c, p, end, 1.dp.toPx())
+            }
+        }
+        "FLY" -> selected.filterIndexed { i, _ -> i % 3 == 0 }.forEachIndexed { i, p ->
+            val q = orbited(p, i, 4.7)
+            val body = Color(0xFF263238).copy(alpha = alpha)
+            drawCircle(body, 1.9.dp.toPx(), q)
+            drawCircle(baseColor.copy(alpha = alpha * .45f), 2.2.dp.toPx(), Offset(q.x - 2.dp.toPx(), q.y - 1.4.dp.toPx()))
+            drawCircle(baseColor.copy(alpha = alpha * .45f), 2.2.dp.toPx(), Offset(q.x + 2.dp.toPx(), q.y - 1.4.dp.toPx()))
+        }
+        "DRIP" -> selected.filterIndexed { i, _ -> i % 2 == 0 }.forEachIndexed { i, p ->
+            val fall = ((tickMs / 12L + i * 17L) % 26L).toFloat().dp.toPx()
+            val q = Offset(p.x, p.y + 3.dp.toPx() + fall)
+            val c = baseColor.copy(alpha = alpha * (1f - fall / 40.dp.toPx()).coerceIn(.25f, 1f))
+            drawLine(c.copy(alpha = c.alpha * .55f), p, q, .9.dp.toPx())
+            drawCircle(c, 2.1.dp.toPx(), q)
+        }
+        "SMOKE" -> selected.filterIndexed { i, _ -> i % 2 == 0 }.forEachIndexed { i, p ->
+            val rise = ((tickMs / 30L + i * 11L) % 22L).toFloat().dp.toPx()
+            val q = Offset(p.x + kotlin.math.sin(time * 1.3 + i).toFloat() * 5.dp.toPx(), p.y - rise)
+            val smoke = Color(0xFF78909C).copy(alpha = alpha * .20f)
+            drawCircle(smoke, (4f + i % 3 * 1.5f).dp.toPx(), q)
+            drawCircle(smoke.copy(alpha = smoke.alpha * .7f), (2.5f + i % 2).dp.toPx(), Offset(q.x + 4.dp.toPx(), q.y - 3.dp.toPx()))
+        }
+        "FISH" -> selected.filterIndexed { i, _ -> i % 4 == 0 }.forEachIndexed { i, p ->
+            val q = orbited(p, i, 1.35)
+            val c = baseColor.copy(alpha = alpha)
+            val bodyR = 3.2.dp.toPx()
+            drawCircle(c, bodyR, q)
+            val tailX = q.x - 6.dp.toPx()
+            drawLine(c, Offset(q.x - bodyR, q.y), Offset(tailX, q.y - 3.dp.toPx()), 1.4.dp.toPx())
+            drawLine(c, Offset(q.x - bodyR, q.y), Offset(tailX, q.y + 3.dp.toPx()), 1.4.dp.toPx())
+            drawCircle(Color.White.copy(alpha = .9f), .8.dp.toPx(), Offset(q.x + 1.7.dp.toPx(), q.y - .8.dp.toPx()))
+        }
+        "BIRD" -> selected.filterIndexed { i, _ -> i % 4 == 0 }.forEachIndexed { i, p ->
+            val q = orbited(Offset(p.x, p.y - 5.dp.toPx()), i, 1.8)
+            val wing = (3.5f + 1.8f * kotlin.math.abs(kotlin.math.sin(time * 5 + i)).toFloat()).dp.toPx()
+            val c = baseColor.copy(alpha = alpha)
+            drawLine(c, Offset(q.x - wing, q.y), q, 1.4.dp.toPx())
+            drawLine(c, q, Offset(q.x + wing, q.y), 1.4.dp.toPx())
+            drawLine(c, Offset(q.x - wing, q.y), Offset(q.x - wing * .45f, q.y - 2.dp.toPx()), 1.dp.toPx())
+            drawLine(c, Offset(q.x + wing, q.y), Offset(q.x + wing * .45f, q.y - 2.dp.toPx()), 1.dp.toPx())
+        }
+        "ORBIT" -> selected.forEachIndexed { i, p ->
+            val q = orbited(p, i, 2.2)
+            drawCircle(baseColor.copy(alpha = alpha * .22f), orbit, p, style = Stroke(width = .55.dp.toPx()))
+            drawCircle(baseColor.copy(alpha = alpha), 1.8.dp.toPx(), q)
+        }
+        "COMET" -> selected.filterIndexed { i, _ -> i % 3 == 0 }.forEachIndexed { i, p ->
+            val q = orbited(p, i, 2.5)
+            val phase = time * 2.5 + i
+            val tail = Offset(q.x - kotlin.math.cos(phase).toFloat() * 10.dp.toPx(), q.y - kotlin.math.sin(phase).toFloat() * 10.dp.toPx())
+            drawLine(baseColor.copy(alpha = alpha * .45f), tail, q, 2.dp.toPx())
+            drawCircle(Color.White.copy(alpha = alpha), 2.1.dp.toPx(), q)
+        }
+        "BUBBLES" -> selected.forEachIndexed { i, p ->
+            val rise = ((tickMs / 25L + i * 13L) % 28L).toFloat().dp.toPx()
+            val q = Offset(p.x + kotlin.math.sin(time + i).toFloat() * orbit * .45f, p.y - rise)
+            drawCircle(baseColor.copy(alpha = alpha * .48f), (2.4f + i % 3).dp.toPx(), q, style = Stroke(width = .9.dp.toPx()))
+        }
+        "FIREFLY" -> selected.forEachIndexed { i, p ->
+            val q = orbited(p, i, 3.1)
+            val pulse = (0.45 + 0.55 * kotlin.math.abs(kotlin.math.sin(time * 3.7 + i))).toFloat()
+            drawCircle(Color(0xFFFFF176).copy(alpha = alpha * .18f * pulse), 6.dp.toPx(), q)
+            drawCircle(Color(0xFFFFEB3B).copy(alpha = alpha * pulse), 1.6.dp.toPx(), q)
+        }
+        "BUTTERFLY" -> selected.filterIndexed { i, _ -> i % 4 == 0 }.forEachIndexed { i, p ->
+            val q = orbited(p, i, 2.7)
+            val flap = (2.2f + 2f * kotlin.math.abs(kotlin.math.sin(time * 6 + i)).toFloat()).dp.toPx()
+            val wing = baseColor.copy(alpha = alpha * .58f)
+            drawCircle(wing, flap, Offset(q.x - flap * .8f, q.y))
+            drawCircle(wing, flap, Offset(q.x + flap * .8f, q.y))
+            drawLine(Color(0xFF37474F).copy(alpha = alpha), Offset(q.x, q.y - 2.dp.toPx()), Offset(q.x, q.y + 2.dp.toPx()), 1.dp.toPx())
+        }
+        "RAIN" -> selected.forEachIndexed { i, p ->
+            val fall = ((tickMs / 10L + i * 19L) % 24L).toFloat().dp.toPx()
+            val q = Offset(p.x + (i % 3 - 1) * 3.dp.toPx(), p.y + fall)
+            val c = Color(0xFF42A5F5).copy(alpha = alpha * .55f)
+            drawLine(c, Offset(q.x, q.y - 5.dp.toPx()), q, 1.dp.toPx())
+        }
+        "PLANET" -> selected.filterIndexed { i, _ -> i % 5 == 0 }.forEachIndexed { i, p ->
+            val q = orbited(p, i, .9)
+            val c = baseColor.copy(alpha = alpha)
+            drawCircle(c, 3.1.dp.toPx(), q)
+            drawCircle(c.copy(alpha = alpha * .55f), 5.5.dp.toPx(), q, style = Stroke(width = .8.dp.toPx()))
+            drawLine(c.copy(alpha = alpha * .55f), Offset(q.x - 6.dp.toPx(), q.y + 1.dp.toPx()), Offset(q.x + 6.dp.toPx(), q.y - 1.dp.toPx()), .8.dp.toPx())
+        }
     }
 }
 
@@ -740,16 +929,46 @@ fun CurveStyleDialog(
         "ORANGE" -> "Orange"
         "YELLOW" -> "Jaune"
         "GREEN" -> "Vert"
+        "LIME" -> "Citron"
+        "MINT" -> "Menthe"
         "CYAN" -> "Cyan"
+        "TEAL" -> "Sarcelle"
         "BLUE" -> "Bleu"
+        "INDIGO" -> "Indigo"
         "PURPLE" -> "Violet"
+        "MAGENTA" -> "Magenta"
+        "PINK" -> "Rose"
+        "CORAL" -> "Corail"
+        "GOLD" -> "Or"
+        "BROWN" -> "Brun"
+        "SLATE" -> "Ardoise"
         "RAINBOW" -> "Arc-en-ciel"
         "IRIDESCENT" -> "Iridescence"
-        "NONE" -> "Pas de couleur"
+        "RANDOM_COLOR" -> "Couleur aléatoire"
+        "NONE" -> "Aucun / aucune"
         "SUN" -> "Soleil"
         "SHADOW" -> "Ombre"
         "ICE" -> "Glace"
         "NATURE" -> "Nature"
+        "FIRE" -> "Feu"
+        "NEON" -> "Néon"
+        "MAGIC" -> "Magique"
+        "SMOKE" -> "Fumée"
+        "ROSE" -> "Halo rose"
+        "SPARKLE" -> "Étincelles"
+        "FIREWORKS" -> "Feu d’artifice"
+        "FLY" -> "Mouches"
+        "DRIP" -> "Goutte à goutte"
+        "FISH" -> "Poissons"
+        "BIRD" -> "Oiseaux"
+        "ORBIT" -> "Orbites"
+        "COMET" -> "Comètes"
+        "BUBBLES" -> "Bulles"
+        "FIREFLY" -> "Lucioles"
+        "BUTTERFLY" -> "Papillons"
+        "RAIN" -> "Pluie"
+        "PLANET" -> "Planètes"
+        "RANDOM" -> "Surprise aléatoire"
         else -> if (v.startsWith("CUSTOM:")) "Personnalisée ${v.removePrefix("CUSTOM:")}" else v
     }
 
@@ -772,6 +991,13 @@ fun CurveStyleDialog(
                 }
                 StyleCarousel("Aura A", display(value.auraA)) { value = value.copy(auraA = next(value.auraA, AURA_OPTIONS)) }
                 StyleCarousel("Aura B", display(value.auraB)) { value = value.copy(auraB = next(value.auraB, AURA_OPTIONS)) }
+                Text("Effets vivants · troisième couche", fontWeight = FontWeight.Bold)
+                StyleCarousel("Effet A", display(value.effectA)) { value = value.copy(effectA = next(value.effectA, EFFECT_OPTIONS)) }
+                StyleCarousel("Effet B", display(value.effectB)) { value = value.copy(effectB = next(value.effectB, EFFECT_OPTIONS)) }
+                Text("Densité effet : ${(value.effectDensity * 100).toInt()} %")
+                Slider(value = value.effectDensity, onValueChange = { value = value.copy(effectDensity = it) }, valueRange = 0.08f..1f)
+                Text("Orbite autour de la courbe : ${(value.effectOrbit * 100).toInt()} %")
+                Slider(value = value.effectOrbit, onValueChange = { value = value.copy(effectOrbit = it) }, valueRange = 0f..1f)
                 Text("Opacité : ${(value.opacity * 100).toInt()} %")
                 Slider(value = value.opacity, onValueChange = { value = value.copy(opacity = it) }, valueRange = 0f..1f)
             }
@@ -803,7 +1029,7 @@ fun CurvePersonalizationCard(
         Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Text("Personnalisation des courbes", fontWeight = FontWeight.Bold)
             Text(
-                "Style A/B · Aura A/B · Opacité, indépendants pour chaque courbe.",
+                "Couleur A/B · Aura A/B · Effet vivant A/B (orbites, étincelles, feu d’artifice, mouches, gouttes, fumée, poissons, oiseaux…) · Opacité.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

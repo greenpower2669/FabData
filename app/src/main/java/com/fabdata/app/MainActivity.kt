@@ -243,14 +243,10 @@ private class FabPrefs(context: Context) {
 }
 
 private val palette = listOf(
-    Color(0xFF1769AA),
-    Color(0xFFD1495B),
-    Color(0xFF2A9D8F),
-    Color(0xFFE08E0B),
-    Color(0xFF6A4C93),
-    Color(0xFF0081A7),
-    Color(0xFFB56576),
-    Color(0xFF588157)
+    Color(0xFF1769AA), Color(0xFFD1495B), Color(0xFF2A9D8F), Color(0xFFE08E0B),
+    Color(0xFF6A4C93), Color(0xFF0081A7), Color(0xFFB56576), Color(0xFF588157),
+    Color(0xFF9C27B0), Color(0xFFE91E63), Color(0xFF00BFA5), Color(0xFFC0CA33),
+    Color(0xFFFF7043), Color(0xFF3949AB), Color(0xFF8D6E63), Color(0xFF546E7A)
 )
 
 private data class LoadedData(
@@ -1907,12 +1903,23 @@ private fun HistoryOverviewCard(
                             if (points.size >= 2) {
                                 val sensor = sensors.firstOrNull { it.id == sensorId } ?: return@forEach
                                 val path = Path()
-                                points.forEachIndexed { index, point ->
+                                var previous: SamplePoint? = null
+                                val navigatorGapLimit = maxOf(
+                                    12L * 60L * 60L * 1000L,
+                                    fullSpan / 120L
+                                )
+                                points.forEach { point ->
                                     val x = (((point.timestamp - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
                                         .coerceIn(0f, size.width)
                                     val y = size.height - (((point.temperature - navigatorMin) / navigatorTempRange)
                                         .toFloat() * size.height)
-                                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                                    val weatherCurve = sensor.stableKey == LyonWeatherSync.STABLE_KEY ||
+                                        sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID
+                                    val breakHere = weatherCurve && previous?.let {
+                                        point.timestamp - it.timestamp > navigatorGapLimit
+                                    } == true
+                                    if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                                    previous = point
                                 }
                                 drawPath(
                                     path,
@@ -2089,7 +2096,9 @@ private fun HistoryOverviewCard(
                                         .toFloat() * size.width
                                     val y = size.height - (((point.temperature - minTemp) / tempRange)
                                         .toFloat() * size.height)
-                                    val breakHere = sensor.stableKey == LyonWeatherSync.STABLE_KEY &&
+                                    val weatherCurve = sensor.stableKey == LyonWeatherSync.STABLE_KEY ||
+                                        sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID
+                                    val breakHere = weatherCurve &&
                                         previous?.let { point.timestamp - it.timestamp > previewGapLimit } == true
                                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                                     previous = point
@@ -2736,6 +2745,24 @@ private fun InteractiveChart(
                         val alpha = when (p.source) { PointSource.MEASURED -> 1f; PointSource.RECONSTRUCTED -> 0.78f; PointSource.FORECAST -> 0.60f }
                         drawCircle(color.copy(alpha = color.alpha * alpha), 2.2.dp.toPx(), Offset(mapX(p.timestamp), mapTemp(p.temperature)))
                     }
+                }
+
+                // v0.20.9 : troisième couche de personnalisation, indépendante de
+                // la couleur et de l'aura. Elle reste volontairement légère : au plus
+                // quelques dizaines de particules, même sur plusieurs années de data.
+                if (visual.effectA != "NONE" || visual.effectB != "NONE") {
+                    val effectStride = (points.size / 36).coerceAtLeast(1)
+                    val effectPoints = points
+                        .filterIndexed { index, _ -> index % effectStride == 0 }
+                        .take(40)
+                        .map { Offset(mapX(it.timestamp), mapTemp(it.temperature)) }
+                    drawCurveDecorations(
+                        points = effectPoints,
+                        prefs = visual,
+                        baseColor = if (color.alpha > 0f) color else baseColor.copy(alpha = visual.opacity),
+                        tickMs = styleTick,
+                        seed = sensor.id.toInt()
+                    )
                 }
 
                 // Nuage d'incertitude : +σ, -σ, +σ... Les marqueurs deviennent

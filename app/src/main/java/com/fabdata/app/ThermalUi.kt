@@ -179,6 +179,22 @@ fun ThermalReferenceCard(
     var selectedKey by remember { mutableStateOf(prefs.selectedKey()) }
     val reference = remember(selectedKey) { prefs.selectedReference() }
     var weatherMigration by remember { mutableStateOf(weatherMigrationStore.load()) }
+
+    // Répare aussi les anciens compteurs v0.20.5-v0.20.8 au premier affichage :
+    // la profondeur affichée devient la profondeur réellement continue de la station.
+    LaunchedEffect(reference.key, dataVersion) {
+        val pending = weatherMigrationStore.load()?.takeIf { it.newKey == reference.key }
+        if (pending != null) {
+            val actual = withContext(Dispatchers.IO) {
+                manager.continuousHistoryDepthDays(reference.key)
+            }
+            if (actual != pending.reconstructedDepthDays) {
+                weatherMigrationStore.setReconstructedDepth(actual)
+                weatherMigration = weatherMigrationStore.load()
+            }
+        }
+    }
+
     var trainedModel by remember { mutableStateOf<ThermalModel?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
     var stationDiscoveryOpen by remember { mutableStateOf(false) }
@@ -281,7 +297,6 @@ fun ThermalReferenceCard(
             runCatching {
                 manager.extendHistoryBackward(
                     reference = reference,
-                    alreadyLoadedDays = migration.reconstructedDepthDays,
                     requestedStepDays = 90
                 )
             }
@@ -289,10 +304,15 @@ fun ThermalReferenceCard(
         busy = false
         result.fold(
             onSuccess = { prepared ->
-                weatherMigrationStore.addReconstructedDepth(90)
+                val depth = prepared.continuousDepthDays
+                weatherMigrationStore.setReconstructedDepth(depth)
                 weatherMigration = weatherMigrationStore.load()
-                val depth = weatherMigration?.reconstructedDepthDays ?: 90
-                info = "${reference.label} · météo étendue à ~$depth j vers le passé · couverture ${(prepared.coverage.coverage * 100).toInt()} %"
+                val coveragePct = (prepared.coverage.coverage * 100).toInt()
+                info = if (prepared.coverage.ready) {
+                    "${reference.label} · profondeur continue ~$depth j · bloc $coveragePct %"
+                } else {
+                    "${reference.label} · bloc incomplet ($coveragePct %) · profondeur continue ~$depth j · le prochain +90 j reprend au premier trou"
+                }
                 suppressNextAuto = true
                 onDataChanged()
                 FabOperationRegistry.finish(operationId, info)
@@ -1125,7 +1145,7 @@ fun ThermalReferenceCard(
                             Text("Reconstruire nouvelle météo · +90 j")
                         }
                         Text(
-                            "Profondeur nouvelle station : ~${migration.reconstructedDepthDays} j. " +
+                            "Profondeur CONTINUE nouvelle station : ~${migration.reconstructedDepthDays} j. " +
                                 "Les courbes intérieures existantes gardent leur station/provenance d'origine tant que tu ne demandes pas leur recalcul.",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant

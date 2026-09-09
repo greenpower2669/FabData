@@ -180,7 +180,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
 
         val nextColor = readableDatabase.rawQuery("SELECT COUNT(*) FROM sensors", null).use { c ->
             c.moveToFirst()
-            c.getInt(0) % 8
+            c.getInt(0) % 16
         }
         val values = ContentValues().apply {
             put("stable_key", stableKey)
@@ -297,7 +297,7 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         val values = ContentValues().apply {
             put("name", name.trim().ifBlank { "Capteur" })
             put("room", room.trim().ifBlank { name.trim().ifBlank { "Pièce" } })
-            put("color_index", colorIndex.coerceIn(0, 7))
+            put("color_index", colorIndex.coerceIn(0, 15))
         }
         writableDatabase.update("sensors", values, "id = ?", arrayOf(id.toString()))
     }
