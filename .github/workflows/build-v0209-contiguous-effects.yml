@@ -31,7 +31,7 @@ jobs:
           grep -q 'fun continuousHistoryRange' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
           grep -q 'continuousDepthDays = actualDepth' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
           ! grep -q 'alreadyLoadedDays = migration.reconstructedDepthDays' app/src/main/java/com/fabdata/app/ThermalUi.kt
-          grep -q 'setReconstructedDepth(prepared.continuousDepthDays)' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -q 'weatherMigrationStore.setReconstructedDepth(depth)' app/src/main/java/com/fabdata/app/ThermalUi.kt
           grep -q 'val effectA: String = "NONE"' app/src/main/java/com/fabdata/app/LyonLabLayer.kt
           grep -q 'FIREWORKS' app/src/main/java/com/fabdata/app/LyonLabLayer.kt
           grep -q 'drawCurveDecorations' app/src/main/java/com/fabdata/app/MainActivity.kt
