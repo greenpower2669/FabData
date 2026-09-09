@@ -310,6 +310,40 @@ class WeatherReferenceStore(private val db: FabDataDb) {
         return out.filter { it.source == PointSource.MEASURED || (it.timestamp / 3600000L) !in measuredHours }
     }
 
+
+    /** SQL-side overview: grouped before rows cross the SQLite/Kotlin boundary. */
+    fun queryLod(
+        referenceKey: String,
+        from: Long,
+        to: Long,
+        bucketMs: Long
+    ): List<WeatherReferencePoint> {
+        val bucket = bucketMs.coerceAtLeast(60_000L)
+        val out = mutableListOf<WeatherReferencePoint>()
+        db.readableDatabase.rawQuery(
+            """
+            SELECT ((timestamp / ?) * ?) AS bucket_start,
+                   AVG(temperature), AVG(humidity), source, AVG(confidence)
+            FROM weather_reference_samples
+            WHERE reference_key=? AND timestamp BETWEEN ? AND ? AND source<>'forecast'
+            GROUP BY bucket_start, source
+            ORDER BY bucket_start
+            """.trimIndent(),
+            arrayOf(bucket.toString(), bucket.toString(), referenceKey, from.toString(), to.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += WeatherReferencePoint(
+                    timestamp = (c.getLong(0) + bucket / 2L).coerceIn(from, to),
+                    temperature = c.getDouble(1),
+                    humidity = c.getDouble(2),
+                    source = PointSource.fromDb(c.getString(3)),
+                    confidence = c.getDouble(4)
+                )
+            }
+        }
+        return out
+    }
+
     fun bounds(referenceKey: String): LongRange? {
         db.readableDatabase.rawQuery(
             "SELECT MIN(timestamp), MAX(timestamp) FROM weather_reference_samples WHERE reference_key=?",

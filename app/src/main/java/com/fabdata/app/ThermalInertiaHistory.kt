@@ -148,6 +148,47 @@ class ThermalInertiaHistoryStore(
         return out
     }
 
+
+    fun queryLod(
+        referenceKey: String,
+        sensorId: Long,
+        modelSignature: String,
+        from: Long,
+        to: Long,
+        bucketMs: Long
+    ): List<SamplePoint> {
+        ensure()
+        val bucket = bucketMs.coerceAtLeast(60_000L)
+        val out = mutableListOf<SamplePoint>()
+        db.readableDatabase.rawQuery(
+            """
+            SELECT ((timestamp / ?) * ?) AS bucket_start,
+                   AVG(temperature), AVG(humidity), AVG(confidence)
+            FROM thermal_inertia_history
+            WHERE reference_key=? AND sensor_id=? AND model_signature=?
+              AND timestamp BETWEEN ? AND ?
+            GROUP BY bucket_start
+            ORDER BY bucket_start
+            """.trimIndent(),
+            arrayOf(
+                bucket.toString(), bucket.toString(), referenceKey, sensorId.toString(), modelSignature,
+                from.toString(), to.toString()
+            )
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += SamplePoint(
+                    sensorId = THERMAL_INERTIA_SENSOR_ID,
+                    timestamp = (c.getLong(0) + bucket / 2L).coerceIn(from, to),
+                    temperature = c.getDouble(1),
+                    humidity = c.getDouble(2),
+                    source = PointSource.RECONSTRUCTED,
+                    confidence = c.getDouble(3)
+                )
+            }
+        }
+        return out
+    }
+
     fun replaceChunk(
         referenceKey: String,
         sensorId: Long,

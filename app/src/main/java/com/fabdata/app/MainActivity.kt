@@ -126,6 +126,9 @@ private enum class TimePreset(val label: String, val spanMs: Long) {
 }
 
 private enum class PreviewPreset(val label: String, val spanMs: Long) {
+    W1("1 sem.", 7L * 24L * 60L * 60L * 1000L),
+    M1("1 mois", 31L * 24L * 60L * 60L * 1000L),
+    M3("3 mois", 92L * 24L * 60L * 60L * 1000L),
     M6("6 mois", 183L * 24L * 60L * 60L * 1000L),
     M12("12 mois", 366L * 24L * 60L * 60L * 1000L),
     M24("24 mois", 732L * 24L * 60L * 60L * 1000L),
@@ -133,6 +136,9 @@ private enum class PreviewPreset(val label: String, val spanMs: Long) {
     M48("48 mois", 1464L * 24L * 60L * 60L * 1000L)
 }
 
+private const val OVERVIEW_LOD_6H_MS = 6L * 60L * 60L * 1000L
+private const val OVERVIEW_LOD_DAY_MS = 24L * 60L * 60L * 1000L
+private const val OVERVIEW_LOD_MONTH_MS = 30L * 24L * 60L * 60L * 1000L
 private const val LYON_DETAIL_GAP_MS = 90L * 60L * 1000L
 private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
 private const val WEATHER_OFFICIAL_SENSOR_ID = -6902900102L
@@ -254,7 +260,9 @@ private data class LoadedData(
     val globalBounds: LongRange?,
     val viewBounds: LongRange?,
     val samples: Map<Long, List<SamplePoint>>,
-    val overviewSamples: Map<Long, List<SamplePoint>>,
+    val gigaOverviewSamples: Map<Long, List<SamplePoint>>,
+    val navigatorOverviewSamples: Map<Long, List<SamplePoint>>,
+    val explorationOverviewSamples: Map<Long, List<SamplePoint>>,
     val stats: Map<Long, SensorStats>,
     val annotations: List<AnnotationItem>,
     val allAnnotations: List<AnnotationItem>,
@@ -293,7 +301,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var statsMap by remember { mutableStateOf<Map<Long, SensorStats>>(emptyMap()) }
     var annotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
     var allAnnotations by remember { mutableStateOf<List<AnnotationItem>>(emptyList()) }
-    var overviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
+    var gigaOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
+    var navigatorOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
+    var explorationOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var globalBounds by remember { mutableStateOf<LongRange?>(null) }
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
     var preset by rememberSaveable { mutableStateOf(TimePreset.TWO_DAYS) }
@@ -494,7 +504,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
             val allNotes = db.annotationsAll()
             if (chosen == null || all == null) {
-                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null)
+                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null)
             } else {
                 val samples = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
@@ -523,32 +533,28 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 ).filter { it.source != PointSource.FORECAST }.map {
                     SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, it.source, it.confidence)
                 }
-                val overview = s.associate { sensor ->
-                    val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
-                        val hourly = lyonLab.queryOfficial(LyonSeriesKind.HOURLY, all.first, all.last)
-                            .map { SamplePoint(sensor.id, it.timestamp, it.temperature, it.humidity) }
-                        hourly.ifEmpty { db.querySamples(sensor.id, all.first, all.last, maxPoints = 600) }
-                    } else {
-                        db.querySamples(sensor.id, all.first, all.last, maxPoints = 600)
+                fun physicalLod(bucketMs: Long): Map<Long, List<SamplePoint>> =
+                    s.associate { sensor ->
+                        sensor.id to db.querySamplesLod(sensor.id, all.first, all.last, bucketMs)
                     }
-                    sensor.id to value
-                }
-                val overviewReferenceRaw = weatherReferenceStore.query(
-                    selectedWeatherReference.key, all.first, all.last
-                ).filter { it.source != PointSource.FORECAST }.map {
-                    SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, it.source, it.confidence)
-                }
-                // v0.20.7 performance: le bandeau n'a pas besoin de dizaines de milliers
-                // de points météo. On garde les extrémités et ~1200 points réguliers.
-                val overviewReference = if (overviewReferenceRaw.size <= 1200) overviewReferenceRaw else {
-                    val step = ((overviewReferenceRaw.size + 1199) / 1200).coerceAtLeast(1)
-                    val sampled = overviewReferenceRaw.filterIndexed { index, _ -> index % step == 0 }.toMutableList()
-                    overviewReferenceRaw.lastOrNull()?.let { last ->
-                        if (sampled.lastOrNull()?.timestamp != last.timestamp) sampled += last
+                fun weatherLod(bucketMs: Long): List<SamplePoint> =
+                    weatherReferenceStore.queryLod(
+                        selectedWeatherReference.key, all.first, all.last, bucketMs
+                    ).map {
+                        SamplePoint(
+                            LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity,
+                            it.source, it.confidence
+                        )
                     }
-                    sampled
-                }
-                val overviewWithReference = overview + (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference)
+
+                // Pyramide LOD : les RAW restent dans SQLite. Chaque bandeau ne reçoit
+                // que sa résolution dédiée, au lieu de charger tout l'historique puis réduire.
+                val gigaOverview = physicalLod(OVERVIEW_LOD_MONTH_MS) +
+                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_MONTH_MS))
+                val navigatorOverview = physicalLod(OVERVIEW_LOD_DAY_MS) +
+                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_DAY_MS))
+                val explorationOverview = physicalLod(OVERVIEW_LOD_6H_MS) +
+                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_6H_MS))
                 val stat = s.mapNotNull { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         sensorStatsFromSamples(sensor.id, samples[sensor.id].orEmpty())
@@ -570,19 +576,55 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             selectedWeatherReference.key,
                             model.sensorId,
                             model.stableSignature(),
-                            all.first,
-                            all.last
+                            chosen.first,
+                            chosen.last
                         )
                         measuredProjection.copy(
-                            surfacePoints = (validatedHistory + measuredProjection.surfacePoints)
+                            surfacePoints = (validatedHistory + measuredProjection.surfacePoints.filter { it.timestamp in chosen })
                                 .associateBy { it.timestamp }
                                 .values
                                 .sortedBy { it.timestamp }
                         )
                     }.getOrNull()
                 }
+                fun withInertiaLod(
+                    base: Map<Long, List<SamplePoint>>,
+                    bucketMs: Long
+                ): Map<Long, List<SamplePoint>> {
+                    val model = trainedModel ?: return base
+                    val stored = inertiaHistoryStore.queryLod(
+                        selectedWeatherReference.key,
+                        model.sensorId,
+                        model.stableSignature(),
+                        all.first,
+                        all.last,
+                        bucketMs
+                    )
+                    val recent = inertia?.surfacePoints.orEmpty()
+                        .groupBy { (it.timestamp / bucketMs) * bucketMs }
+                        .map { (bucketStart, points) ->
+                            SamplePoint(
+                                THERMAL_INERTIA_SENSOR_ID,
+                                bucketStart + bucketMs / 2L,
+                                points.map { it.temperature }.average(),
+                                points.map { it.humidity }.average(),
+                                PointSource.RECONSTRUCTED,
+                                points.mapNotNull { it.confidence }.takeIf { it.isNotEmpty() }?.average()
+                            )
+                        }
+                    val merged = (stored + recent)
+                        .associateBy { it.timestamp }
+                        .values
+                        .sortedBy { it.timestamp }
+                    return base + (THERMAL_INERTIA_SENSOR_ID to merged)
+                }
+
                 LoadedData(
-                    s, all, chosen, samples, overviewWithReference, stat,
+                    s, all, chosen, samples,
+                    withInertiaLod(gigaOverview, OVERVIEW_LOD_MONTH_MS),
+                    withInertiaLod(navigatorOverview, OVERVIEW_LOD_DAY_MS),
+                    withInertiaLod(explorationOverview, OVERVIEW_LOD_6H_MS),
+                    stat,
                     db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia
                 )
             }
@@ -593,7 +635,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         sampleMap = loaded.samples
         lyonReconstructedSamples = loaded.lyonReconstructedSamples
         inertiaEstimate = loaded.inertiaEstimate
-        overviewSampleMap = loaded.overviewSamples
+        gigaOverviewSampleMap = loaded.gigaOverviewSamples
+        navigatorOverviewSampleMap = loaded.navigatorOverviewSamples
+        explorationOverviewSampleMap = loaded.explorationOverviewSamples
         statsMap = loaded.stats
         annotations = loaded.annotations
         allAnnotations = loaded.allAnnotations
@@ -666,14 +710,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val inertiaVisible = viewBounds?.let { b ->
         inertiaEstimate?.surfacePoints?.filter { it.timestamp in b }.orEmpty()
     }.orEmpty()
-    val inertiaOverview = globalBounds?.let { b ->
-        inertiaEstimate?.surfacePoints?.filter { it.timestamp in b }.orEmpty().let { selected ->
-            if (selected.size <= 1200) selected else {
-                val step = ((selected.size + 1199) / 1200).coerceAtLeast(1)
-                selected.filterIndexed { index, _ -> index % step == 0 }
-            }
-        }
-    }.orEmpty()
     val inertiaSensor = Sensor(
         id = THERMAL_INERTIA_SENSOR_ID,
         stableKey = THERMAL_INERTIA_STABLE_KEY,
@@ -681,6 +717,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         room = "Surface / sol équivalent · réel + historique validé",
         colorIndex = 4,
         latestTimestamp = inertiaEstimate?.surfacePoints?.lastOrNull()?.timestamp
+            ?: explorationOverviewSampleMap[THERMAL_INERTIA_SENSOR_ID]?.lastOrNull()?.timestamp
     )
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
     val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + inertiaSensor
@@ -688,11 +725,19 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         (WEATHER_OFFICIAL_SENSOR_ID to weatherOfficialSamples) +
         (LYON_RECONSTRUCTED_SENSOR_ID to weatherReconstructedSamples) +
         (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
-    val overviewReference = overviewSampleMap[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty()
-    val chartOverviewSampleMap = overviewSampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
-        (WEATHER_OFFICIAL_SENSOR_ID to overviewReference.filter { it.source == PointSource.MEASURED }.map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }) +
-        (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference.filter { it.source == PointSource.RECONSTRUCTED }) +
-        (THERMAL_INERTIA_SENSOR_ID to inertiaOverview)
+
+    fun chartLodMap(source: Map<Long, List<SamplePoint>>): Map<Long, List<SamplePoint>> {
+        val reference = source[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty()
+        return source.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
+            (WEATHER_OFFICIAL_SENSOR_ID to reference.filter { it.source == PointSource.MEASURED }
+                .map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }) +
+            (LYON_RECONSTRUCTED_SENSOR_ID to reference.filter { it.source == PointSource.RECONSTRUCTED }
+                .map { it.copy(sensorId = LYON_RECONSTRUCTED_SENSOR_ID) }) +
+            (THERMAL_INERTIA_SENSOR_ID to source[THERMAL_INERTIA_SENSOR_ID].orEmpty())
+    }
+    val chartGigaOverviewSampleMap = chartLodMap(gigaOverviewSampleMap)
+    val chartNavigatorOverviewSampleMap = chartLodMap(navigatorOverviewSampleMap)
+    val chartExplorationOverviewSampleMap = chartLodMap(explorationOverviewSampleMap)
 
     val activeProcessCount = FabOperationRegistry.operations.count { it.active }
 
@@ -810,7 +855,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 item {
                     HistoryOverviewCard(
                         sensors = chartSensors,
-                        sampleMap = chartOverviewSampleMap,
+                        gigaSampleMap = chartGigaOverviewSampleMap,
+                        navigatorSampleMap = chartNavigatorOverviewSampleMap,
+                        sampleMap = chartExplorationOverviewSampleMap,
+                        preferredIndoorSensorId = trainingTargetPrefs.indoorSensorId()
+                            ?: inertiaEstimate?.diagnostics?.sourceSensorId,
                         historyBounds = globalBounds,
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
@@ -1596,7 +1645,10 @@ private fun SeriesSelector(
 @Composable
 private fun HistoryOverviewCard(
     sensors: List<Sensor>,
+    gigaSampleMap: Map<Long, List<SamplePoint>>,
+    navigatorSampleMap: Map<Long, List<SamplePoint>>,
     sampleMap: Map<Long, List<SamplePoint>>,
+    preferredIndoorSensorId: Long?,
     historyBounds: LongRange?,
     viewBounds: LongRange?,
     selectedTimestamp: Long?,
@@ -1614,7 +1666,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Bandeau fin = déplacer la fenêtre · bandeau principal = viser/sélectionner · pince = zoom de prévisu",
+                "Giga = mois · navigation = jours · exploration = 6 h · détail = RAW",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1638,6 +1690,34 @@ private fun HistoryOverviewCard(
                 val helpContext = LocalContext.current
                 val helpPrefs = remember {
                     helpContext.getSharedPreferences("fabdata_context_help", Context.MODE_PRIVATE)
+                }
+                val bandPrefs = remember {
+                    helpContext.getSharedPreferences("fabdata_overview_band_curves", Context.MODE_PRIVATE)
+                }
+                val availableBandSensorIds = remember(sensors, sampleMap) {
+                    sensors.filter { sampleMap[it.id].orEmpty().isNotEmpty() }.map { it.id }.toSet()
+                }
+                val bandSignature = remember(availableBandSensorIds) { availableBandSensorIds.sorted().joinToString(",") }
+                var bandSensorIds by remember(bandSignature, preferredIndoorSensorId) {
+                    val configured = bandPrefs.getBoolean("configured", false)
+                    val stored = bandPrefs.getStringSet("sensor_ids", emptySet()).orEmpty()
+                        .mapNotNull { it.toLongOrNull() }
+                        .filter { it in availableBandSensorIds }
+                        .toSet()
+                    val defaults = linkedSetOf<Long>().apply {
+                        preferredIndoorSensorId?.takeIf { it in availableBandSensorIds }?.let { add(it) }
+                        THERMAL_INERTIA_SENSOR_ID.takeIf { it in availableBandSensorIds }?.let { add(it) }
+                        if (isEmpty()) availableBandSensorIds.firstOrNull()?.let { add(it) }
+                    }
+                    mutableStateOf(if (configured) stored else defaults)
+                }
+                var bandChooserOpen by rememberSaveable { mutableStateOf(false) }
+                fun saveBandSensors(next: Set<Long>) {
+                    bandSensorIds = next
+                    bandPrefs.edit()
+                        .putBoolean("configured", true)
+                        .putStringSet("sensor_ids", next.map { it.toString() }.toSet())
+                        .apply()
                 }
                 var helpOpen by rememberSaveable { mutableStateOf(false) }
                 var tipOpen by rememberSaveable {
@@ -1683,6 +1763,54 @@ private fun HistoryOverviewCard(
                                 Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
                                 fontWeight = if (item == previewPreset) FontWeight.Bold else FontWeight.Normal
                             )
+                        }
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = { bandChooserOpen = !bandChooserOpen },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Courbes des bandeaux · ${bandSensorIds.size} sélectionnée(s)")
+                }
+                if (bandChooserOpen) {
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.34f)
+                        )
+                    ) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                "Même sélection, résolutions différentes. Les segments RECONSTRUCTED gardent leur style reconstruit.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            sensors.filter { it.id in availableBandSensorIds }.forEach { sensor ->
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = sensor.id in bandSensorIds,
+                                        onCheckedChange = { checked ->
+                                            val next = bandSensorIds.toMutableSet()
+                                            if (checked) next += sensor.id else next -= sensor.id
+                                            saveBandSensors(next)
+                                        }
+                                    )
+                                    Text(
+                                        when (sensor.id) {
+                                            THERMAL_INERTIA_SENSOR_ID -> "Sol inertiel"
+                                            WEATHER_OFFICIAL_SENSOR_ID -> "Météo officielle"
+                                            LYON_RECONSTRUCTED_SENSOR_ID -> "Météo reconstruite"
+                                            else -> sensor.room
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -1815,7 +1943,7 @@ private fun HistoryOverviewCard(
                 val maxSpan = minOf(previewPreset.spanMs, fullSpan).coerceAtLeast(1L)
                 val mainSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
                     ?: (24L * 60L * 60L * 1000L)
-                val minSpan = minOf(maxSpan, maxOf(24L * 60L * 60L * 1000L, mainSpan))
+                val minSpan = minOf(maxSpan, maxOf(6L * 60L * 60L * 1000L, mainSpan))
                 val maxZoom = (maxSpan.toDouble() / minSpan.toDouble()).toFloat().coerceAtLeast(1f)
                 val effectiveZoom = previewZoom.coerceIn(1f, maxZoom)
                 val previewSpan = (maxSpan.toDouble() / effectiveZoom.toDouble()).toLong()
@@ -1833,8 +1961,8 @@ private fun HistoryOverviewCard(
                 val previewWindow = previewFrom..previewTo
                 // v0.20.8 : le bandeau exploré ne recalcule que sa fenêtre courante.
                 // Le bandeau supérieur reste volontairement grossier et global.
-                val previewSensorPoints = remember(sampleMap, sensors, previewFrom, previewTo) {
-                    sensors.associate { sensor ->
+                val previewSensorPoints = remember(sampleMap, sensors, bandSensorIds, previewFrom, previewTo) {
+                    sensors.filter { it.id in bandSensorIds }.associate { sensor ->
                         sensor.id to sampleMap[sensor.id].orEmpty()
                             .filter { it.timestamp in previewWindow }
                             .sortedBy { it.timestamp }
@@ -1857,9 +1985,9 @@ private fun HistoryOverviewCard(
                 // Il représente tout l'historique avec des points déjà décimés par la couche overview.
                 // La fenêtre colorée se comporte comme un vrai curseur : on la glisse au doigt/souris,
                 // et seul ce morceau alimente ensuite le bandeau principal + ses MIN/MAX.
-                val navigatorSensorPoints = remember(sampleMap, sensors, bounds.first, bounds.last) {
-                    sensors.associate { sensor ->
-                        sensor.id to sampleMap[sensor.id].orEmpty()
+                val navigatorSensorPoints = remember(navigatorSampleMap, sensors, bandSensorIds, bounds.first, bounds.last) {
+                    sensors.filter { it.id in bandSensorIds }.associate { sensor ->
+                        sensor.id to navigatorSampleMap[sensor.id].orEmpty()
                             .filter { it.timestamp in bounds }
                             .sortedBy { it.timestamp }
                     }
@@ -1871,8 +1999,88 @@ private fun HistoryOverviewCard(
                 val navigatorMax = navigatorAllPoints.maxOfOrNull { it.temperature } ?: 1.0
                 val navigatorTempRange = (navigatorMax - navigatorMin).takeIf { it > 0.01 } ?: 1.0
 
+                val gigaSensorPoints = remember(gigaSampleMap, sensors, bandSensorIds, bounds.first, bounds.last) {
+                    sensors.filter { it.id in bandSensorIds }.associate { sensor ->
+                        sensor.id to gigaSampleMap[sensor.id].orEmpty()
+                            .filter { it.timestamp in bounds }
+                            .sortedBy { it.timestamp }
+                    }
+                }
+                val gigaAllPoints = remember(gigaSensorPoints) { gigaSensorPoints.values.flatten() }
+                val gigaMin = gigaAllPoints.minOfOrNull { it.temperature } ?: 0.0
+                val gigaMax = gigaAllPoints.maxOfOrNull { it.temperature } ?: 1.0
+                val gigaTempRange = (gigaMax - gigaMin).takeIf { it > 0.01 } ?: 1.0
+
                 Text(
-                    "Navigation globale · glisse la fenêtre",
+                    "Navigation giga · LOD mois · historique complet",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(34.dp)
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.17f), RoundedCornerShape(10.dp))
+                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                            detectDragGestures { change, dragAmount ->
+                                val width = size.width.toFloat().coerceAtLeast(1f)
+                                val deltaTs = ((dragAmount.x / width) * fullSpan.toDouble()).toLong()
+                                previewCenter = clampCenter(previewCenter + deltaTs, previewSpan)
+                                change.consume()
+                            }
+                        }
+                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                            detectTapGestures(onTap = { p ->
+                                val width = size.width.toFloat().coerceAtLeast(1f)
+                                val fraction = (p.x / width).coerceIn(0f, 1f)
+                                previewCenter = clampCenter(
+                                    bounds.first + (fullSpan * fraction).toLong(),
+                                    previewSpan
+                                )
+                            })
+                        }
+                ) {
+                    gigaSensorPoints.forEach { (sensorId, points) ->
+                        if (points.size >= 2) {
+                            val sensor = sensors.firstOrNull { it.id == sensorId } ?: return@forEach
+                            val path = Path()
+                            var previous: SamplePoint? = null
+                            val gapLimit = maxOf(62L * 24L * 60L * 60L * 1000L, fullSpan / 80L)
+                            points.forEach { point ->
+                                val x = (((point.timestamp - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                                    .coerceIn(0f, size.width)
+                                val y = size.height - (((point.temperature - gigaMin) / gigaTempRange).toFloat() * size.height)
+                                val breakHere = previous?.let { point.timestamp - it.timestamp > gapLimit } == true
+                                if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
+                                previous = point
+                            }
+                            drawPath(
+                                path,
+                                palette[sensor.colorIndex % palette.size].copy(alpha = 0.34f),
+                                style = Stroke(width = 0.8.dp.toPx())
+                            )
+                        }
+                    }
+                    val left = (((previewFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                        .coerceIn(0f, size.width)
+                    val right = (((previewTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                        .coerceIn(left, size.width)
+                    drawRect(
+                        highlight.copy(alpha = 0.12f),
+                        topLeft = Offset(left, 0f),
+                        size = androidx.compose.ui.geometry.Size((right - left).coerceAtLeast(1f), size.height)
+                    )
+                    drawLine(highlight, Offset(left, 0f), Offset(left, size.height), 1.5.dp.toPx())
+                    drawLine(highlight, Offset(right, 0f), Offset(right, size.height), 1.5.dp.toPx())
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(formatDateTime(bounds.first), style = MaterialTheme.typography.labelSmall)
+                    Text("ultra simplifié", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(formatDateTime(bounds.last), style = MaterialTheme.typography.labelSmall)
+                }
+
+                Text(
+                    "Navigation globale · LOD jour · glisse la fenêtre",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1913,9 +2121,7 @@ private fun HistoryOverviewCard(
                                         .coerceIn(0f, size.width)
                                     val y = size.height - (((point.temperature - navigatorMin) / navigatorTempRange)
                                         .toFloat() * size.height)
-                                    val weatherCurve = sensor.stableKey == LyonWeatherSync.STABLE_KEY ||
-                                        sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID
-                                    val breakHere = weatherCurve && previous?.let {
+                                    val breakHere = previous?.let {
                                         point.timestamp - it.timestamp > navigatorGapLimit
                                     } == true
                                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
@@ -2096,10 +2302,9 @@ private fun HistoryOverviewCard(
                                         .toFloat() * size.width
                                     val y = size.height - (((point.temperature - minTemp) / tempRange)
                                         .toFloat() * size.height)
-                                    val weatherCurve = sensor.stableKey == LyonWeatherSync.STABLE_KEY ||
-                                        sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID
-                                    val breakHere = weatherCurve &&
-                                        previous?.let { point.timestamp - it.timestamp > previewGapLimit } == true
+                                    val breakHere = previous?.let {
+                                        point.timestamp - it.timestamp > previewGapLimit
+                                    } == true
                                     if (previous == null || breakHere) path.moveTo(x, y) else path.lineTo(x, y)
                                     previous = point
                                 }

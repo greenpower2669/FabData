@@ -11,6 +11,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -118,6 +119,9 @@ fun FabLiveUpdateCoordinator(
                 FabOperationRegistry.finish(operationId, "Météo et prévision à jour")
             }
             true
+        } catch (cancel: CancellationException) {
+            FabOperationRegistry.cancelled(operationId, "Routine remplacée / composition quittée")
+            throw cancel
         } catch (error: Throwable) {
             FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour automatique impossible")
             false

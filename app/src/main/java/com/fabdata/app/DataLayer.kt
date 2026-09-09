@@ -430,6 +430,62 @@ class FabDataDb(context: Context) : SQLiteOpenHelper(context, "fabdata.db", null
         return out.distinctBy { it.timestamp }.sortedBy { it.timestamp }
     }
 
+
+    /**
+     * Courbe LOD calculée directement par SQLite.
+     *
+     * Contrairement à querySamples(maxPoints), on ne matérialise jamais toutes les RAW
+     * en mémoire avant de réduire la courbe. SQLite agrège les buckets et Kotlin ne reçoit
+     * que quelques centaines / milliers de points selon le niveau de navigation.
+     */
+    fun querySamplesLod(
+        sensorId: Long,
+        from: Long,
+        to: Long,
+        bucketMs: Long,
+        sourceFilter: PointSource? = null
+    ): List<SamplePoint> {
+        PointSourceStore.ensure(readableDatabase)
+        val bucket = bucketMs.coerceAtLeast(60_000L)
+        val args = mutableListOf(
+            bucket.toString(), bucket.toString(), sensorId.toString(), from.toString(), to.toString()
+        )
+        val sourceClause = if (sourceFilter != null) {
+            args += sourceFilter.dbValue
+            " AND COALESCE(ps.source,'measured')=?"
+        } else ""
+        val out = ArrayList<SamplePoint>()
+        readableDatabase.rawQuery(
+            """
+            SELECT ((p.timestamp / ?) * ?) AS bucket_start,
+                   AVG(p.temperature), AVG(p.humidity),
+                   COALESCE(ps.source,'measured') AS point_source,
+                   AVG(COALESCE(ps.confidence,
+                       CASE WHEN COALESCE(ps.source,'measured')='measured' THEN 1.0 ELSE 0.65 END))
+            FROM samples p
+            LEFT JOIN point_sources ps ON ps.sensor_id=p.sensor_id AND ps.timestamp=p.timestamp
+            WHERE p.sensor_id=? AND p.timestamp BETWEEN ? AND ?
+              AND COALESCE(ps.source,'measured')<>'forecast'
+              $sourceClause
+            GROUP BY bucket_start, COALESCE(ps.source,'measured')
+            ORDER BY bucket_start
+            """.trimIndent(),
+            args.toTypedArray()
+        ).use { c ->
+            while (c.moveToNext()) {
+                out += SamplePoint(
+                    sensorId = sensorId,
+                    timestamp = (c.getLong(0) + bucket / 2L).coerceIn(from, to),
+                    temperature = c.getDouble(1),
+                    humidity = c.getDouble(2),
+                    source = PointSource.fromDb(c.getString(3)),
+                    confidence = if (c.isNull(4)) null else c.getDouble(4)
+                )
+            }
+        }
+        return out
+    }
+
     fun stats(sensorId: Long, from: Long, to: Long): SensorStats? {
         readableDatabase.rawQuery(
             """
