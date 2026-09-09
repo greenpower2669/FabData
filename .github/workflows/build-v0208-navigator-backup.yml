@@ -7,6 +7,7 @@ on:
     paths:
       - '.github/workflows/build-v0208-navigator-backup.yml'
       - 'tools/fix_v0208_navigator_backup.py'
+      - 'tools/fix_v0208_compile.py'
 
 permissions:
   contents: write
@@ -23,7 +24,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply v0.20.8 integration
-        run: python3 tools/fix_v0208_navigator_backup.py
+        run: |
+          python3 tools/fix_v0208_navigator_backup.py
+          python3 tools/fix_v0208_compile.py
 
       - name: Diff and regression guards
         run: |
@@ -31,6 +34,7 @@ jobs:
           git diff --stat
           grep -q 'Navigation globale · glisse la fenêtre' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -q 'previewSensorPoints = remember' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -q 'val navigatorDim = MaterialTheme.colorScheme.scrim' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -q 'key = "backup-export"' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -q 'const val FORMAT_VERSION = "4"' app/src/main/java/com/fabdata/app/BackupLayer.kt
           grep -q 'BACKUP_END' app/src/main/java/com/fabdata/app/BackupLayer.kt
