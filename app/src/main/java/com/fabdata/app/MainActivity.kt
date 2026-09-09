@@ -312,6 +312,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var selectedAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var detailAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
+    var processActivityOpen by remember { mutableStateOf(false) }
     var remoteSensorDialogOpen by remember { mutableStateOf(false) }
     var remoteConfigs by remember { mutableStateOf(remoteSensorStore.load()) }
     var annotationTimestamp by remember { mutableStateOf<Long?>(null) }
@@ -437,6 +438,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs) {
+        val reloadStarted = System.currentTimeMillis()
+        val reloadOperation = FabOperationRegistry.tryStart(
+            "ui-reload", "Actualisation affichage", "Lecture des courbes…", cancellable = false
+        )
+        try {
         busy = true
         val loaded = withContext(Dispatchers.IO) {
             val s = db.sensors()
@@ -514,10 +520,20 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     sensor.id to value
                 }
-                val overviewReference = weatherReferenceStore.query(
+                val overviewReferenceRaw = weatherReferenceStore.query(
                     selectedWeatherReference.key, all.first, all.last
                 ).filter { it.source != PointSource.FORECAST }.map {
                     SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, it.source, it.confidence)
+                }
+                // v0.20.7 performance: le bandeau n'a pas besoin de dizaines de milliers
+                // de points météo. On garde les extrémités et ~1200 points réguliers.
+                val overviewReference = if (overviewReferenceRaw.size <= 1200) overviewReferenceRaw else {
+                    val step = ((overviewReferenceRaw.size + 1199) / 1200).coerceAtLeast(1)
+                    val sampled = overviewReferenceRaw.filterIndexed { index, _ -> index % step == 0 }.toMutableList()
+                    overviewReferenceRaw.lastOrNull()?.let { last ->
+                        if (sampled.lastOrNull()?.timestamp != last.timestamp) sampled += last
+                    }
+                    sampled
                 }
                 val overviewWithReference = overview + (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference)
                 val stat = s.mapNotNull { sensor ->
@@ -598,6 +614,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = true
         showHumidity[THERMAL_INERTIA_SENSOR_ID] = false
         busy = false
+        } finally {
+            busy = false
+            FabOperationRegistry.finish(
+                reloadOperation,
+                "Affichage prêt · ${System.currentTimeMillis() - reloadStarted} ms"
+            )
+        }
     }
 
     val visualReference = WeatherReferencePrefs(context).selectedReference()
@@ -658,6 +681,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         (LYON_RECONSTRUCTED_SENSOR_ID to overviewReference.filter { it.source == PointSource.RECONSTRUCTED }) +
         (THERMAL_INERTIA_SENSOR_ID to inertiaOverview)
 
+    val activeProcessCount = FabOperationRegistry.operations.count { it.active }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
@@ -666,13 +691,21 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     Column {
                         Text("FabData", fontWeight = FontWeight.Bold)
                         Text(
-                            if (busy) "Mise à jour…" else "Courbes & événements",
+                            if (busy || thermalBusy || activeProcessCount > 0) {
+                                if (activeProcessCount > 0) "Mise à jour… · $activeProcessCount tâche(s)" else "Mise à jour…"
+                            } else "Courbes & événements",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
+                    IconButton(onClick = { processActivityOpen = true }) {
+                        Text(
+                            if (activeProcessCount > 0) "↕$activeProcessCount" else "↕",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                     IconButton(onClick = {
                         picker.launch(arrayOf("text/*", "application/csv", "application/vnd.ms-excel"))
                     }) { Icon(Icons.Default.FileOpen, contentDescription = "Importer des CSV") }
@@ -682,9 +715,18 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         Icon(Icons.Default.FileDownload, contentDescription = "Exporter / sauvegarder FabData")
                     }
                     IconButton(onClick = {
-                        scope.launch {
+                        val selected = WeatherReferencePrefs(context).selectedReference()
+                        val operationId = FabOperationRegistry.tryStart(
+                            "weather:${selected.key}",
+                            "Actualisation météo",
+                            "${selected.label} · démarrage…"
+                        )
+                        if (operationId == null) {
+                            processActivityOpen = true
+                            scope.launch { snackbar.showSnackbar("Une routine météo est déjà en cours") }
+                        } else scope.launch {
                             busy = true
-                            val selected = WeatherReferencePrefs(context).selectedReference()
+                            FabOperationRegistry.update(operationId, "${selected.label} · téléchargement récent…")
                             val result = withContext(Dispatchers.IO) {
                                 runCatching {
                                     if (selected.key == WeatherReferenceCatalog.DEFAULT_KEY) {
@@ -694,11 +736,22 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 }
                             }
                             busy = false
-                            reloadToken++
+                            if (FabOperationRegistry.cancelRequested(operationId)) {
+                                FabOperationRegistry.cancelled(operationId, "Arrêt demandé · bloc réseau terminé")
+                            } else {
+                                reloadToken++
+                            }
                             snackbar.showSnackbar(
                                 result.fold(
-                                    onSuccess = { "${it.label} · ${it.measured} réel(s) · ${it.reconstructed} reconstruit(s)" },
-                                    onFailure = { "Station météo non actualisée : ${it.message ?: "réseau ou source indisponible"}" }
+                                    onSuccess = {
+                                        FabOperationRegistry.finish(operationId, "${it.label} · ${it.measured} réel(s) · ${it.reconstructed} reconstruit(s)")
+                                        "${it.label} · ${it.measured} réel(s) · ${it.reconstructed} reconstruit(s)"
+                                    },
+                                    onFailure = {
+                                        val message = it.message ?: "réseau ou source indisponible"
+                                        FabOperationRegistry.fail(operationId, message)
+                                        "Station météo non actualisée : $message"
+                                    }
                                 )
                             )
                         }
@@ -1112,6 +1165,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 )
             }
         }
+    }
+
+    if (processActivityOpen) {
+        FabProcessActivityDialog(onDismiss = { processActivityOpen = false })
     }
 
     if (settingsOpen) {
@@ -1764,12 +1821,41 @@ private fun HistoryOverviewCard(
                 val visiblePoints = sensors.flatMap { sensor ->
                     sampleMap[sensor.id].orEmpty().filter { it.timestamp in previewWindow }
                 }
-                val minTemp = visiblePoints.minOfOrNull { it.temperature } ?: 0.0
-                val maxTemp = visiblePoints.maxOfOrNull { it.temperature } ?: 1.0
+                val minPoint = visiblePoints.minByOrNull { it.temperature }
+                val maxPoint = visiblePoints.maxByOrNull { it.temperature }
+                val minTemp = minPoint?.temperature ?: 0.0
+                val maxTemp = maxPoint?.temperature ?: 1.0
                 val tempRange = (maxTemp - minTemp).takeIf { it > 0.01 } ?: 1.0
                 val highlight = MaterialTheme.colorScheme.primary
                 val selectionColor = MaterialTheme.colorScheme.tertiary
                 val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
+
+                if (minPoint != null && maxPoint != null) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f)
+                    ) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("MIN ${String.format(Locale.getDefault(), "%.1f°", minPoint.temperature)}", fontWeight = FontWeight.SemiBold)
+                                Text(formatDateTime(minPoint.timestamp), style = MaterialTheme.typography.labelSmall)
+                            }
+                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                                Text(
+                                    "MAX ${String.format(Locale.getDefault(), "%.1f°", maxPoint.temperature)}",
+                                    fontWeight = FontWeight.Bold,
+                                    color = overviewMaximumColor(maxPoint.temperature)
+                                )
+                                Text(formatDateTime(maxPoint.timestamp), style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
+                }
 
                 Canvas(
                     modifier = Modifier
@@ -3334,6 +3420,14 @@ private fun paddedRange(
     high = min(clampMax, high + span * 0.12)
     if (high - low < 0.5) high = min(clampMax, low + 0.5)
     return low to high
+}
+
+private fun overviewMaximumColor(value: Double): Color = when {
+    value >= 40.0 -> Color(0xFF7B1FA2) // violet : chaleur extrême
+    value >= 35.0 -> Color(0xFFC62828)
+    value >= 30.0 -> Color(0xFFD1495B)
+    value >= 25.0 -> Color(0xFFE08E0B)
+    else -> Color(0xFF2A9D8F)
 }
 
 private fun formatDateTime(epoch: Long): String =

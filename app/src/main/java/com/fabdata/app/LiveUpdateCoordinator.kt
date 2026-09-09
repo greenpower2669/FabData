@@ -70,12 +70,19 @@ fun FabLiveUpdateCoordinator(
 
     suspend fun updateLive(): Boolean {
         if (!foreground || working) return false
+        val referenceForOperation = weatherPrefs.selectedReference()
+        val operationId = FabOperationRegistry.tryStart(
+            "weather:${referenceForOperation.key}",
+            "Mise à jour automatique",
+            "${referenceForOperation.label} · ouverture / focus"
+        ) ?: return false
         working = true
         return try {
             withContext(Dispatchers.IO) {
                 // Important : le focus ne choisit jamais une autre station.
                 // La référence ne peut changer que depuis l'écran de choix explicite.
-                val reference = weatherPrefs.selectedReference()
+                val reference = referenceForOperation
+                FabOperationRegistry.update(operationId, "${reference.label} · météo récente…")
 
                 if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
                     if (credentials.hasCredential()) {
@@ -87,7 +94,9 @@ fun FabLiveUpdateCoordinator(
 
                 PointSourceStore.reconcileMeasuredDominance(db)
                 manager.refreshRecent(reference)
+                if (FabOperationRegistry.cancelRequested(operationId)) return@withContext
 
+                FabOperationRegistry.update(operationId, "${reference.label} · prévision / cohérence…")
                 val profile = profileStore.load()
                 val mode = profileStore.forecastMode()
                 val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
@@ -102,8 +111,16 @@ fun FabLiveUpdateCoordinator(
                     )
                 }
             }
-            onDataChanged()
+            if (FabOperationRegistry.cancelRequested(operationId)) {
+                FabOperationRegistry.cancelled(operationId, "Mise à jour automatique arrêtée")
+            } else {
+                onDataChanged()
+                FabOperationRegistry.finish(operationId, "Météo et prévision à jour")
+            }
             true
+        } catch (error: Throwable) {
+            FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour automatique impossible")
+            false
         } finally {
             working = false
         }

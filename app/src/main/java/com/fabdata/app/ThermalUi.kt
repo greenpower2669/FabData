@@ -240,6 +240,8 @@ fun ThermalReferenceCard(
     var observedForecastMode by remember { mutableStateOf(forecastMode) }
     var debtSnapshot by remember { mutableStateOf(historyDebtStore.loadDebt()) }
     var continuationWork by remember { mutableStateOf<ThermalHistoryWork?>(null) }
+    var historyOperationId by remember { mutableStateOf<Long?>(null) }
+    var inertiaOperationId by remember { mutableStateOf<Long?>(null) }
 
     fun switchWeatherReference(next: WeatherReference, auto: Boolean) {
         val previous = reference
@@ -264,8 +266,17 @@ fun ThermalReferenceCard(
         val migration = weatherMigrationStore.load()?.takeIf { it.newKey == reference.key }
             ?: run { info = "Aucun changement de station météo à traiter"; return }
         if (busy) return
+        val operationId = FabOperationRegistry.tryStart(
+            "weather:${reference.key}",
+            "Historique météo +90 j",
+            "${reference.label} · présent → passé"
+        ) ?: run {
+            info = "Une routine météo est déjà en cours · ouvre ↕ Activité"
+            return
+        }
         busy = true
         info = "${reference.label} · météo : +90 j vers le passé…"
+        FabOperationRegistry.update(operationId, info)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 manager.extendHistoryBackward(
@@ -284,25 +295,51 @@ fun ThermalReferenceCard(
                 info = "${reference.label} · météo étendue à ~$depth j vers le passé · couverture ${(prepared.coverage.coverage * 100).toInt()} %"
                 suppressNextAuto = true
                 onDataChanged()
+                FabOperationRegistry.finish(operationId, info)
             },
             onFailure = { error ->
                 info = error.message ?: "Extension météo 90 j impossible"
+                FabOperationRegistry.fail(operationId, info)
             }
         )
     }
 
     suspend fun processNextHistoryChunk() {
-        val work = historyDebtStore.loadWork() ?: return
+        val work = historyDebtStore.loadWork() ?: run {
+            FabOperationRegistry.finish(historyOperationId, "Historique intérieur terminé")
+            historyOperationId = null
+            return
+        }
+        if (historyOperationId == null) {
+            historyOperationId = FabOperationRegistry.tryStart(
+                "thermal-history:${work.sensorId}",
+                "Historique intérieur",
+                "Reprise · passé → présent"
+            )
+        }
+        val operationId = historyOperationId
+        if (FabOperationRegistry.cancelRequested(operationId)) {
+            historyDebtStore.pauseWork()
+            historyDebtStore.setDebtState(HistoricalDebtState.PAUSED)
+            info = "Historique intérieur annulé · session conservée en pause"
+            FabOperationRegistry.cancelled(operationId, info)
+            historyOperationId = null
+            busy = false
+            refreshDebtState()
+            return
+        }
         historyDebtStore.resumeWork()
         val range = work.nextRange() ?: return
         busy = true
         info = "Historique · mois ${work.nextChunk + 1}/${work.totalChunks} · préparation météo…"
+        FabOperationRegistry.update(operationId, info)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val prepared = manager.prepareHistoryRange(reference, range.first, range.last)
                 if (!prepared.coverage.ready) {
                     error("${reference.city} incomplet sur ce mois : couverture ${(prepared.coverage.coverage * 100).toInt()} % · trou max ${prepared.coverage.maxGapHours} h")
                 }
+                if (FabOperationRegistry.cancelRequested(operationId)) error("__FAB_CANCELLED__")
                 val advanced = historyDebtStore.advanceWork() ?: error("Session historique perdue")
                 if (advanced.nextChunk >= advanced.totalChunks) {
                     val activeModel = trainedModelStore.loadUsable(reference.key, advanced.sensorId)
@@ -319,10 +356,9 @@ fun ThermalReferenceCard(
                                 val percent = (100 * p.processed / p.total.coerceAtLeast(1)).coerceIn(0, 100)
                                 "${p.stage} · $percent % · ${p.changed} point(s)"
                             } else p.stage
-                            if (p.total > 0 && p.processed > 0) {
-                                suppressNextAuto = true
-                                onDataChanged()
-                            }
+                            // v0.20.7: progression UI seulement. Recharger toutes les courbes
+                            // à chaque batch SQLite de 256 points provoquait une tempête de reads.
+                            FabOperationRegistry.update(operationId, info, p.processed, p.total)
                         }
                     }
                     historyDebtStore.clearWork()
@@ -343,6 +379,8 @@ fun ThermalReferenceCard(
                     info = "Historique terminé · ${summary.reconstructed} point(s) · ${summary.raccords} raccord(s)$detail"
                     suppressNextAuto = true
                     onDataChanged()
+                    FabOperationRegistry.finish(operationId, info)
+                    historyOperationId = null
                 } else if (next != null) {
                     if (next.stepDays <= 90) {
                         continuationWork = null
@@ -362,7 +400,14 @@ fun ThermalReferenceCard(
                 historyDebtStore.setDebtState(HistoricalDebtState.PAUSED)
                 refreshDebtState()
                 continuationWork = null
-                info = error.message ?: "Morceau historique impossible · session mise en pause"
+                if (error.message == "__FAB_CANCELLED__" || FabOperationRegistry.cancelRequested(operationId)) {
+                    info = "Historique intérieur annulé · session conservée en pause"
+                    FabOperationRegistry.cancelled(operationId, info)
+                } else {
+                    info = error.message ?: "Morceau historique impossible · session mise en pause"
+                    FabOperationRegistry.fail(operationId, info)
+                }
+                historyOperationId = null
             }
         )
     }
@@ -397,10 +442,26 @@ fun ThermalReferenceCard(
     suspend fun beginNext90DayHistory(reason: String) {
         val activeModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
             ?: run { info = "Modèle vide ou à réentraîner"; return }
+        if (historyOperationId != null || FabOperationRegistry.activeId("thermal-history:${activeModel.sensorId}") != null) {
+            info = "Historique intérieur déjà en cours · ouvre ↕ Activité"
+            return
+        }
+        historyOperationId = FabOperationRegistry.tryStart(
+            "thermal-history:${activeModel.sensorId}",
+            "Historique intérieur +90 j",
+            "${activeModel.sensorName} · préparation · passé → présent"
+        )
+        val operationId = historyOperationId
+        if (operationId == null) {
+            info = "Historique intérieur déjà en cours · ouvre ↕ Activité"
+            return
+        }
         val firstReal = withContext(Dispatchers.IO) {
             coherenceStore.firstMeasuredTimestamp(activeModel.sensorId)
         } ?: run {
             info = "Aucune vraie mesure pour initialiser l'historique"
+            FabOperationRegistry.fail(operationId, info)
+            historyOperationId = null
             return
         }
         val dayMs = 24L * 60L * 60L * 1000L
@@ -411,6 +472,8 @@ fun ThermalReferenceCard(
         }
         if (existingDepth >= 1464) {
             info = "Historique déjà au maximum de 48 mois"
+            FabOperationRegistry.finish(operationId, info)
+            historyOperationId = null
             return
         }
         val added = minOf(90, 1464 - existingDepth)
@@ -420,12 +483,30 @@ fun ThermalReferenceCard(
         } else {
             "Extension de $added jours · profondeur cible ~$targetDepth jours · 3 étapes maximum"
         }
+        FabOperationRegistry.update(operationId, info)
         beginHistoryWork(targetDepth, reason, existingDepthDays = existingDepth)
     }
 
 
     suspend fun processNextInertiaChunk() {
-        val work = inertiaHistoryStore.loadWork() ?: return
+        val work = inertiaHistoryStore.loadWork() ?: run {
+            FabOperationRegistry.finish(inertiaOperationId, "Sol inertiel terminé")
+            inertiaOperationId = null
+            return
+        }
+        if (inertiaOperationId == null) {
+            inertiaOperationId = FabOperationRegistry.tryStart(
+                "inertia-history:${work.sensorId}", "Calcul sol inertiel", "Préparation du prochain mois"
+            )
+        }
+        val inertiaOp = inertiaOperationId
+        if (FabOperationRegistry.cancelRequested(inertiaOp)) {
+            inertiaHistoryStore.pauseWork()
+            info = "Sol inertiel annulé · session conservée en pause"
+            FabOperationRegistry.cancelled(inertiaOp, info)
+            inertiaOperationId = null
+            return
+        }
         inertiaHistoryStore.resumeWork()
         if (work.referenceKey != reference.key) {
             inertiaHistoryStore.pauseWork()
@@ -439,6 +520,7 @@ fun ThermalReferenceCard(
         }
         busy = true
         info = "Sol inertiel · mois ${work.nextChunk + 1}/${work.totalChunks} · contrôle des prérequis…"
+        FabOperationRegistry.update(inertiaOp, info)
         val result = withContext(Dispatchers.IO) {
             runCatching {
                 val activeModel = trainedModelStore.loadUsable(reference.key, work.sensorId)
@@ -466,11 +548,14 @@ fun ThermalReferenceCard(
             onSuccess = { chunk ->
                 inertiaPending = ThermalInertiaPendingChunk(work, range, chunk)
                 info = "Sol inertiel · mois ${work.nextChunk + 1}/${work.totalChunks} calculé · validation utilisateur requise"
+                FabOperationRegistry.update(inertiaOp, info)
             },
             onFailure = { error ->
                 inertiaHistoryStore.pauseWork()
                 inertiaPending = null
                 info = error.message ?: "Sol inertiel impossible · session mise en pause"
+                FabOperationRegistry.fail(inertiaOp, info)
+                inertiaOperationId = null
             }
         )
     }
@@ -539,6 +624,8 @@ fun ThermalReferenceCard(
         if (advanced == null || advanced.nextChunk >= advanced.totalChunks) {
             inertiaHistoryStore.clearWork()
             info = "Sol inertiel historique terminé · tous les mois validés sont conservés"
+            FabOperationRegistry.finish(inertiaOperationId, info)
+            inertiaOperationId = null
         } else if (pauseAfter) {
             inertiaHistoryStore.pauseWork()
             info = "Sol inertiel mis en pause · ${advanced.nextChunk}/${advanced.totalChunks} mois validé(s)"
@@ -610,6 +697,9 @@ fun ThermalReferenceCard(
 
     suspend fun trainPersistedModel() {
         if (busy) return
+        val operationId = FabOperationRegistry.tryStart(
+            "training-inertia:${selectedSensorId ?: -1L}", "Entraînement sol / inertie", "Préparation des mesures réelles…"
+        ) ?: run { info = "Entraînement déjà en cours · ouvre ↕ Activité"; return }
         busy = true
         trainingFeedback = "⏳ Entraînement en cours…"
         info = "Entraînement du modèle · préparation des mesures réelles…"
@@ -637,11 +727,13 @@ fun ThermalReferenceCard(
                 info = "Modèle entraîné une fois · k ${fmt(k)} · Δ ${model.lagHours} h · futur prêt"
                 suppressNextAuto = true
                 onDataChanged()
+                FabOperationRegistry.finish(operationId, trainingFeedback ?: info)
             },
             onFailure = { error ->
                 val message = error.message ?: "Entraînement impossible"
                 info = message
                 trainingFeedback = "⚠ $message"
+                FabOperationRegistry.fail(operationId, message)
             }
         )
         busy = false
@@ -649,6 +741,9 @@ fun ThermalReferenceCard(
 
     suspend fun trainSelectedWallSolar(wallId: String) {
         if (busy) return
+        val operationId = FabOperationRegistry.tryStart(
+            "training-wall:$wallId", "Entraînement mur / solaire", "Pan $wallId · préparation…"
+        ) ?: run { info = "Entraînement mur déjà en cours · ouvre ↕ Activité"; return }
         busy = true
         trainingFeedback = "⏳ Apprentissage solaire du pan…"
         info = "Mur / solaire · préparation des mesures réelles…"
@@ -661,11 +756,13 @@ fun ThermalReferenceCard(
                 info = "Mur / solaire entraîné · orientation ${orientationLabel(model.orientationDeg)} · RMSE ${fmt(model.fitRmseC)} °C"
                 trainingTopologyVersion++
                 onDataChanged()
+                FabOperationRegistry.finish(operationId, trainingFeedback ?: info)
             },
             onFailure = { error ->
                 val message = error.message ?: "Apprentissage solaire impossible"
                 trainingFeedback = "⚠ $message"
                 info = message
+                FabOperationRegistry.fail(operationId, message)
             }
         )
         busy = false
