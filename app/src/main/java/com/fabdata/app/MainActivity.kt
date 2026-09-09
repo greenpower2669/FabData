@@ -306,6 +306,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var explorationOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var globalBounds by remember { mutableStateOf<LongRange?>(null) }
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
+    var wideOverviewRange by remember { mutableStateOf<LongRange?>(null) }
+    var explorationOverviewRange by remember { mutableStateOf<LongRange?>(null) }
     var preset by rememberSaveable { mutableStateOf(TimePreset.TWO_DAYS) }
     var windowCenterTimestamp by remember { mutableStateOf<Long?>(null) }
     var customViewSpanMs by remember { mutableStateOf<Long?>(null) }
@@ -460,7 +462,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs) {
+    LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs, wideOverviewRange, explorationOverviewRange) {
         val reloadStarted = System.currentTimeMillis()
         val reloadOperation = FabOperationRegistry.tryStart(
             "ui-reload", "Actualisation affichage", "Lecture des courbes…", cancellable = false
@@ -506,6 +508,40 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             if (chosen == null || all == null) {
                 LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null)
             } else {
+                fun centeredRange(center: Long, requestedSpan: Long, outer: LongRange): LongRange {
+                    val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
+                    val span = minOf(requestedSpan.coerceAtLeast(1L), outerSpan)
+                    if (span >= outerSpan) return outer
+                    val half = span / 2L
+                    var start = center - half
+                    var end = start + span
+                    if (start < outer.first) {
+                        start = outer.first
+                        end = start + span
+                    }
+                    if (end > outer.last) {
+                        end = outer.last
+                        start = end - span
+                    }
+                    return start..end
+                }
+                fun clipRange(candidate: LongRange, outer: LongRange): LongRange {
+                    val start = maxOf(candidate.first, outer.first)
+                    val end = minOf(candidate.last, outer.last)
+                    return if (end > start) start..end else outer
+                }
+                val allSpan = (all.last - all.first).coerceAtLeast(1L)
+                val detailCenter = chosen.first + (chosen.last - chosen.first) / 2L
+                val defaultExplorationSpan = minOf(PreviewPreset.M6.spanMs, allSpan)
+                val defaultExploration = centeredRange(detailCenter, defaultExplorationSpan, all)
+                val defaultWideSpan = minOf(
+                    allSpan,
+                    maxOf(defaultExplorationSpan * 6L, PreviewPreset.M6.spanMs)
+                )
+                val defaultWide = centeredRange(detailCenter, defaultWideSpan, all)
+                val navigatorScope = clipRange(wideOverviewRange ?: defaultWide, all)
+                val explorationScope = clipRange(explorationOverviewRange ?: defaultExploration, navigatorScope)
+
                 val samples = s.associate { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         // v0.10 : une seule chronologie Lyon. Reconstruction d'abord, puis
@@ -533,13 +569,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 ).filter { it.source != PointSource.FORECAST }.map {
                     SamplePoint(LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity, it.source, it.confidence)
                 }
-                fun physicalLod(bucketMs: Long): Map<Long, List<SamplePoint>> =
+                fun physicalLod(bucketMs: Long, range: LongRange): Map<Long, List<SamplePoint>> =
                     s.associate { sensor ->
-                        sensor.id to db.querySamplesLod(sensor.id, all.first, all.last, bucketMs)
+                        sensor.id to db.querySamplesLod(sensor.id, range.first, range.last, bucketMs)
                     }
-                fun weatherLod(bucketMs: Long): List<SamplePoint> =
+                fun weatherLod(bucketMs: Long, range: LongRange): List<SamplePoint> =
                     weatherReferenceStore.queryLod(
-                        selectedWeatherReference.key, all.first, all.last, bucketMs
+                        selectedWeatherReference.key, range.first, range.last, bucketMs
                     ).map {
                         SamplePoint(
                             LYON_RECONSTRUCTED_SENSOR_ID, it.timestamp, it.temperature, it.humidity,
@@ -547,14 +583,15 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         )
                     }
 
-                // Pyramide LOD : les RAW restent dans SQLite. Chaque bandeau ne reçoit
-                // que sa résolution dédiée, au lieu de charger tout l'historique puis réduire.
-                val gigaOverview = physicalLod(OVERVIEW_LOD_MONTH_MS) +
-                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_MONTH_MS))
-                val navigatorOverview = physicalLod(OVERVIEW_LOD_DAY_MS) +
-                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_DAY_MS))
-                val explorationOverview = physicalLod(OVERVIEW_LOD_6H_MS) +
-                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_6H_MS))
+                // V0.21.1 : vraie cascade. Seul le giga touche tout l'historique.
+                // Le niveau jour ne lit que la fenêtre large ; le niveau 6 h uniquement
+                // la fenêtre d'exploration. Le graphe détaillé reste limité à chosen.
+                val gigaOverview = physicalLod(OVERVIEW_LOD_MONTH_MS, all) +
+                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_MONTH_MS, all))
+                val navigatorOverview = physicalLod(OVERVIEW_LOD_DAY_MS, navigatorScope) +
+                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_DAY_MS, navigatorScope))
+                val explorationOverview = physicalLod(OVERVIEW_LOD_6H_MS, explorationScope) +
+                    (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_6H_MS, explorationScope))
                 val stat = s.mapNotNull { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         sensorStatsFromSamples(sensor.id, samples[sensor.id].orEmpty())
@@ -589,18 +626,20 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
                 fun withInertiaLod(
                     base: Map<Long, List<SamplePoint>>,
-                    bucketMs: Long
+                    bucketMs: Long,
+                    range: LongRange
                 ): Map<Long, List<SamplePoint>> {
                     val model = trainedModel ?: return base
                     val stored = inertiaHistoryStore.queryLod(
                         selectedWeatherReference.key,
                         model.sensorId,
                         model.stableSignature(),
-                        all.first,
-                        all.last,
+                        range.first,
+                        range.last,
                         bucketMs
                     )
                     val recent = inertia?.surfacePoints.orEmpty()
+                        .filter { it.timestamp in range }
                         .groupBy { (it.timestamp / bucketMs) * bucketMs }
                         .map { (bucketStart, points) ->
                             SamplePoint(
@@ -621,9 +660,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
                 LoadedData(
                     s, all, chosen, samples,
-                    withInertiaLod(gigaOverview, OVERVIEW_LOD_MONTH_MS),
-                    withInertiaLod(navigatorOverview, OVERVIEW_LOD_DAY_MS),
-                    withInertiaLod(explorationOverview, OVERVIEW_LOD_6H_MS),
+                    withInertiaLod(gigaOverview, OVERVIEW_LOD_MONTH_MS, all),
+                    withInertiaLod(navigatorOverview, OVERVIEW_LOD_DAY_MS, navigatorScope),
+                    withInertiaLod(explorationOverview, OVERVIEW_LOD_6H_MS, explorationScope),
                     stat,
                     db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia
                 )
@@ -863,6 +902,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         historyBounds = globalBounds,
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
+                        onCascadeRangesChanged = { wide, exploration ->
+                            if (wideOverviewRange != wide) wideOverviewRange = wide
+                            if (explorationOverviewRange != exploration) explorationOverviewRange = exploration
+                        },
                         onSelectTimestamp = { ts ->
                             // v0.17 : une sélection depuis le bandeau place la visée
                             // au centre de la fenêtre détaillée tout en gardant son zoom.
@@ -1652,6 +1695,7 @@ private fun HistoryOverviewCard(
     historyBounds: LongRange?,
     viewBounds: LongRange?,
     selectedTimestamp: Long?,
+    onCascadeRangesChanged: (LongRange, LongRange) -> Unit,
     onSelectTimestamp: (Long) -> Unit,
     onNavigate: (Long) -> Unit,
     onUseForInertia: (LongRange) -> Unit,
@@ -1666,7 +1710,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Giga = mois · navigation = jours · exploration = 6 h · détail = RAW",
+                "Global = mois · zoom large = jours · sélection = 6 h · détail = RAW",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1683,6 +1727,12 @@ private fun HistoryOverviewCard(
                             ?: (bounds.first + (bounds.last - bounds.first) / 2L)
                     )
                 }
+                var wideCenter by remember(bounds.first, bounds.last) {
+                    mutableStateOf(
+                        viewBounds?.let { it.first + (it.last - it.first) / 2L }
+                            ?: (bounds.first + (bounds.last - bounds.first) / 2L)
+                    )
+                }
                 var rangeSelectionMode by rememberSaveable { mutableStateOf(false) }
                 var rangeStart by remember { mutableStateOf<Long?>(null) }
                 var rangeEnd by remember { mutableStateOf<Long?>(null) }
@@ -1694,8 +1744,12 @@ private fun HistoryOverviewCard(
                 val bandPrefs = remember {
                     helpContext.getSharedPreferences("fabdata_overview_band_curves", Context.MODE_PRIVATE)
                 }
-                val availableBandSensorIds = remember(sensors, sampleMap) {
-                    sensors.filter { sampleMap[it.id].orEmpty().isNotEmpty() }.map { it.id }.toSet()
+                val availableBandSensorIds = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
+                    sensors.filter { sensor ->
+                        gigaSampleMap[sensor.id].orEmpty().isNotEmpty() ||
+                            navigatorSampleMap[sensor.id].orEmpty().isNotEmpty() ||
+                            sampleMap[sensor.id].orEmpty().isNotEmpty()
+                    }.map { it.id }.toSet()
                 }
                 val bandSignature = remember(availableBandSensorIds) { availableBandSensorIds.sorted().joinToString(",") }
                 var bandSensorIds by remember(bandSignature, preferredIndoorSensorId) {
@@ -1751,9 +1805,11 @@ private fun HistoryOverviewCard(
                             onClick = {
                                 previewPreset = item
                                 previewZoom = 1f
-                                previewCenter = (selectedTimestamp
+                                val targetCenter = (selectedTimestamp
                                     ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
                                     ?: previewCenter).coerceIn(bounds.first, bounds.last)
+                                previewCenter = targetCenter
+                                wideCenter = targetCenter
                             },
                             color = if (item == previewPreset) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
                             shape = RoundedCornerShape(14.dp)
@@ -1954,11 +2010,39 @@ private fun HistoryOverviewCard(
                     val half = span / 2L
                     return value.coerceIn(bounds.first + half, bounds.last - (span - half))
                 }
+                fun clampCenterToRange(value: Long, span: Long, outer: LongRange): Long {
+                    val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
+                    if (span >= outerSpan) return outer.first + outerSpan / 2L
+                    val half = span / 2L
+                    return value.coerceIn(outer.first + half, outer.last - (span - half))
+                }
 
-                val effectiveCenter = clampCenter(previewCenter, previewSpan)
-                val previewFrom = if (previewSpan >= fullSpan) bounds.first else effectiveCenter - previewSpan / 2L
-                val previewTo = if (previewSpan >= fullSpan) bounds.last else previewFrom + previewSpan
+                // Niveau 1 : le giga est le seul historique complet. Sa fenêtre large
+                // vaut environ 6 fois la fenêtre d'exploration (minimum 6 mois).
+                val minimumWideSpan = minOf(fullSpan, PreviewPreset.M6.spanMs)
+                val wideSpan = minOf(fullSpan, maxOf(previewSpan * 6L, minimumWideSpan))
+                    .coerceAtLeast(previewSpan)
+                val effectiveWideCenter = clampCenter(wideCenter, wideSpan)
+                val wideFrom = if (wideSpan >= fullSpan) bounds.first else effectiveWideCenter - wideSpan / 2L
+                val wideTo = if (wideSpan >= fullSpan) bounds.last else wideFrom + wideSpan
+                val wideWindow = wideFrom..wideTo
+
+                // Niveau 2 -> 3 : la fenêtre d'exploration est contrainte à la fenêtre large.
+                val effectiveCenter = clampCenterToRange(previewCenter, previewSpan, wideWindow)
+                val previewFrom = if (previewSpan >= wideSpan) wideFrom else effectiveCenter - previewSpan / 2L
+                val previewTo = if (previewSpan >= wideSpan) wideTo else previewFrom + previewSpan
                 val previewWindow = previewFrom..previewTo
+
+                // Les déplacements sont très fréquents au doigt : on attend un bref repos avant
+                // de lancer les requêtes SQLite du niveau inférieur.
+                LaunchedEffect(wideFrom, wideTo, previewFrom, previewTo) {
+                    delay(140L)
+                    onCascadeRangesChanged(wideWindow, previewWindow)
+                }
+                LaunchedEffect(wideFrom, wideTo, previewSpan) {
+                    val clamped = clampCenterToRange(previewCenter, previewSpan, wideWindow)
+                    if (previewCenter != clamped) previewCenter = clamped
+                }
                 // v0.20.8 : le bandeau exploré ne recalcule que sa fenêtre courante.
                 // Le bandeau supérieur reste volontairement grossier et global.
                 val previewSensorPoints = remember(sampleMap, sensors, bandSensorIds, previewFrom, previewTo) {
@@ -1985,10 +2069,10 @@ private fun HistoryOverviewCard(
                 // Il représente tout l'historique avec des points déjà décimés par la couche overview.
                 // La fenêtre colorée se comporte comme un vrai curseur : on la glisse au doigt/souris,
                 // et seul ce morceau alimente ensuite le bandeau principal + ses MIN/MAX.
-                val navigatorSensorPoints = remember(navigatorSampleMap, sensors, bandSensorIds, bounds.first, bounds.last) {
+                val navigatorSensorPoints = remember(navigatorSampleMap, sensors, bandSensorIds, wideFrom, wideTo) {
                     sensors.filter { it.id in bandSensorIds }.associate { sensor ->
                         sensor.id to navigatorSampleMap[sensor.id].orEmpty()
-                            .filter { it.timestamp in bounds }
+                            .filter { it.timestamp in wideWindow }
                             .sortedBy { it.timestamp }
                     }
                 }
@@ -2021,21 +2105,21 @@ private fun HistoryOverviewCard(
                         .fillMaxWidth()
                         .height(34.dp)
                         .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.17f), RoundedCornerShape(10.dp))
-                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                        .pointerInput(bounds.first, bounds.last, wideSpan) {
                             detectDragGestures { change, dragAmount ->
                                 val width = size.width.toFloat().coerceAtLeast(1f)
                                 val deltaTs = ((dragAmount.x / width) * fullSpan.toDouble()).toLong()
-                                previewCenter = clampCenter(previewCenter + deltaTs, previewSpan)
+                                wideCenter = clampCenter(wideCenter + deltaTs, wideSpan)
                                 change.consume()
                             }
                         }
-                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                        .pointerInput(bounds.first, bounds.last, wideSpan) {
                             detectTapGestures(onTap = { p ->
                                 val width = size.width.toFloat().coerceAtLeast(1f)
                                 val fraction = (p.x / width).coerceIn(0f, 1f)
-                                previewCenter = clampCenter(
+                                wideCenter = clampCenter(
                                     bounds.first + (fullSpan * fraction).toLong(),
-                                    previewSpan
+                                    wideSpan
                                 )
                             })
                         }
@@ -2061,9 +2145,9 @@ private fun HistoryOverviewCard(
                             )
                         }
                     }
-                    val left = (((previewFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                    val left = (((wideFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
                         .coerceIn(0f, size.width)
-                    val right = (((previewTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                    val right = (((wideTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
                         .coerceIn(left, size.width)
                     drawRect(
                         highlight.copy(alpha = 0.12f),
@@ -2080,7 +2164,7 @@ private fun HistoryOverviewCard(
                 }
 
                 Text(
-                    "Navigation globale · LOD jour · glisse la fenêtre",
+                    "Zoom large · LOD jour · glisse la fenêtre de sélection",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -2089,20 +2173,20 @@ private fun HistoryOverviewCard(
                         .fillMaxWidth()
                         .height(58.dp)
                         .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.22f), RoundedCornerShape(12.dp))
-                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                        .pointerInput(wideFrom, wideTo, previewSpan) {
                             detectDragGestures { change, dragAmount ->
                                 val width = size.width.toFloat().coerceAtLeast(1f)
-                                val deltaTs = ((dragAmount.x / width) * fullSpan.toDouble()).toLong()
-                                previewCenter = clampCenter(previewCenter + deltaTs, previewSpan)
+                                val deltaTs = ((dragAmount.x / width) * wideSpan.toDouble()).toLong()
+                                previewCenter = clampCenterToRange(previewCenter + deltaTs, previewSpan, wideWindow)
                                 change.consume()
                             }
                         }
-                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                        .pointerInput(wideFrom, wideTo, previewSpan) {
                             detectTapGestures(onTap = { p ->
                                 val width = size.width.toFloat().coerceAtLeast(1f)
                                 val fraction = (p.x / width).coerceIn(0f, 1f)
-                                val target = bounds.first + (fullSpan * fraction).toLong()
-                                previewCenter = clampCenter(target, previewSpan)
+                                val target = wideFrom + (wideSpan * fraction).toLong()
+                                previewCenter = clampCenterToRange(target, previewSpan, wideWindow)
                             })
                         }
                 ) {
@@ -2114,10 +2198,10 @@ private fun HistoryOverviewCard(
                                 var previous: SamplePoint? = null
                                 val navigatorGapLimit = maxOf(
                                     12L * 60L * 60L * 1000L,
-                                    fullSpan / 120L
+                                    wideSpan / 120L
                                 )
                                 points.forEach { point ->
-                                    val x = (((point.timestamp - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                                    val x = (((point.timestamp - wideFrom).toDouble() / wideSpan.toDouble()).toFloat() * size.width)
                                         .coerceIn(0f, size.width)
                                     val y = size.height - (((point.temperature - navigatorMin) / navigatorTempRange)
                                         .toFloat() * size.height)
@@ -2136,9 +2220,9 @@ private fun HistoryOverviewCard(
                         }
                     }
 
-                    val left = (((previewFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                    val left = (((previewFrom - wideFrom).toDouble() / wideSpan.toDouble()).toFloat() * size.width)
                         .coerceIn(0f, size.width)
-                    val right = (((previewTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                    val right = (((previewTo - wideFrom).toDouble() / wideSpan.toDouble()).toFloat() * size.width)
                         .coerceIn(left, size.width)
                     if (left > 0f) {
                         drawRect(
@@ -2166,10 +2250,16 @@ private fun HistoryOverviewCard(
                     drawCircle(highlight, 3.5.dp.toPx(), Offset(handleX, size.height / 2f))
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(formatDateTime(bounds.first), style = MaterialTheme.typography.labelSmall)
-                    Text("historique complet", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(formatDateTime(bounds.last), style = MaterialTheme.typography.labelSmall)
+                    Text(formatDateTime(wideFrom), style = MaterialTheme.typography.labelSmall)
+                    Text("zoom large", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(formatDateTime(wideTo), style = MaterialTheme.typography.labelSmall)
                 }
+
+                Text(
+                    "Sélection / exploration · LOD 6 h · seules ces données alimentent ce bandeau",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
                 if (minPoint != null && maxPoint != null) {
                     Surface(
@@ -2217,8 +2307,8 @@ private fun HistoryOverviewCard(
                                 val oldZoom = previewZoom.coerceIn(1f, oldMaxZoom)
                                 val oldSpan = (oldMaxSpan.toDouble() / oldZoom.toDouble()).toLong()
                                     .coerceIn(oldMinSpan, oldMaxSpan)
-                                val oldCenter = clampCenter(previewCenter, oldSpan)
-                                val oldFrom = if (oldSpan >= fullSpan) bounds.first else oldCenter - oldSpan / 2L
+                                val oldCenter = clampCenterToRange(previewCenter, oldSpan, wideWindow)
+                                val oldFrom = if (oldSpan >= wideSpan) wideFrom else oldCenter - oldSpan / 2L
                                 val width = size.width.toFloat().coerceAtLeast(1f)
                                 val fraction = (centroid.x / width).coerceIn(0f, 1f)
                                 val anchorTs = oldFrom + (oldSpan * fraction).toLong()
@@ -2230,7 +2320,7 @@ private fun HistoryOverviewCard(
                                 val panShift = (-(pan.x / width) * newSpan.toDouble()).toLong()
 
                                 previewZoom = newZoom
-                                previewCenter = clampCenter(zoomAnchoredCenter + panShift, newSpan)
+                                previewCenter = clampCenterToRange(zoomAnchoredCenter + panShift, newSpan, wideWindow)
                             }
                         }
                         .pointerInput(previewFrom, previewTo, rangeSelectionMode) {
