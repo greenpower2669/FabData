@@ -356,15 +356,32 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
         if (uri != null) {
             scope.launch {
+                val opId = FabOperationRegistry.tryStart(
+                    key = "backup-export",
+                    title = "Sauvegarde FabData",
+                    detail = "Écriture temporaire + contrôle d’intégrité…",
+                    cancellable = false
+                )
+                if (opId == null) {
+                    snackbar.showSnackbar("Une sauvegarde est déjà en cours")
+                    return@launch
+                }
                 busy = true
                 val result = withContext(Dispatchers.IO) { runCatching { backup.export(uri) } }
                 busy = false
                 snackbar.showSnackbar(
                     result.fold(
                         onSuccess = {
-                            "Sauvegarde créée : ${it.measurements} mesures · ${it.events} événement(s) · ${it.sensors} capteur(s)"
+                            FabOperationRegistry.finish(
+                                opId,
+                                "Vérifiée · ${it.measurements} mesures · ${it.events} événement(s) · ${it.sensors} capteur(s)"
+                            )
+                            "Sauvegarde vérifiée : ${it.measurements} mesures · ${it.events} événement(s) · ${it.sensors} capteur(s)"
                         },
-                        onFailure = { "Sauvegarde impossible : ${it.message ?: "erreur inconnue"}" }
+                        onFailure = {
+                            FabOperationRegistry.fail(opId, "Échec : ${it.message ?: "erreur inconnue"}")
+                            "Sauvegarde impossible : ${it.message ?: "erreur inconnue"}"
+                        }
                     )
                 )
             }
@@ -1601,7 +1618,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Tap = viser · double tap = ouvrir · Sélection = choisir une période · pince/glisse = prévisu",
+                "Bandeau fin = déplacer la fenêtre · bandeau principal = viser/sélectionner · pince = zoom de prévisu",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1818,8 +1835,17 @@ private fun HistoryOverviewCard(
                 val previewFrom = if (previewSpan >= fullSpan) bounds.first else effectiveCenter - previewSpan / 2L
                 val previewTo = if (previewSpan >= fullSpan) bounds.last else previewFrom + previewSpan
                 val previewWindow = previewFrom..previewTo
-                val visiblePoints = sensors.flatMap { sensor ->
-                    sampleMap[sensor.id].orEmpty().filter { it.timestamp in previewWindow }
+                // v0.20.8 : le bandeau exploré ne recalcule que sa fenêtre courante.
+                // Le bandeau supérieur reste volontairement grossier et global.
+                val previewSensorPoints = remember(sampleMap, sensors, previewFrom, previewTo) {
+                    sensors.associate { sensor ->
+                        sensor.id to sampleMap[sensor.id].orEmpty()
+                            .filter { it.timestamp in previewWindow }
+                            .sortedBy { it.timestamp }
+                    }
+                }
+                val visiblePoints = remember(previewSensorPoints) {
+                    previewSensorPoints.values.flatten()
                 }
                 val minPoint = visiblePoints.minByOrNull { it.temperature }
                 val maxPoint = visiblePoints.maxByOrNull { it.temperature }
@@ -1829,6 +1855,108 @@ private fun HistoryOverviewCard(
                 val highlight = MaterialTheme.colorScheme.primary
                 val selectionColor = MaterialTheme.colorScheme.tertiary
                 val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
+                val navigatorDim = MaterialTheme.colorScheme.scrim.copy(alpha = 0.07f)
+
+                // Bandeau d'exploration DU bandeau d'exploration.
+                // Il représente tout l'historique avec des points déjà décimés par la couche overview.
+                // La fenêtre colorée se comporte comme un vrai curseur : on la glisse au doigt/souris,
+                // et seul ce morceau alimente ensuite le bandeau principal + ses MIN/MAX.
+                val navigatorSensorPoints = remember(sampleMap, sensors, bounds.first, bounds.last) {
+                    sensors.associate { sensor ->
+                        sensor.id to sampleMap[sensor.id].orEmpty()
+                            .filter { it.timestamp in bounds }
+                            .sortedBy { it.timestamp }
+                    }
+                }
+                val navigatorAllPoints = remember(navigatorSensorPoints) {
+                    navigatorSensorPoints.values.flatten()
+                }
+                val navigatorMin = navigatorAllPoints.minOfOrNull { it.temperature } ?: 0.0
+                val navigatorMax = navigatorAllPoints.maxOfOrNull { it.temperature } ?: 1.0
+                val navigatorTempRange = (navigatorMax - navigatorMin).takeIf { it > 0.01 } ?: 1.0
+
+                Text(
+                    "Navigation globale · glisse la fenêtre",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(58.dp)
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.22f), RoundedCornerShape(12.dp))
+                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                            detectDragGestures { change, dragAmount ->
+                                val width = size.width.toFloat().coerceAtLeast(1f)
+                                val deltaTs = ((dragAmount.x / width) * fullSpan.toDouble()).toLong()
+                                previewCenter = clampCenter(previewCenter + deltaTs, previewSpan)
+                                change.consume()
+                            }
+                        }
+                        .pointerInput(bounds.first, bounds.last, previewSpan) {
+                            detectTapGestures(onTap = { p ->
+                                val width = size.width.toFloat().coerceAtLeast(1f)
+                                val fraction = (p.x / width).coerceIn(0f, 1f)
+                                val target = bounds.first + (fullSpan * fraction).toLong()
+                                previewCenter = clampCenter(target, previewSpan)
+                            })
+                        }
+                ) {
+                    if (navigatorAllPoints.isNotEmpty()) {
+                        navigatorSensorPoints.forEach { (sensorId, points) ->
+                            if (points.size >= 2) {
+                                val sensor = sensors.firstOrNull { it.id == sensorId } ?: return@forEach
+                                val path = Path()
+                                points.forEachIndexed { index, point ->
+                                    val x = (((point.timestamp - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                                        .coerceIn(0f, size.width)
+                                    val y = size.height - (((point.temperature - navigatorMin) / navigatorTempRange)
+                                        .toFloat() * size.height)
+                                    if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                                }
+                                drawPath(
+                                    path,
+                                    palette[sensor.colorIndex % palette.size].copy(alpha = 0.42f),
+                                    style = Stroke(width = 1.dp.toPx())
+                                )
+                            }
+                        }
+                    }
+
+                    val left = (((previewFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                        .coerceIn(0f, size.width)
+                    val right = (((previewTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                        .coerceIn(left, size.width)
+                    if (left > 0f) {
+                        drawRect(
+                            navigatorDim,
+                            topLeft = Offset(0f, 0f),
+                            size = androidx.compose.ui.geometry.Size(left, size.height)
+                        )
+                    }
+                    if (right < size.width) {
+                        drawRect(
+                            navigatorDim,
+                            topLeft = Offset(right, 0f),
+                            size = androidx.compose.ui.geometry.Size(size.width - right, size.height)
+                        )
+                    }
+                    drawRect(
+                        highlight.copy(alpha = 0.16f),
+                        topLeft = Offset(left, 0f),
+                        size = androidx.compose.ui.geometry.Size((right - left).coerceAtLeast(1f), size.height)
+                    )
+                    drawLine(highlight, Offset(left, 0f), Offset(left, size.height), 2.dp.toPx())
+                    drawLine(highlight, Offset(right, 0f), Offset(right, size.height), 2.dp.toPx())
+                    val handleX = (left + right) / 2f
+                    drawLine(highlight.copy(alpha = 0.9f), Offset(handleX - 5.dp.toPx(), size.height / 2f), Offset(handleX + 5.dp.toPx(), size.height / 2f), 2.dp.toPx())
+                    drawCircle(highlight, 3.5.dp.toPx(), Offset(handleX, size.height / 2f))
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(formatDateTime(bounds.first), style = MaterialTheme.typography.labelSmall)
+                    Text("historique complet", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(formatDateTime(bounds.last), style = MaterialTheme.typography.labelSmall)
+                }
 
                 if (minPoint != null && maxPoint != null) {
                     Surface(
@@ -1946,9 +2074,7 @@ private fun HistoryOverviewCard(
                 ) {
                     if (visiblePoints.isNotEmpty()) {
                         sensors.forEach { sensor ->
-                            val points = sampleMap[sensor.id].orEmpty()
-                                .filter { it.timestamp in previewWindow }
-                                .sortedBy { it.timestamp }
+                            val points = previewSensorPoints[sensor.id].orEmpty()
                             if (points.size >= 2) {
                                 val path = Path()
                                 var previous: SamplePoint? = null

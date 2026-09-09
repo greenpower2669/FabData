@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.time.Instant
@@ -51,7 +52,7 @@ fun ImportResult.toFabDataImportSummary() = FabDataImportSummary(
  */
 class FabDataBackup(private val context: Context, private val db: FabDataDb) {
     companion object {
-        const val FORMAT_VERSION = "3"
+        const val FORMAT_VERSION = "4"
         const val HEADER = "FabData_Record,Format_Version,Capteur_ID,Capteur,Piece,Couleur,Temps_Epoch_ms,Temps,Temperature_Celsius,Humidite_relative_Pourcentage,Titre,Note,Type,UpdatedAt_Epoch_ms,Source,Confiance,Reference_Station_ID,Reference_Ville,Calibration_Debut_ms,Calibration_Fin_ms,Model_Version"
     }
 
@@ -81,6 +82,36 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
             var invalid = 0
 
             val records = splitCsvRecords(reader.readText())
+
+            // v4 : un fichier n'est restaurable que s'il a été complètement finalisé.
+            // Les anciennes sauvegardes v1/v2/v3 restent volontairement acceptées.
+            fun recordType(line: String): String = splitCsv(line, ',').firstOrNull().orEmpty().trim().uppercase(Locale.ROOT)
+            val metaLine = records.firstOrNull { recordType(it) == "META" }
+            val metaFields = metaLine?.let { splitCsv(it, ',') }.orEmpty()
+            val fileVersion = col(metaFields, "Format_Version").trim()
+            if (fileVersion == FORMAT_VERSION) {
+                val footerLine = records.lastOrNull { it.isNotBlank() }
+                    ?: error("Sauvegarde v4 vide ou incomplète")
+                if (recordType(footerLine) != "BACKUP_END") {
+                    error("Sauvegarde v4 incomplète : marqueur de fin absent")
+                }
+                val footer = splitCsv(footerLine, ',')
+                val note = col(footer, "Note")
+                val expected = note.split(';').mapNotNull { token ->
+                    val pair = token.split('=', limit = 2)
+                    if (pair.size == 2) pair[0].trim() to pair[1].trim().toIntOrNull() else null
+                }.toMap()
+                val actualSensors = records.count { recordType(it) == "SENSOR" }
+                val actualSamples = records.count { recordType(it) == "SAMPLE" }
+                val actualEvents = records.count { recordType(it) == "EVENT" }
+                if (expected["sensors"] != actualSensors ||
+                    expected["measurements"] != actualSamples ||
+                    expected["events"] != actualEvents
+                ) {
+                    error("Sauvegarde v4 incomplète : compteurs d’intégrité incohérents")
+                }
+            }
+
             val v3Support = FabDataBackupV3Support(context, db)
             db.inTransaction {
                 records.forEach { line ->
@@ -89,7 +120,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                         val fields = splitCsv(line, ',')
                         val record = col(fields, "FabData_Record").trim().uppercase(Locale.ROOT)
                         val formatVersion = col(fields, "Format_Version").trim()
-                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", "2", FORMAT_VERSION)) {
+                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", "2", "3", FORMAT_VERSION)) {
                             invalid++
                             return@forEach
                         }
@@ -196,8 +227,8 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                                 }
                             }
 
-                            "META" -> {
-                                // Réservé aux évolutions futures du format.
+                            "META", "BACKUP_END" -> {
+                                // META décrit la sauvegarde ; BACKUP_END certifie une v4 complète.
                             }
 
                             else -> {
@@ -227,14 +258,16 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
 
     /** Sauvegarde capteurs + mesures + événements dans un seul CSV réimportable. */
     fun export(uri: Uri): FabDataBackupExportResult {
-        val output = context.contentResolver.openOutputStream(uri, "wt")
-            ?: error("Impossible de créer le fichier de sauvegarde")
+        // Génération locale d'abord : jamais de demi-sauvegarde présentée comme valide.
+        // Le document choisi n'est touché qu'après écriture + contrôle du footer.
+        val tempFile = File.createTempFile("fabdata-backup-", ".csv", context.cacheDir)
 
         var sensorCount = 0
         var measurementCount = 0
         var eventCount = 0
 
-        OutputStreamWriter(output, Charsets.UTF_8).buffered().use { writer ->
+        try {
+            OutputStreamWriter(tempFile.outputStream(), Charsets.UTF_8).buffered().use { writer ->
             writer.write(HEADER)
             writer.write("\n")
 
@@ -329,11 +362,44 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                     eventCount++
                 }
             }
-            // v3 state is appended after the ordinary human-readable records.
+            // L'état thermique/météo complet reste append-only après les lignes lisibles.
             FabDataBackupV3Support(context, db).writeExtraRows(writer)
+
+            // Le footer est la preuve qu'on a atteint la fin de TOUTES les tables.
+            writeRow(
+                writer,
+                listOf(
+                    "BACKUP_END", FORMAT_VERSION, "", "FabData", "", "", "", "", "", "",
+                    "Sauvegarde complète et vérifiée",
+                    "sensors=$sensorCount;measurements=$measurementCount;events=$eventCount",
+                    "integrity",
+                    System.currentTimeMillis().toString()
+                )
+            )
         }
 
-        return FabDataBackupExportResult(sensorCount, measurementCount, eventCount)
+            val lastRecord = tempFile.useLines(Charsets.UTF_8) { lines ->
+                lines.filter { it.isNotBlank() }.lastOrNull()
+            } ?: error("Sauvegarde vide après génération")
+            val footer = splitCsv(lastRecord, ',')
+            if (footer.firstOrNull()?.trim() != "BACKUP_END") {
+                error("Sauvegarde incomplète : footer absent après génération")
+            }
+            val expectedNote = "sensors=$sensorCount;measurements=$measurementCount;events=$eventCount"
+            if (footer.getOrNull(11).orEmpty() != expectedNote) {
+                error("Sauvegarde incomplète : compteurs de fin incohérents")
+            }
+
+            val output = context.contentResolver.openOutputStream(uri, "wt")
+                ?: error("Impossible de créer le fichier de sauvegarde")
+            output.use { out ->
+                tempFile.inputStream().use { input -> input.copyTo(out, 256 * 1024) }
+                out.flush()
+            }
+            return FabDataBackupExportResult(sensorCount, measurementCount, eventCount)
+        } finally {
+            tempFile.delete()
+        }
     }
 
     private fun readableDatabase() = db.readableDatabase
