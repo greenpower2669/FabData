@@ -1757,7 +1757,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "Global = mois · zoom large = jours · sélection = 6 h · détail = RAW",
+                "1. totalité · 2. sélection du haut · 3. sélection du milieu · 4. détail RAW",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2064,11 +2064,13 @@ private fun HistoryOverviewCard(
                     return value.coerceIn(outer.first + half, outer.last - (span - half))
                 }
 
-                // Niveau 1 : le giga est le seul historique complet. Sa fenêtre large
-                // vaut environ 6 fois la fenêtre d'exploration (minimum 6 mois).
-                val minimumWideSpan = minOf(fullSpan, PreviewPreset.M6.spanMs)
-                val wideSpan = minOf(fullSpan, maxOf(previewSpan * 6L, minimumWideSpan))
-                    .coerceAtLeast(previewSpan)
+                // Niveau 1 : le giga est le seul historique complet.
+                // Sa sélection doit rester un VRAI niveau intermédiaire et non retomber
+                // automatiquement sur tout l'historique. Le milieu vaut environ 2x
+                // l'exploration, avec un plancher d'un mois pour les petits presets.
+                val minimumWideSpan = minOf(fullSpan, maxOf(PreviewPreset.M1.spanMs, previewSpan))
+                val desiredWideSpan = maxOf(previewSpan * 2L, minimumWideSpan)
+                val wideSpan = minOf(fullSpan, desiredWideSpan).coerceAtLeast(previewSpan)
                 val effectiveWideCenter = clampCenter(wideCenter, wideSpan)
                 val wideFrom = if (wideSpan >= fullSpan) bounds.first else effectiveWideCenter - wideSpan / 2L
                 val wideTo = if (wideSpan >= fullSpan) bounds.last else wideFrom + wideSpan
@@ -2089,6 +2091,23 @@ private fun HistoryOverviewCard(
                 LaunchedEffect(wideFrom, wideTo, previewSpan) {
                     val clamped = clampCenterToRange(previewCenter, previewSpan, wideWindow)
                     if (previewCenter != clamped) previewCenter = clamped
+                }
+
+                // v0.21.3 : le détail est le quatrième étage de la cascade.
+                // Il ne peut jamais rester hors de la sélection du bandeau 6 h.
+                LaunchedEffect(previewFrom, previewTo, viewBounds?.first, viewBounds?.last) {
+                    val detail = viewBounds ?: return@LaunchedEffect
+                    if (detail.first < previewFrom || detail.last > previewTo) {
+                        val detailSpan = (detail.last - detail.first).coerceAtLeast(1L)
+                            .coerceAtMost(previewSpan)
+                        val currentDetailCenter = detail.first + (detail.last - detail.first) / 2L
+                        val constrainedCenter = clampCenterToRange(
+                            currentDetailCenter,
+                            detailSpan,
+                            previewWindow
+                        )
+                        onNavigate(constrainedCenter)
+                    }
                 }
                 // v0.20.8 : le bandeau exploré ne recalcule que sa fenêtre courante.
                 // Le bandeau supérieur reste volontairement grossier et global.
@@ -2143,7 +2162,7 @@ private fun HistoryOverviewCard(
                 val gigaTempRange = (gigaMax - gigaMin).takeIf { it > 0.01 } ?: 1.0
 
                 Text(
-                    "Navigation giga · LOD mois · historique complet",
+                    "Navigation giga · LOD mois · TOTALITÉ de l’historique",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -2211,7 +2230,7 @@ private fun HistoryOverviewCard(
                 }
 
                 Text(
-                    "Zoom large · LOD jour · glisse la fenêtre de sélection",
+                    "Zoom large · LOD jour · uniquement la sélection du bandeau du haut",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -2303,7 +2322,7 @@ private fun HistoryOverviewCard(
                 }
 
                 Text(
-                    "Sélection / exploration · LOD 6 h · seules ces données alimentent ce bandeau",
+                    "Sélection / exploration · LOD 6 h · limitée par le bandeau du milieu",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -2613,7 +2632,7 @@ private fun HistoryOverviewCard(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text(formatDateTime(previewFrom), style = MaterialTheme.typography.labelSmall)
                     Text(
-                        "max ${previewPreset.label}",
+                        "fenêtre ${previewPreset.label} → détail RAW",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
