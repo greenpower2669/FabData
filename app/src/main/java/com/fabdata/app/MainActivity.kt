@@ -143,6 +143,11 @@ private enum class PreviewPreset(val label: String, val spanMs: Long) {
     M48("48 mois", 1464L * 24L * 60L * 60L * 1000L)
 }
 
+private enum class TemporalPageDirection {
+    PREVIOUS,
+    NEXT
+}
+
 private const val OVERVIEW_LOD_6H_MS = 6L * 60L * 60L * 1000L
 private const val OVERVIEW_LOD_DAY_MS = 24L * 60L * 60L * 1000L
 private const val OVERVIEW_LOD_MONTH_MS = 30L * 24L * 60L * 60L * 1000L
@@ -325,6 +330,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var lowerCascadeVeil by remember { mutableStateOf(false) }
     var lowerCascadeAwaitingReload by remember { mutableStateOf(false) }
     var lowerCascadeFlashToken by remember { mutableIntStateOf(0) }
+    var temporalPageSyncToken by remember { mutableIntStateOf(0) }
+    var temporalPageSyncCenter by remember { mutableStateOf<Long?>(null) }
     var thermalBusy by remember { mutableStateOf(false) }
     var thermalProgressText by remember { mutableStateOf<String?>(null) }
     var selectedTimestamp by remember { mutableStateOf<Long?>(null) }
@@ -844,6 +851,94 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val chartNavigatorOverviewSampleMap = chartLodMap(navigatorOverviewSampleMap)
     val chartExplorationOverviewSampleMap = chartLodMap(explorationOverviewSampleMap)
 
+    fun centeredTemporalRange(center: Long, requestedSpan: Long, outer: LongRange): LongRange {
+        val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
+        val span = minOf(requestedSpan.coerceAtLeast(1L), outerSpan)
+        if (span >= outerSpan) return outer
+        val half = span / 2L
+        var start = center - half
+        var end = start + span
+        if (start < outer.first) {
+            start = outer.first
+            end = start + span
+        }
+        if (end > outer.last) {
+            end = outer.last
+            start = end - span
+        }
+        return start..end
+    }
+
+    fun requestTemporalPage(direction: TemporalPageDirection, currentPage: LongRange) {
+        if (lowerCascadeVeil) return
+        val history = globalBounds ?: return
+        val historySpan = (history.last - history.first).coerceAtLeast(1L)
+        val pageSpan = (currentPage.last - currentPage.first).coerceAtLeast(1L)
+            .coerceAtMost(historySpan)
+        if (pageSpan >= historySpan) return
+
+        val desiredCenter = when (direction) {
+            TemporalPageDirection.NEXT -> {
+                if (currentPage.last >= history.last) return
+                currentPage.last + pageSpan / 2L
+            }
+            TemporalPageDirection.PREVIOUS -> {
+                if (currentPage.first <= history.first) return
+                currentPage.first - pageSpan / 2L
+            }
+        }
+        val nextPage = centeredTemporalRange(desiredCenter, pageSpan, history)
+        if (nextPage.first == currentPage.first && nextPage.last == currentPage.last) return
+
+        val nextPageSpan = (nextPage.last - nextPage.first).coerceAtLeast(1L)
+        val nextCenter = nextPage.first + nextPageSpan / 2L
+        val currentWideSpan = wideOverviewRange
+            ?.let { (it.last - it.first).coerceAtLeast(nextPageSpan) }
+            ?: minOf(historySpan, maxOf(nextPageSpan * 2L, PreviewPreset.M1.spanMs))
+        val nextWide = centeredTemporalRange(nextCenter, currentWideSpan, history)
+
+        val requestedDetailSpan = (customViewSpanMs ?: preset.spanMs)
+            .coerceAtLeast(60L * 60L * 1000L)
+        val detailSpan = minOf(requestedDetailSpan, nextPageSpan)
+        val detailCenter = when (direction) {
+            TemporalPageDirection.NEXT -> nextPage.first + detailSpan / 2L
+            TemporalPageDirection.PREVIOUS -> nextPage.last - detailSpan / 2L
+        }
+        val landingTimestamp = when (direction) {
+            TemporalPageDirection.NEXT -> nextPage.first
+            TemporalPageDirection.PREVIOUS -> nextPage.last
+        }
+
+        // One commit only. Smoke freezes levels 3+4 until this single reload ends.
+        lowerCascadeAwaitingReload = true
+        lowerCascadeVeil = true
+        wideOverviewRange = nextWide
+        explorationOverviewRange = nextPage
+        temporalPageSyncCenter = nextCenter
+        temporalPageSyncToken++
+        windowCenterTimestamp = detailCenter
+        selectedTimestamp = landingTimestamp
+        selectedAnnotation = null
+    }
+
+    val temporalPageRange = explorationOverviewRange
+    val temporalDetailRange = viewBounds
+    val temporalHistoryRange = globalBounds
+    val temporalEdgeTolerance = temporalDetailRange?.let {
+        maxOf(
+            60L * 60L * 1000L,
+            minOf(12L * 60L * 60L * 1000L, (it.last - it.first).coerceAtLeast(1L) / 20L)
+        )
+    } ?: (60L * 60L * 1000L)
+    val detailCanPageBackward = !lowerCascadeVeil && temporalPageRange != null &&
+        temporalDetailRange != null && temporalHistoryRange != null &&
+        temporalDetailRange.first <= temporalPageRange.first + temporalEdgeTolerance &&
+        temporalPageRange.first > temporalHistoryRange.first
+    val detailCanPageForward = !lowerCascadeVeil && temporalPageRange != null &&
+        temporalDetailRange != null && temporalHistoryRange != null &&
+        temporalDetailRange.last >= temporalPageRange.last - temporalEdgeTolerance &&
+        temporalPageRange.last < temporalHistoryRange.last
+
     val activeProcessCount = FabOperationRegistry.operations.count { it.active }
 
     Scaffold(
@@ -970,6 +1065,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         selectedTimestamp = selectedTimestamp,
                         lowerZonesPending = lowerCascadeVeil,
                         lowerZonesFlashToken = lowerCascadeFlashToken,
+                        temporalPageSyncToken = temporalPageSyncToken,
+                        temporalPageSyncCenter = temporalPageSyncCenter,
                         onLowerZonesInteractionStart = {
                             lowerCascadeAwaitingReload = false
                             lowerCascadeVeil = true
@@ -981,6 +1078,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         onLowerZonesCommit = {
                             lowerCascadeAwaitingReload = true
                             lowerCascadeVeil = true
+                        },
+                        onTemporalPageRequest = { direction, page ->
+                            requestTemporalPage(direction, page)
                         },
                         onCascadeRangesChanged = { wide, exploration ->
                             if (wideOverviewRange != wide) wideOverviewRange = wide
@@ -1131,6 +1231,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         curveStyles = activeCurveStyles,
                         styleTick = styleTick,
                         selectedTimestamp = selectedTimestamp,
+                        canPageBackward = detailCanPageBackward,
+                        canPageForward = detailCanPageForward,
+                        onPageBackward = {
+                            temporalPageRange?.let { requestTemporalPage(TemporalPageDirection.PREVIOUS, it) }
+                        },
+                        onPageForward = {
+                            temporalPageRange?.let { requestTemporalPage(TemporalPageDirection.NEXT, it) }
+                        },
                         onSelectTimestamp = {
                             selectedTimestamp = it
                             selectedAnnotation = null
@@ -1823,6 +1931,52 @@ private fun weatherMissingRanges(
 }
 
 @Composable
+private fun TemporalPageArrows(
+    showPrevious: Boolean,
+    showNext: Boolean,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(modifier) {
+        if (showPrevious) {
+            Surface(
+                onClick = onPrevious,
+                modifier = Modifier.align(Alignment.CenterStart).padding(4.dp),
+                shape = RoundedCornerShape(22.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.92f),
+                shadowElevation = 5.dp
+            ) {
+                Text(
+                    "←",
+                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+        if (showNext) {
+            Surface(
+                onClick = onNext,
+                modifier = Modifier.align(Alignment.CenterEnd).padding(4.dp),
+                shape = RoundedCornerShape(22.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.92f),
+                shadowElevation = 5.dp
+            ) {
+                Text(
+                    "→",
+                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun PendingCascadeOverlay(
     pending: Boolean,
     flashToken: Int,
@@ -1883,9 +2037,12 @@ private fun HistoryOverviewCard(
     selectedTimestamp: Long?,
     lowerZonesPending: Boolean,
     lowerZonesFlashToken: Int,
+    temporalPageSyncToken: Int,
+    temporalPageSyncCenter: Long?,
     onLowerZonesInteractionStart: () -> Unit,
     onLowerZonesInteractionCancel: () -> Unit,
     onLowerZonesCommit: () -> Unit,
+    onTemporalPageRequest: (TemporalPageDirection, LongRange) -> Unit,
     onCascadeRangesChanged: (LongRange, LongRange) -> Unit,
     onSelectTimestamp: (Long) -> Unit,
     onNavigate: (Long) -> Unit,
@@ -2030,6 +2187,25 @@ private fun HistoryOverviewCard(
                 val previewTo = if (previewSpan >= wideSpan) wideTo else previewFrom + previewSpan
                 val previewWindow = previewFrom..previewTo
 
+                LaunchedEffect(temporalPageSyncToken, temporalPageSyncCenter) {
+                    if (temporalPageSyncToken > 0) {
+                        temporalPageSyncCenter?.let { target ->
+                            secondBandDraftCenter = null
+                            val syncedWideCenter = clampCenter(target, wideSpan)
+                            wideCenter = syncedWideCenter
+                            val syncedWideFrom = if (wideSpan >= fullSpan) bounds.first
+                                else syncedWideCenter - wideSpan / 2L
+                            val syncedWideTo = if (wideSpan >= fullSpan) bounds.last
+                                else syncedWideFrom + wideSpan
+                            previewCenter = clampCenterToRange(
+                                target,
+                                previewSpan,
+                                syncedWideFrom..syncedWideTo
+                            )
+                        }
+                    }
+                }
+
                 // Les déplacements sont très fréquents au doigt : on attend un bref repos avant
                 // de lancer les requêtes SQLite du niveau inférieur.
                 LaunchedEffect(wideFrom, wideTo, previewFrom, previewTo) {
@@ -2078,6 +2254,18 @@ private fun HistoryOverviewCard(
                 val selectionColor = MaterialTheme.colorScheme.tertiary
                 val surface = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.28f)
                 val navigatorDim = MaterialTheme.colorScheme.scrim.copy(alpha = 0.07f)
+                val thirdLevelEdgeTolerance = viewBounds?.let {
+                    maxOf(
+                        60L * 60L * 1000L,
+                        minOf(12L * 60L * 60L * 1000L, (it.last - it.first).coerceAtLeast(1L) / 20L)
+                    )
+                } ?: (60L * 60L * 1000L)
+                val thirdLevelCanPagePrevious = !lowerZonesPending && viewBounds != null &&
+                    viewBounds.first <= previewFrom + thirdLevelEdgeTolerance &&
+                    previewFrom > bounds.first
+                val thirdLevelCanPageNext = !lowerZonesPending && viewBounds != null &&
+                    viewBounds.last >= previewTo - thirdLevelEdgeTolerance &&
+                    previewTo < bounds.last
 
                 // v0.21.4 : navigation = température extérieure uniquement.
                 val navigatorWeatherPoints = remember(navigatorSampleMap, wideFrom, wideTo) {
@@ -2751,6 +2939,19 @@ private fun HistoryOverviewCard(
                     flashToken = lowerZonesFlashToken,
                     modifier = Modifier.fillMaxSize()
                 )
+                if (!lowerZonesPending) {
+                    TemporalPageArrows(
+                        showPrevious = thirdLevelCanPagePrevious,
+                        showNext = thirdLevelCanPageNext,
+                        onPrevious = {
+                            onTemporalPageRequest(TemporalPageDirection.PREVIOUS, previewWindow)
+                        },
+                        onNext = {
+                            onTemporalPageRequest(TemporalPageDirection.NEXT, previewWindow)
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
                 }
 
                 val pendingRange = rangeStart?.let { a ->
@@ -2963,6 +3164,10 @@ private fun ChartCard(
     curveStyles: Map<Long, CurveVisualPrefs>,
     styleTick: Long,
     selectedTimestamp: Long?,
+    canPageBackward: Boolean,
+    canPageForward: Boolean,
+    onPageBackward: () -> Unit,
+    onPageForward: () -> Unit,
     onSelectTimestamp: (Long) -> Unit,
     onAnnotationClick: (AnnotationItem) -> Unit,
     onAnnotationDoubleClick: (AnnotationItem) -> Unit,
@@ -2993,8 +3198,9 @@ private fun ChartCard(
                     Text("Pas de données")
                 }
             } else {
+                Box(Modifier.fillMaxWidth().height(390.dp)) {
                 InteractiveChart(
-                    modifier = Modifier.fillMaxWidth().height(390.dp),
+                    modifier = Modifier.fillMaxSize(),
                     sensors = sensors,
                     sampleMap = sampleMap,
                     showTemp = showTemp,
@@ -3007,12 +3213,24 @@ private fun ChartCard(
                     styleTick = styleTick,
                     selectedTimestamp = selectedTimestamp,
                     resetKey = resetKey,
+                    canPageBackward = canPageBackward,
+                    canPageForward = canPageForward,
+                    onPageBackward = onPageBackward,
+                    onPageForward = onPageForward,
                     onSelectTimestamp = onSelectTimestamp,
                     onAnnotationClick = onAnnotationClick,
                     onAnnotationDoubleClick = onAnnotationDoubleClick,
                     onRequestAnnotation = onRequestAnnotation,
                     onRequestZoom = onRequestZoom
                 )
+                TemporalPageArrows(
+                    showPrevious = canPageBackward,
+                    showNext = canPageForward,
+                    onPrevious = onPageBackward,
+                    onNext = onPageForward,
+                    modifier = Modifier.fillMaxSize()
+                )
+                }
             }
         }
     }
@@ -3033,6 +3251,10 @@ private fun InteractiveChart(
     styleTick: Long,
     selectedTimestamp: Long?,
     resetKey: Int,
+    canPageBackward: Boolean,
+    canPageForward: Boolean,
+    onPageBackward: () -> Unit,
+    onPageForward: () -> Unit,
     onSelectTimestamp: (Long) -> Unit,
     onAnnotationClick: (AnnotationItem) -> Unit,
     onAnnotationDoubleClick: (AnnotationItem) -> Unit,
@@ -3042,6 +3264,9 @@ private fun InteractiveChart(
     var zoom by remember(resetKey, from, to) { mutableFloatStateOf(1f) }
     var center by remember(resetKey, from, to) { mutableFloatStateOf(0.5f) }
     var sightTemperature by remember(resetKey, from, to) { mutableStateOf<Double?>(null) }
+    var edgePushDistancePx by remember(resetKey, from, to) { mutableFloatStateOf(0f) }
+    var edgePushDirection by remember(resetKey, from, to) { mutableIntStateOf(0) }
+    var edgePushTriggered by remember(resetKey, from, to) { mutableStateOf(false) }
     val currentSelectedTimestamp by rememberUpdatedState(selectedTimestamp)
 
     val axisColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.60f)
@@ -3107,8 +3332,34 @@ private fun InteractiveChart(
                         val newZoom = (zoom * zoomChange).coerceIn(1f, 720f)
                         zoom = newZoom
                         val visible = 1f / zoom
-                        center = (center - (pan.x / size.width.toFloat()) * oldVisible)
-                            .coerceIn(visible / 2f, 1f - visible / 2f)
+                        val minimumCenter = visible / 2f
+                        val maximumCenter = 1f - visible / 2f
+                        val requestedCenter = center - (pan.x / size.width.toFloat()) * oldVisible
+                        val clampedCenter = requestedCenter.coerceIn(minimumCenter, maximumCenter)
+
+                        val deliberatePan = zoomChange in 0.985f..1.015f
+                        val pushDirection = when {
+                            deliberatePan && requestedCenter < minimumCenter && pan.x > 0f && canPageBackward -> -1
+                            deliberatePan && requestedCenter > maximumCenter && pan.x < 0f && canPageForward -> 1
+                            else -> 0
+                        }
+                        if (pushDirection != 0) {
+                            if (edgePushDirection != pushDirection) {
+                                edgePushDirection = pushDirection
+                                edgePushDistancePx = 0f
+                                edgePushTriggered = false
+                            }
+                            edgePushDistancePx += kotlin.math.abs(pan.x)
+                            if (!edgePushTriggered && edgePushDistancePx >= 46.dp.toPx()) {
+                                edgePushTriggered = true
+                                if (pushDirection < 0) onPageBackward() else onPageForward()
+                            }
+                        } else if (kotlin.math.abs(pan.x) > 0.5f) {
+                            edgePushDirection = 0
+                            edgePushDistancePx = 0f
+                            edgePushTriggered = false
+                        }
+                        center = clampedCenter
                     }
                 }
             }
