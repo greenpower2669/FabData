@@ -1,0 +1,135 @@
+name: Build FabData v0.21.5 temporal page navigation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'agent/v0.21.5-temporal-page-navigation'
+    paths:
+      - '.github/workflows/build-v0215-temporal-page-navigation.yml'
+      - 'tools/fix_v0215_temporal_page_navigation.py'
+      - 'tools/fix_v0215_temporal_page_navigation_runner.py'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.21.5-temporal-page-navigation
+          fetch-depth: 0
+
+      - name: Validate runner
+        run: python3 -m py_compile tools/fix_v0215_temporal_page_navigation_runner.py
+
+      - name: Apply temporal page navigation patch
+        run: python3 tools/fix_v0215_temporal_page_navigation_runner.py
+
+      - name: Regression diagnostics
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.21.5"' app/build.gradle.kts
+          grep -n 'TemporalPageDirection' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'requestTemporalPage' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'TemporalPageArrows' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'edgePushDistancePx' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n '46.dp.toPx()' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'temporalPageSyncToken' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'lowerCascadeAwaitingReload = true' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Global météo · LOD jour' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Zoom large météo · LOD 6 h' app/src/main/java/com/fabdata/app/MainActivity.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit integrated source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Add temporal page navigation from lower levels"
+            git push origin HEAD:agent/v0.21.5-temporal-page-navigation
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.21.5-temporal-page-navigation-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.21.5-temporal-page-navigation-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.21.5-temporal-page-navigation-signing-mode.txt
+          sha256sum artifacts/FabData-v0.21.5-temporal-page-navigation-release.apk artifacts/FabData-v0.21.5-temporal-page-navigation-release.aab > artifacts/FabData-v0.21.5-temporal-page-navigation-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.21.5-temporal-page-navigation
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.21.5-temporal-page-navigation --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.21.5-temporal-page-navigation \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.21.5 temporal page navigation" \
+            --notes "Ajoute la navigation par page temporelle depuis les niveaux bas. Les flèches gauche/droite apparaissent uniquement lorsque la fenêtre RAW détaillée touche réellement le bord de la page calculée du niveau 3 et qu'une page voisine existe. Le changement reste volontaire : clic sur la flèche ou poussée d'environ 46 dp au-delà de la butée dans le graphe. Une page correspond à la fenêtre calculée du niveau 3, évitant tout saut artificiel depuis un zoom 48 h. Pendant le changement, niveaux 3 et 4 restent figés sous le voile/fumée existant ; un seul recalcul est lancé, puis le halo de révélation déjà présent découvre les nouvelles courbes. En allant à droite, le détail arrive au début de la page suivante ; à gauche, à la fin de la page précédente. Les sélecteurs météo des niveaux 1 et 2 se recentrent automatiquement sur la nouvelle page. Toute la logique météo-only et performance/annulation des versions 0.21.2 à 0.21.4 est conservée." \
+            artifacts/FabData-v0.21.5-temporal-page-navigation-release.apk \
+            artifacts/FabData-v0.21.5-temporal-page-navigation-release.aab \
+            artifacts/FabData-v0.21.5-temporal-page-navigation-signing-mode.txt \
+            artifacts/FabData-v0.21.5-temporal-page-navigation-sha256.txt
