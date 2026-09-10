@@ -1,0 +1,142 @@
+name: Build FabData v0.21.2 cancellation performance
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'agent/v0.21.2-cancellation-performance'
+    paths:
+      - '.github/workflows/build-v0212-cancellation-performance.yml'
+      - 'tools/fix_v0212_cancellation_performance.py'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.21.2-cancellation-performance
+          fetch-depth: 0
+
+      - name: Validate patch script
+        run: python3 -m py_compile tools/fix_v0212_cancellation_performance.py
+
+      - name: Apply cancellation and performance patch
+        run: python3 tools/fix_v0212_cancellation_performance.py
+
+      - name: Regression diagnostics
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.21.2"' app/build.gradle.kts
+          grep -n 'cancellable = true' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'reloadMutex.withLock' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Global · LOD mois' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Zoom large · LOD jour' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Sélection · LOD 6 h' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Sol inertiel · projection' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'reconcileMeasuredDominance(db, recentFrom, recentTo)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'reconcileMeasuredDominance(reference.key, from, now)' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'idx_point_sources_source_time' app/src/main/java/com/fabdata/app/PointSourceLayer.kt
+          grep -n 'idx_weather_reference_source_time' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'ensureNotCancelled' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit integrated source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/FabOperationRegistry.kt \
+            app/src/main/java/com/fabdata/app/PointSourceLayer.kt \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
+            app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Fix cancellation and live database contention"
+            git push origin HEAD:agent/v0.21.2-cancellation-performance
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.21.2-cancellation-performance-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.21.2-cancellation-performance-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.21.2-cancellation-performance-signing-mode.txt
+          sha256sum artifacts/FabData-v0.21.2-cancellation-performance-release.apk artifacts/FabData-v0.21.2-cancellation-performance-release.aab > artifacts/FabData-v0.21.2-cancellation-performance-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.21.2-cancellation-performance
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.21.2-cancellation-performance --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.21.2-cancellation-performance \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.21.2 cancellation + performance" \
+            --notes "Corrige le blocage observé où Actualisation affichage et Mise à jour automatique restaient actives ensemble pendant des heures. Le nettoyage de dominance des mesures n'est plus un balayage historique avec DELETE ligne par ligne : il devient SQL set-based et l'actualisation live ne traite que sa fenêtre récente. La météo applique la même règle. L'affichage est sérialisé par Mutex, devient annulable et vérifie l'annulation entre les étapes bornées. Le panneau d'activité indique désormais Capteurs/bornes, Détail RAW, Global LOD mois, Zoom large LOD jour, Sélection LOD 6 h et Sol inertiel afin d'identifier immédiatement une étape lente. La vraie cascade LOD v0.21.1 est conservée." \
+            artifacts/FabData-v0.21.2-cancellation-performance-release.apk \
+            artifacts/FabData-v0.21.2-cancellation-performance-release.aab \
+            artifacts/FabData-v0.21.2-cancellation-performance-signing-mode.txt \
+            artifacts/FabData-v0.21.2-cancellation-performance-sha256.txt
