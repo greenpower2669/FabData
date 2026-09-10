@@ -1,0 +1,130 @@
+name: Build FabData v0.21.3 strict cascade
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'agent/v0.21.3-strict-cascade'
+    paths:
+      - '.github/workflows/build-v0213-strict-cascade.yml'
+      - 'tools/fix_v0213_strict_cascade.py'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.21.3-strict-cascade
+          fetch-depth: 0
+
+      - name: Validate patch script
+        run: python3 -m py_compile tools/fix_v0213_strict_cascade.py
+
+      - name: Apply strict cascade patch
+        run: python3 tools/fix_v0213_strict_cascade.py
+
+      - name: Regression diagnostics
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.21.3"' app/build.gradle.kts
+          grep -n 'desiredWideSpan = maxOf(previewSpan \* 2L' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'le détail est le quatrième étage' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'TOTALITÉ de l’historique' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'uniquement la sélection du bandeau du haut' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'limitée par le bandeau du milieu' app/src/main/java/com/fabdata/app/MainActivity.kt
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit integrated source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Make overview hierarchy strictly nested"
+            git push origin HEAD:agent/v0.21.3-strict-cascade
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.21.3-strict-cascade-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.21.3-strict-cascade-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.21.3-strict-cascade-signing-mode.txt
+          sha256sum artifacts/FabData-v0.21.3-strict-cascade-release.apk artifacts/FabData-v0.21.3-strict-cascade-release.aab > artifacts/FabData-v0.21.3-strict-cascade-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.21.3-strict-cascade
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.21.3-strict-cascade --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.21.3-strict-cascade \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.21.3 strict nested cascade" \
+            --notes "Corrige la hiérarchie visuelle des bandeaux : le giga reste la totalité de l'historique, le bandeau journalier n'affiche que la sélection du giga, le bandeau 6 h reste strictement contenu dans le journalier, et la fenêtre RAW détaillée est automatiquement contrainte à rester dans le bandeau 6 h. Le niveau intermédiaire ne retombe plus sur tout l'historique avec la sélection 6 mois : sa largeur cible devient environ 2x celle de son enfant au lieu de 6x. Les corrections performance/annulation de v0.21.2 sont conservées." \
+            artifacts/FabData-v0.21.3-strict-cascade-release.apk \
+            artifacts/FabData-v0.21.3-strict-cascade-release.aab \
+            artifacts/FabData-v0.21.3-strict-cascade-signing-mode.txt \
+            artifacts/FabData-v0.21.3-strict-cascade-sha256.txt
