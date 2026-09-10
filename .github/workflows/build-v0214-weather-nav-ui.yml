@@ -1,0 +1,139 @@
+name: Build FabData v0.21.4 weather navigation UI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'agent/v0.21.4-weather-nav-ui'
+    paths:
+      - '.github/workflows/build-v0214-weather-nav-ui.yml'
+      - 'tools/fix_v0214_weather_navigation_ui.py'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: agent/v0.21.4-weather-nav-ui
+          fetch-depth: 0
+
+      - name: Validate patch script
+        run: python3 -m py_compile tools/fix_v0214_weather_navigation_ui.py
+
+      - name: Apply weather navigation UI patch
+        run: python3 tools/fix_v0214_weather_navigation_ui.py
+
+      - name: Regression diagnostics
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.21.4"' app/build.gradle.kts
+          grep -n 'Global météo · LOD jour' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Zoom large météo · LOD 6 h' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Outils d’analyse de la période' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'secondBandDraftCenter' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'PendingCascadeOverlay' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'météo absente' app/src/main/java/com/fabdata/app/MainActivity.kt
+          if grep -n 'withInertiaLod(gigaOverview' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo 'Upper global band still loads inertia' >&2
+            exit 1
+          fi
+          if grep -n 'withInertiaLod(navigatorOverview' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo 'Upper wide band still loads inertia' >&2
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Restore signing
+        env:
+          KEYSTORE_B64: ${{ secrets.FABDATA_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.FABDATA_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FABDATA_UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.FABDATA_UPLOAD_KEY_PASSWORD }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/fabdata-upload.jks"
+            echo "FABDATA_KEYSTORE_PATH=$RUNNER_TEMP/fabdata-upload.jks" >> "$GITHUB_ENV"
+            echo "FABDATA_KEYSTORE_PASSWORD=$STORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "FABDATA_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "FABDATA_SIGNING_MODE=google-play-upload-key" >> "$GITHUB_ENV"
+          else
+            echo "FABDATA_SIGNING_MODE=development-fallback" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK and AAB
+        run: gradle --no-daemon :app:assembleRelease :app:bundleRelease
+
+      - name: Verify packages
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/release/app-release.apk
+          jarsigner -verify app/build/outputs/bundle/release/app-release.aab
+
+      - name: Commit integrated source
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "No source patch to commit"
+          else
+            git commit -m "Reorganize navigation bands around reference weather"
+            git push origin HEAD:agent/v0.21.4-weather-nav-ui
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Stage packages
+        run: |
+          mkdir -p artifacts
+          cp app/build/outputs/apk/release/app-release.apk artifacts/FabData-v0.21.4-weather-nav-ui-release.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifacts/FabData-v0.21.4-weather-nav-ui-release.aab
+          printf '%s\n' "$FABDATA_SIGNING_MODE" > artifacts/FabData-v0.21.4-weather-nav-ui-signing-mode.txt
+          sha256sum artifacts/FabData-v0.21.4-weather-nav-ui-release.apk artifacts/FabData-v0.21.4-weather-nav-ui-release.aab > artifacts/FabData-v0.21.4-weather-nav-ui-sha256.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.21.4-weather-nav-ui
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          gh release delete v0.21.4-weather-nav-ui --yes --cleanup-tag 2>/dev/null || true
+          gh release create v0.21.4-weather-nav-ui \
+            --target "$TARGET_SHA" \
+            --title "FabData v0.21.4 weather navigation UI" \
+            --notes "Les deux bandeaux supérieurs deviennent des navigateurs temporels météo pure : global en météo extérieure LOD jour, zoom large en météo extérieure LOD 6 h. Ils ne chargent plus les sondes physiques ni le sol inertiel. Le sélecteur prend la couleur de la température extérieure visée, affiche sa valeur et les trous météo sont matérialisés. Les commandes de période, choix de courbes, sélection, aide et alertes sont déplacées entre le bandeau 2 et le bandeau 3. Pendant le glisser du bandeau 2, seul son sélecteur provisoire bouge ; aucun recalcul inférieur n'est lancé. Les zones 3 et 4 restent figées sous un voile gris progressif, puis un seul recalcul est validé au relâchement ; après chargement un flash doux traverse le voile et révèle les nouvelles courbes. Les corrections performance/annulation et la cascade stricte de v0.21.3 sont conservées." \
+            artifacts/FabData-v0.21.4-weather-nav-ui-release.apk \
+            artifacts/FabData-v0.21.4-weather-nav-ui-release.aab \
+            artifacts/FabData-v0.21.4-weather-nav-ui-signing-mode.txt \
+            artifacts/FabData-v0.21.4-weather-nav-ui-sha256.txt
