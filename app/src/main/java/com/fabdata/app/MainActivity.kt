@@ -91,9 +91,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.LocalDateTime
@@ -292,6 +295,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val draftStore = remember { AnnotationDraftStore(context) }
     val prefsStore = remember { FabPrefs(context) }
     val scope = rememberCoroutineScope()
+    val reloadMutex = remember { Mutex() }
     val snackbar = remember { SnackbarHostState() }
 
     var sensors by remember { mutableStateOf<List<Sensor>>(emptyList()) }
@@ -463,14 +467,19 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs, wideOverviewRange, explorationOverviewRange) {
+        reloadMutex.withLock {
         val reloadStarted = System.currentTimeMillis()
         val reloadOperation = FabOperationRegistry.tryStart(
-            "ui-reload", "Actualisation affichage", "Lecture des courbes…", cancellable = false
+            "ui-reload", "Actualisation affichage", "Lecture des courbes…", cancellable = true
         )
+        var reloadSucceeded = false
         try {
         busy = true
         val loaded = withContext(Dispatchers.IO) {
+            FabOperationRegistry.ensureNotCancelled(reloadOperation)
+            FabOperationRegistry.update(reloadOperation, "Capteurs & bornes…")
             val s = db.sensors()
+            FabOperationRegistry.ensureNotCancelled(reloadOperation)
 
             // Les thermomètres physiques/importés définissent la période de navigation.
             // Lyon et les sondes HTTP complètent cette période sans pousser l'ancien hors écran.
@@ -504,7 +513,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
             }
 
+            FabOperationRegistry.ensureNotCancelled(reloadOperation)
+            FabOperationRegistry.update(reloadOperation, "Annotations & fenêtre…")
             val allNotes = db.annotationsAll()
+            FabOperationRegistry.ensureNotCancelled(reloadOperation)
             if (chosen == null || all == null) {
                 LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null)
             } else {
@@ -542,7 +554,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 val navigatorScope = clipRange(wideOverviewRange ?: defaultWide, all)
                 val explorationScope = clipRange(explorationOverviewRange ?: defaultExploration, navigatorScope)
 
-                val samples = s.associate { sensor ->
+                val samples = s.mapIndexed { sensorIndex, sensor ->
+                    FabOperationRegistry.ensureNotCancelled(reloadOperation)
+                    FabOperationRegistry.update(
+                        reloadOperation,
+                        "Détail RAW · ${sensorIndex + 1}/${s.size}",
+                        sensorIndex + 1,
+                        s.size
+                    )
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         // v0.10 : une seule chronologie Lyon. Reconstruction d'abord, puis
                         // données stockées, puis officiel 6 min qui garde la priorité absolue.
@@ -562,7 +581,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         db.querySamples(sensor.id, chosen.first, chosen.last)
                     }
                     sensor.id to value
-                }
+                }.toMap()
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 // v0.10.3 : cette couche EST la série météo effectivement consommée par le RC.
                 val lyonReconstructed = weatherReferenceStore.query(
                     selectedWeatherReference.key, chosen.first, chosen.last
@@ -571,6 +591,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
                 fun physicalLod(bucketMs: Long, range: LongRange): Map<Long, List<SamplePoint>> =
                     s.associate { sensor ->
+                        FabOperationRegistry.ensureNotCancelled(reloadOperation)
                         sensor.id to db.querySamplesLod(sensor.id, range.first, range.last, bucketMs)
                     }
                 fun weatherLod(bucketMs: Long, range: LongRange): List<SamplePoint> =
@@ -586,12 +607,21 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 // V0.21.1 : vraie cascade. Seul le giga touche tout l'historique.
                 // Le niveau jour ne lit que la fenêtre large ; le niveau 6 h uniquement
                 // la fenêtre d'exploration. Le graphe détaillé reste limité à chosen.
+                FabOperationRegistry.update(reloadOperation, "Global · LOD mois…")
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 val gigaOverview = physicalLod(OVERVIEW_LOD_MONTH_MS, all) +
                     (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_MONTH_MS, all))
+
+                FabOperationRegistry.update(reloadOperation, "Zoom large · LOD jour…")
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 val navigatorOverview = physicalLod(OVERVIEW_LOD_DAY_MS, navigatorScope) +
                     (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_DAY_MS, navigatorScope))
+
+                FabOperationRegistry.update(reloadOperation, "Sélection · LOD 6 h…")
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 val explorationOverview = physicalLod(OVERVIEW_LOD_6H_MS, explorationScope) +
                     (LYON_RECONSTRUCTED_SENSOR_ID to weatherLod(OVERVIEW_LOD_6H_MS, explorationScope))
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 val stat = s.mapNotNull { sensor ->
                     val value = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                         sensorStatsFromSamples(sensor.id, samples[sensor.id].orEmpty())
@@ -605,6 +635,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     .getLong("selected_sensor_id", -1L)
                     .takeIf { it >= 0L }
                 val trainedModel = trainedModelStore.loadUsable(selectedWeatherReference.key, modelSensorId)
+                FabOperationRegistry.update(reloadOperation, "Sol inertiel · projection…")
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 val inertia = trainedModel?.let { model ->
                     runCatching {
                         val measuredProjection = inertiaEstimator.projectTrained(selectedWeatherReference, model)
@@ -624,6 +656,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         )
                     }.getOrNull()
                 }
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
                 fun withInertiaLod(
                     base: Map<Long, List<SamplePoint>>,
                     bucketMs: Long,
@@ -668,6 +701,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 )
             }
         }
+        FabOperationRegistry.ensureNotCancelled(reloadOperation)
         sensors = loaded.sensors
         globalBounds = loaded.globalBounds
         viewBounds = loaded.viewBounds
@@ -710,12 +744,25 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = true
         showHumidity[THERMAL_INERTIA_SENSOR_ID] = false
         busy = false
+        reloadSucceeded = true
+        } catch (cancel: CancellationException) {
+            FabOperationRegistry.cancelled(reloadOperation, "Actualisation affichage annulée")
+            throw cancel
+        } catch (error: Throwable) {
+            FabOperationRegistry.fail(
+                reloadOperation,
+                error.message ?: "Actualisation affichage impossible"
+            )
+            throw error
         } finally {
             busy = false
-            FabOperationRegistry.finish(
-                reloadOperation,
-                "Affichage prêt · ${System.currentTimeMillis() - reloadStarted} ms"
-            )
+            if (reloadSucceeded) {
+                FabOperationRegistry.finish(
+                    reloadOperation,
+                    "Affichage prêt · ${System.currentTimeMillis() - reloadStarted} ms"
+                )
+            }
+        }
         }
     }
 

@@ -13,7 +13,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
 /**
@@ -83,6 +85,7 @@ fun FabLiveUpdateCoordinator(
                 // Important : le focus ne choisit jamais une autre station.
                 // La référence ne peut changer que depuis l'écran de choix explicite.
                 val reference = referenceForOperation
+                FabOperationRegistry.ensureNotCancelled(operationId)
                 FabOperationRegistry.update(operationId, "${reference.label} · météo récente…")
 
                 if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
@@ -93,9 +96,18 @@ fun FabLiveUpdateCoordinator(
                     }
                 }
 
-                PointSourceStore.reconcileMeasuredDominance(db)
+                FabOperationRegistry.ensureNotCancelled(operationId)
+                val dominanceNow = System.currentTimeMillis()
+                val recentFrom = dominanceNow - 48L * 60L * 60L * 1000L
+                val recentTo = dominanceNow + 12L * 60L * 60L * 1000L
+                FabOperationRegistry.update(operationId, "${reference.label} · cohérence récente…")
+                // v0.21.2 : jamais de réparation historique globale au focus.
+                PointSourceStore.reconcileMeasuredDominance(db, recentFrom, recentTo)
+
+                FabOperationRegistry.ensureNotCancelled(operationId)
+                FabOperationRegistry.update(operationId, "${reference.label} · référence récente…")
                 manager.refreshRecent(reference)
-                if (FabOperationRegistry.cancelRequested(operationId)) return@withContext
+                FabOperationRegistry.ensureNotCancelled(operationId)
 
                 FabOperationRegistry.update(operationId, "${reference.label} · prévision / cohérence…")
                 val profile = profileStore.load()
@@ -106,10 +118,12 @@ fun FabLiveUpdateCoordinator(
                 // Une nouvelle mesure ne le remplace pas et aucun historique n'est recalculé ici.
                 val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
                 if (trainedModel != null) {
+                    FabOperationRegistry.ensureNotCancelled(operationId)
                     engine.refreshForecasts(
                         reference, trainedModel.sensorId, profile, mode,
                         precalibratedModel = trainedModel
                     )
+                    FabOperationRegistry.ensureNotCancelled(operationId)
                 }
             }
             if (FabOperationRegistry.cancelRequested(operationId)) {
@@ -120,8 +134,15 @@ fun FabLiveUpdateCoordinator(
             }
             true
         } catch (cancel: CancellationException) {
-            FabOperationRegistry.cancelled(operationId, "Routine remplacée / composition quittée")
-            throw cancel
+            val userRequested = FabOperationRegistry.cancelRequested(operationId)
+            FabOperationRegistry.cancelled(
+                operationId,
+                if (userRequested) "Mise à jour automatique arrêtée" else "Routine remplacée / composition quittée"
+            )
+            // Un clic utilisateur termine seulement CE passage. Une vraie annulation du
+            // LaunchedEffect (composition/lifecycle) doit continuer à se propager.
+            if (!userRequested || !currentCoroutineContext().isActive) throw cancel
+            false
         } catch (error: Throwable) {
             FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour automatique impossible")
             false

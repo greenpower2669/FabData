@@ -26,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.ZoneId
@@ -119,6 +120,19 @@ object FabOperationRegistry {
     fun cancelRequested(id: Long?): Boolean {
         if (id == null) return false
         return operations.firstOrNull { it.id == id }?.state == FabOperationState.CANCEL_REQUESTED
+    }
+
+    /**
+     * Point de contrôle coopératif. Une pression sur Annuler ne reste plus un simple
+     * état visuel : les traitements bornés appellent cette méthode entre deux blocs
+     * SQLite/réseau et quittent réellement leur coroutine.
+     */
+    @Synchronized
+    fun ensureNotCancelled(id: Long?) {
+        if (id == null) return
+        if (operations.firstOrNull { it.id == id }?.state == FabOperationState.CANCEL_REQUESTED) {
+            throw CancellationException("FabData operation cancellation requested")
+        }
     }
 
     @Synchronized

@@ -96,6 +96,7 @@ object PointSourceStore {
             """.trimIndent()
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_point_sources_time ON point_sources(sensor_id, timestamp)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_point_sources_source_time ON point_sources(source, timestamp)")
         ensureColumn(db, "sigma_c", "REAL")
         ensureColumn(db, "analog_count", "INTEGER")
         ensureColumn(db, "profile_hash", "TEXT")
@@ -197,32 +198,73 @@ object PointSourceStore {
      * au moins une vraie mesure, seules les lignes calculées de ce même bucket sont
      * retirées. Aucune mesure réelle ne peut apparaître dans la liste de suppression.
      */
-    fun reconcileMeasuredDominance(db: FabDataDb): Int {
+    fun reconcileMeasuredDominance(db: FabDataDb): Int =
+        reconcileMeasuredDominance(db, Long.MIN_VALUE, Long.MAX_VALUE)
+
+    /**
+     * Réparation de dominance bornée et set-based.
+     *
+     * L'ancienne version matérialisait toute la liste historique puis exécutait deux
+     * DELETE par point. Sur une grosse base elle pouvait conserver SQLite pendant des
+     * minutes/heures et bloquer simultanément l'affichage. Ici SQLite identifie puis
+     * supprime le lot en une seule transaction, et le live peut limiter la fenêtre.
+     */
+    fun reconcileMeasuredDominance(db: FabDataDb, from: Long, to: Long): Int {
+        require(to >= from) { "Période de réconciliation invalide" }
         ensure(db.writableDatabase)
-        val stale = mutableListOf<Pair<Long, Long>>()
-        db.readableDatabase.rawQuery(
-            """
-            SELECT c.sensor_id, c.timestamp
-            FROM point_sources c
-            WHERE c.source<>'measured'
-              AND EXISTS (
-                SELECT 1
-                FROM samples m
-                LEFT JOIN point_sources mp ON mp.sensor_id=m.sensor_id AND mp.timestamp=m.timestamp
-                WHERE m.sensor_id=c.sensor_id
-                  AND (m.timestamp / 3600000)=(c.timestamp / 3600000)
-                  AND (mp.source IS NULL OR mp.source='measured')
-              )
-            """.trimIndent(), null
-        ).use { c -> while (c.moveToNext()) stale += c.getLong(0) to c.getLong(1) }
-        if (stale.isEmpty()) return 0
-        db.inTransaction {
-            stale.forEach { (sensorId, ts) ->
-                db.writableDatabase.delete("samples", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
-                db.writableDatabase.delete("point_sources", "sensor_id=? AND timestamp=?", arrayOf(sensorId.toString(), ts.toString()))
-            }
+        val sql = db.writableDatabase
+        val args = arrayOf(from.toString(), to.toString())
+        sql.beginTransaction()
+        return try {
+            val deleted = sql.delete(
+                "samples",
+                """
+                rowid IN (
+                    SELECT stale.rowid
+                    FROM point_sources c
+                    JOIN samples stale
+                      ON stale.sensor_id=c.sensor_id AND stale.timestamp=c.timestamp
+                    WHERE c.source<>'measured'
+                      AND c.timestamp BETWEEN ? AND ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM samples m
+                          LEFT JOIN point_sources mp
+                            ON mp.sensor_id=m.sensor_id AND mp.timestamp=m.timestamp
+                          WHERE m.sensor_id=c.sensor_id
+                            AND m.timestamp BETWEEN
+                                ((c.timestamp / 3600000) * 3600000)
+                                AND (((c.timestamp / 3600000) * 3600000) + 3599999)
+                            AND (mp.source IS NULL OR mp.source='measured')
+                      )
+                )
+                """.trimIndent(),
+                args
+            )
+
+            // Les samples viennent d'être retirés : enlève leurs provenances devenues
+            // orphelines, toujours dans la même fenêtre et sans boucle Kotlin.
+            sql.delete(
+                "point_sources",
+                """
+                rowid IN (
+                    SELECT c.rowid
+                    FROM point_sources c
+                    WHERE c.source<>'measured'
+                      AND c.timestamp BETWEEN ? AND ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM samples s
+                          WHERE s.sensor_id=c.sensor_id AND s.timestamp=c.timestamp
+                      )
+                )
+                """.trimIndent(),
+                args
+            )
+            sql.setTransactionSuccessful()
+            deleted
+        } finally {
+            sql.endTransaction()
         }
-        return stale.size
     }
 
     private fun invalidateForecastsAfterMeasured(db: FabDataDb, sensorId: Long, timestamp: Long) {

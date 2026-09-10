@@ -146,6 +146,7 @@ class WeatherReferenceStore(private val db: FabDataDb) {
                 """.trimIndent()
             )
             sql.execSQL("CREATE INDEX IF NOT EXISTS idx_weather_reference_time ON weather_reference_samples(reference_key, timestamp)")
+            sql.execSQL("CREATE INDEX IF NOT EXISTS idx_weather_reference_source_time ON weather_reference_samples(reference_key, source, timestamp)")
             sql.execSQL(
                 """
                 CREATE TABLE IF NOT EXISTS weather_reference_meta (
@@ -261,28 +262,37 @@ class WeatherReferenceStore(private val db: FabDataDb) {
         return stale.size
     }
 
-    fun reconcileMeasuredDominance(referenceKey: String): Int {
-        val stale = mutableListOf<Long>()
-        db.readableDatabase.rawQuery(
+    fun reconcileMeasuredDominance(referenceKey: String): Int =
+        reconcileMeasuredDominance(referenceKey, Long.MIN_VALUE, Long.MAX_VALUE)
+
+    /**
+     * Nettoyage météo borné. SQLite supprime directement les lignes calculées dont
+     * l'heure possède une mesure réelle, sans rapatrier toute l'histoire en Kotlin.
+     */
+    fun reconcileMeasuredDominance(referenceKey: String, from: Long, to: Long): Int {
+        require(to >= from) { "Période météo invalide" }
+        return db.writableDatabase.delete(
+            "weather_reference_samples",
             """
-            SELECT c.timestamp
-            FROM weather_reference_samples c
-            WHERE c.reference_key=? AND c.source<>'measured'
-              AND EXISTS (
-                SELECT 1 FROM weather_reference_samples m
-                WHERE m.reference_key=c.reference_key AND m.source='measured'
-                  AND (m.timestamp / 3600000)=(c.timestamp / 3600000)
-              )
-            """.trimIndent(), arrayOf(referenceKey)
-        ).use { c -> while (c.moveToNext()) stale += c.getLong(0) }
-        stale.forEach { ts ->
-            db.writableDatabase.delete(
-                "weather_reference_samples",
-                "reference_key=? AND timestamp=? AND source<>'measured'",
-                arrayOf(referenceKey, ts.toString())
+            rowid IN (
+                SELECT c.rowid
+                FROM weather_reference_samples c
+                WHERE c.reference_key=?
+                  AND c.source<>'measured'
+                  AND c.timestamp BETWEEN ? AND ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM weather_reference_samples m
+                      WHERE m.reference_key=c.reference_key
+                        AND m.source='measured'
+                        AND m.timestamp BETWEEN
+                            ((c.timestamp / 3600000) * 3600000)
+                            AND (((c.timestamp / 3600000) * 3600000) + 3599999)
+                  )
             )
-        }
-        return stale.size
+            """.trimIndent(),
+            arrayOf(referenceKey, from.toString(), to.toString())
+        )
     }
 
     fun query(referenceKey: String, from: Long, to: Long): List<WeatherReferencePoint> {
@@ -514,7 +524,7 @@ class WeatherReferenceManager(
             reconstructShortGaps(reference.key, from, to)
         }
 
-        store.reconcileMeasuredDominance(reference.key)
+        store.reconcileMeasuredDominance(reference.key, from, minOf(to, System.currentTimeMillis()))
         val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
         val actual = store.query(reference.key, from, minOf(to, System.currentTimeMillis()))
         return WeatherReferenceSyncResult(
@@ -667,7 +677,7 @@ class WeatherReferenceManager(
         }
 
         reconstructShortGaps(reference.key, from, now)
-        store.reconcileMeasuredDominance(reference.key)
+        store.reconcileMeasuredDominance(reference.key, from, now)
         val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
         val actual = store.query(reference.key, from, now)
         return WeatherReferenceSyncResult(
