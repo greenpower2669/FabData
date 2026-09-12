@@ -243,6 +243,9 @@ private class ForecastDialDataSource(
     fun load(now: Long = System.currentTimeMillis()): DialState {
         ForecastMemoryStore.ensure(db.writableDatabase)
         val reference = WeatherReferencePrefs(appContext).selectedReference()
+        runCatching {
+            ForecastSelectableCurveStore(db).materializeLocalSnapshots(reference.key, now - 48L * HOUR_MS, now + 24L * HOUR_MS, now)
+        }
         val nowHour = hourBucket(now)
         val targets = listOf(
             "PASSÉ" to (nowHour - HOUR_MS),

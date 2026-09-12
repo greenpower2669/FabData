@@ -368,6 +368,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             sensors.forEach { sensor -> put(sensor.id, curveStyleStore.load("sensor:${sensor.stableKey}")) }
             put(WEATHER_OFFICIAL_SENSOR_ID, curveStyleStore.load("weather:official"))
             put(LYON_RECONSTRUCTED_SENSOR_ID, curveStyleStore.load("lyon:reconstructed"))
+            put(FORECAST_RECONSTRUCTED_SENSOR_ID, curveStyleStore.load("forecast:reconstructed"))
+            put(FORECAST_FAB_SENSOR_ID, curveStyleStore.load("forecast:fab"))
             put(THERMAL_INERTIA_SENSOR_ID, curveStyleStore.load("thermal:inertia"))
         }
     }
@@ -767,6 +769,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
         // v0.19.7: on montre la surface/sol inertiel sur la période MEASURED uniquement.
         // La masse énergétique profonde reste cachée et n'est jamais branchée au graphe.
+        if (!showTemp.containsKey(FORECAST_RECONSTRUCTED_SENSOR_ID)) showTemp[FORECAST_RECONSTRUCTED_SENSOR_ID] = true
+        if (!showTemp.containsKey(FORECAST_FAB_SENSOR_ID)) showTemp[FORECAST_FAB_SENSOR_ID] = true
+        showHumidity[FORECAST_RECONSTRUCTED_SENSOR_ID] = false
+        showHumidity[FORECAST_FAB_SENSOR_ID] = false
         if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = true
         showHumidity[THERMAL_INERTIA_SENSOR_ID] = false
         busy = false
@@ -793,6 +799,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     val visualReference = WeatherReferencePrefs(context).selectedReference()
+    var selectableForecastCurves by remember(visualReference.key) { mutableStateOf(ForecastSelectableCurves.EMPTY) }
+    LaunchedEffect(reloadToken, visualReference.key, globalBounds?.first, globalBounds?.last) {
+        val history = globalBounds
+        if (history == null) selectableForecastCurves = ForecastSelectableCurves.EMPTY else {
+            val now = System.currentTimeMillis()
+            val queryTo = maxOf(history.last, now + 24L * 60L * 60L * 1000L)
+            selectableForecastCurves = withContext(Dispatchers.IO) { ForecastSelectableCurveStore(db).query(visualReference.key, history.first, queryTo, now) }
+        }
+    }
+    val forecastReconstructedSamples = selectableForecastCurves.reconstructed
+    val forecastFabSamples = selectableForecastCurves.fab
     val weatherOfficialSamples = lyonReconstructedSamples
         .filter { it.source == PointSource.MEASURED }
         .map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }
@@ -831,11 +848,15 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         latestTimestamp = inertiaEstimate?.surfacePoints?.lastOrNull()?.timestamp
             ?: explorationOverviewSampleMap[THERMAL_INERTIA_SENSOR_ID]?.lastOrNull()?.timestamp
     )
+    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision reconstruite", "Archive prévisionnelle + futur actif", 13, forecastReconstructedSamples.lastOrNull()?.timestamp)
+    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab", "Notre prévision locale corrigée", 8, forecastFabSamples.lastOrNull()?.timestamp)
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
-    val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + inertiaSensor
+    val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
     val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
         (WEATHER_OFFICIAL_SENSOR_ID to weatherOfficialSamples) +
         (LYON_RECONSTRUCTED_SENSOR_ID to weatherReconstructedSamples) +
+        (FORECAST_RECONSTRUCTED_SENSOR_ID to forecastReconstructedSamples) +
+        (FORECAST_FAB_SENSOR_ID to forecastFabSamples) +
         (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
 
     fun chartLodMap(source: Map<Long, List<SamplePoint>>): Map<Long, List<SamplePoint>> {
@@ -1354,6 +1375,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             val key = when (sensor.id) {
                                 WEATHER_OFFICIAL_SENSOR_ID -> "weather:official"
                                 LYON_RECONSTRUCTED_SENSOR_ID -> "lyon:reconstructed"
+                                FORECAST_RECONSTRUCTED_SENSOR_ID -> "forecast:reconstructed"
+                                FORECAST_FAB_SENSOR_ID -> "forecast:fab"
                                 THERMAL_INERTIA_SENSOR_ID -> "thermal:inertia"
                                 else -> "sensor:${sensor.stableKey}"
                             }
@@ -1846,6 +1869,8 @@ private fun SeriesSelector(
                         val displayRoom = when (sensor.id) {
                             WEATHER_OFFICIAL_SENSOR_ID -> "Station météo officielle"
                             LYON_RECONSTRUCTED_SENSOR_ID -> "Station météo reconstruite"
+                            FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision reconstruite"
+                            FORECAST_FAB_SENSOR_ID -> "Prévision Fab"
                             THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
                             else -> sensor.room
                         }
@@ -1865,7 +1890,7 @@ private fun SeriesSelector(
                         checked = showTemp[sensor.id] == true,
                         onCheckedChange = { showTemp[sensor.id] = it }
                     )
-                    if (sensor.id != THERMAL_INERTIA_SENSOR_ID) {
+                    if (sensor.id != THERMAL_INERTIA_SENSOR_ID && sensor.id != FORECAST_RECONSTRUCTED_SENSOR_ID && sensor.id != FORECAST_FAB_SENSOR_ID) {
                         Text("%", style = MaterialTheme.typography.labelMedium)
                         Checkbox(
                             checked = showHumidity[sensor.id] == true,
