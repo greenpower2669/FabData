@@ -10,6 +10,7 @@ on:
       - 'app/src/main/java/com/fabdata/app/ForecastReplayUi.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastPastArchive.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt'
       - 'app/src/main/java/com/fabdata/app/BackupV3Support.kt'
       - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
       - 'app/src/main/AndroidManifest.xml'
@@ -64,10 +65,13 @@ jobs:
           grep -n 'FORECAST_RECONSTRUCTED_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'FORECAST_FAB_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'CURVE_STEP_10M_MS' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'ForecastCurve10mStore.persistAlignedPast' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'forecast_curve_10m_archive' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
           grep -n 'Prévision météo reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'Prévision Fab reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'historical-forecast-api.open-meteo.com' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
           grep -n 'FORECAST_PAST_API_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -n 'FORECAST_CURVE_10M_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
           grep -n 'ForecastPastArchiveBackfill' app/src/main/java/com/fabdata/app/MainActivity.kt
           ! grep -n 'source=.reconstructed.' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
 
@@ -101,7 +105,7 @@ jobs:
 
       - name: Commit validated source
         run: |
-          if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
+          if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
             echo "Forecast archive source already committed"
           else
             git config user.name "github-actions[bot]"
@@ -110,6 +114,7 @@ jobs:
                     app/src/main/java/com/fabdata/app/ForecastReplayUi.kt \
                     app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt \
                     app/src/main/java/com/fabdata/app/ForecastPastArchive.kt \
+                    app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt \
                     app/src/main/java/com/fabdata/app/BackupV3Support.kt \
                     app/src/main/java/com/fabdata/app/MainActivity.kt
             git commit -m "Cache past forecast archive and 10-minute user backtest [skip ci]"
