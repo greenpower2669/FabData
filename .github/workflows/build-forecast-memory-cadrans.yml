@@ -16,6 +16,7 @@ on:
       - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
       - 'app/src/main/AndroidManifest.xml'
       - 'tools/patch_forecast_fixed_lead_h24_v2.py'
+      - 'tools/patch_forecast_cache_v3.py'
       - 'tools/patch_terrain_reference_ui.py'
       - '.github/workflows/build-forecast-memory-cadrans.yml'
 
@@ -36,6 +37,9 @@ jobs:
       - name: Switch past verification to Météo-France H24
         run: python3 tools/patch_forecast_fixed_lead_h24_v2.py
 
+      - name: Invalidate prior mixed-horizon 10-minute cache
+        run: python3 tools/patch_forecast_cache_v3.py
+
       - name: Apply terrain reference and UI audit fixes
         run: python3 tools/patch_terrain_reference_ui.py
 
@@ -52,7 +56,8 @@ jobs:
           grep -n 'past = fixed-lead Météo-France H+24 archive only' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'Scientific comparison: never fall back' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'forecast_curve_10m_archive' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
-          grep -n 'fab-local-causal-h24-v2' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
+          grep -n 'fab-local-causal-h24-terrain-v3' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
+          grep -n 'meteofrance-h24-terrain-cosine-10m' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
           grep -n 'previous-runs-api.open-meteo.com/v1/meteofrance' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
           grep -n 'temperature_2m_previous_day1' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
           grep -n 'open-meteo-previous-runs-h24-meteofrance' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
