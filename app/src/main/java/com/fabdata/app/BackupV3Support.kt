@@ -34,6 +34,8 @@ class FabDataBackupV3Support(
         WeatherReferenceStore.ensure(db.writableDatabase)
         ForecastMemoryStore.ensure(db.writableDatabase)
         ForecastLocalSnapshotStore.ensure(db.writableDatabase)
+        ForecastPastArchiveStore.ensure(db.writableDatabase)
+        ForecastCurve10mStore.ensure(db.writableDatabase)
 
         writeJson(writer, "WEATHER_META", weatherMetaJson())
         WeatherReferenceStore(db).allReferenceMetadata().forEach { meta ->
@@ -153,6 +155,53 @@ class FabDataBackupV3Support(
 
         db.readableDatabase.rawQuery(
             """
+            SELECT reference_key, target_ts, weather_temperature, humidity, fab_temperature,
+                   weather_confidence, fab_confidence, provider, fetched_at
+            FROM ${ForecastPastArchiveStore.TABLE}
+            ORDER BY reference_key, target_ts
+            """.trimIndent(), null
+        ).use { c ->
+            while (c.moveToNext()) {
+                writeJson(writer, "FORECAST_PAST_API_ARCHIVE", JSONObject().apply {
+                    put("referenceKey", c.getString(0))
+                    put("targetAt", c.getLong(1))
+                    put("weatherTemperature", c.getDouble(2))
+                    put("humidity", c.getDouble(3))
+                    putNullable("fabTemperature", if (c.isNull(4)) null else c.getDouble(4))
+                    put("weatherConfidence", c.getDouble(5))
+                    putNullable("fabConfidence", if (c.isNull(6)) null else c.getDouble(6))
+                    put("provider", c.getString(7))
+                    put("fetchedAt", c.getLong(8))
+                })
+            }
+        }
+
+        db.readableDatabase.rawQuery(
+            """
+            SELECT reference_key, target_ts, weather_temperature, fab_temperature, humidity,
+                   weather_confidence, fab_confidence, origin, model_version, created_at
+            FROM ${ForecastCurve10mStore.TABLE}
+            ORDER BY reference_key, target_ts, model_version
+            """.trimIndent(), null
+        ).use { c ->
+            while (c.moveToNext()) {
+                writeJson(writer, "FORECAST_CURVE_10M_ARCHIVE", JSONObject().apply {
+                    put("referenceKey", c.getString(0))
+                    put("targetAt", c.getLong(1))
+                    put("weatherTemperature", c.getDouble(2))
+                    put("fabTemperature", c.getDouble(3))
+                    put("humidity", c.getDouble(4))
+                    put("weatherConfidence", c.getDouble(5))
+                    put("fabConfidence", c.getDouble(6))
+                    put("origin", c.getString(7))
+                    put("modelVersion", c.getString(8))
+                    put("createdAt", c.getLong(9))
+                })
+            }
+        }
+
+        db.readableDatabase.rawQuery(
+            """
             SELECT reference_key, timestamp, temperature, humidity, source, confidence
             FROM weather_reference_samples
             ORDER BY reference_key, timestamp
@@ -188,6 +237,8 @@ class FabDataBackupV3Support(
                 "TRAINING_EXCLUSION" -> restoreTrainingExclusion(json(values))
                 "FORECAST_ARCHIVE" -> restoreForecastArchive(json(values))
                 "FORECAST_LOCAL_ARCHIVE" -> restoreForecastLocalArchive(json(values))
+                "FORECAST_PAST_API_ARCHIVE" -> restoreForecastPastApiArchive(json(values))
+                "FORECAST_CURVE_10M_ARCHIVE" -> restoreForecastCurve10mArchive(json(values))
                 "WEATHER" -> restoreWeather(values)
                 else -> return false
             }
@@ -459,6 +510,48 @@ class FabDataBackupV3Support(
         val fab = o.optDouble("fabTemperature", Double.NaN)
         if (key.isBlank() || issuedAt < 0L || targetAt < 0L || !baseline.isFinite() || !fab.isFinite()) return
         ForecastLocalSnapshotStore.restore(db.writableDatabase, key, issuedAt, targetAt, baseline, fab, nullableDouble(o, "confidence"), o.optInt("modelSamples", 0), o.optLong("createdAt", issuedAt))
+    }
+
+    private fun restoreForecastPastApiArchive(o: JSONObject) {
+        val key = o.optString("referenceKey", "").trim()
+        val targetAt = o.optLong("targetAt", -1L)
+        val weather = o.optDouble("weatherTemperature", Double.NaN)
+        val humidity = o.optDouble("humidity", Double.NaN)
+        if (key.isBlank() || targetAt < 0L || !weather.isFinite() || !humidity.isFinite()) return
+        ForecastPastArchiveStore.restore(
+            sql = db.writableDatabase,
+            referenceKey = key,
+            targetAt = targetAt,
+            weatherTemperature = weather,
+            humidity = humidity,
+            fabTemperature = nullableDouble(o, "fabTemperature"),
+            weatherConfidence = o.optDouble("weatherConfidence", 0.78),
+            fabConfidence = nullableDouble(o, "fabConfidence"),
+            provider = o.optString("provider", ForecastPastArchiveStore.PROVIDER),
+            fetchedAt = o.optLong("fetchedAt", System.currentTimeMillis())
+        )
+    }
+
+    private fun restoreForecastCurve10mArchive(o: JSONObject) {
+        val key = o.optString("referenceKey", "").trim()
+        val targetAt = o.optLong("targetAt", -1L)
+        val weather = o.optDouble("weatherTemperature", Double.NaN)
+        val fab = o.optDouble("fabTemperature", Double.NaN)
+        val humidity = o.optDouble("humidity", Double.NaN)
+        if (key.isBlank() || targetAt < 0L || !weather.isFinite() || !fab.isFinite() || !humidity.isFinite()) return
+        ForecastCurve10mStore.restore(
+            sql = db.writableDatabase,
+            referenceKey = key,
+            targetAt = targetAt,
+            weatherTemperature = weather,
+            fabTemperature = fab,
+            humidity = humidity,
+            weatherConfidence = o.optDouble("weatherConfidence", 0.65),
+            fabConfidence = o.optDouble("fabConfidence", 0.45),
+            origin = o.optString("origin", ForecastCurve10mStore.ORIGIN),
+            modelVersion = o.optString("modelVersion", ForecastCurve10mStore.MODEL_VERSION),
+            createdAt = o.optLong("createdAt", targetAt)
+        )
     }
 
     private fun restoreWeather(values: Map<String, String>) {

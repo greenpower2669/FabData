@@ -805,7 +805,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (history == null) selectableForecastCurves = ForecastSelectableCurves.EMPTY else {
             val now = System.currentTimeMillis()
             val queryTo = maxOf(history.last, now + 24L * 60L * 60L * 1000L)
-            selectableForecastCurves = withContext(Dispatchers.IO) { ForecastSelectableCurveStore(db).query(visualReference.key, history.first, queryTo, now) }
+            selectableForecastCurves = withContext(Dispatchers.IO) {
+                // Historical forecast API is only a backfill. Once cached it is restored from
+                // FabData backup, so an app update does not need to download it again.
+                ForecastPastArchiveBackfill(db).ensure(
+                    visualReference, history.first, minOf(history.last, now - 60L * 60L * 1000L), now
+                )
+                ForecastSelectableCurveStore(db).query(visualReference.key, history.first, queryTo, now)
+            }
         }
     }
     val forecastReconstructedSamples = selectableForecastCurves.reconstructed
@@ -848,8 +855,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         latestTimestamp = inertiaEstimate?.surfacePoints?.lastOrNull()?.timestamp
             ?: explorationOverviewSampleMap[THERMAL_INERTIA_SENSOR_ID]?.lastOrNull()?.timestamp
     )
-    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision reconstruite", "Archive prévisionnelle + futur actif", 13, forecastReconstructedSamples.lastOrNull()?.timestamp)
-    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab", "Notre prévision locale corrigée", 8, forecastFabSamples.lastOrNull()?.timestamp)
+    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo reconstruite", "Archives de prévisions + futur actif · rendu 10 min", 13, forecastReconstructedSamples.lastOrNull()?.timestamp)
+    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab reconstruite", "Modèle local utilisateur · rendu 10 min", 8, forecastFabSamples.lastOrNull()?.timestamp)
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
     val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
     val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
@@ -1869,8 +1876,8 @@ private fun SeriesSelector(
                         val displayRoom = when (sensor.id) {
                             WEATHER_OFFICIAL_SENSOR_ID -> "Station météo officielle"
                             LYON_RECONSTRUCTED_SENSOR_ID -> "Station météo reconstruite"
-                            FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision reconstruite"
-                            FORECAST_FAB_SENSOR_ID -> "Prévision Fab"
+                            FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision météo reconstruite"
+                            FORECAST_FAB_SENSOR_ID -> "Prévision Fab reconstruite"
                             THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
                             else -> sensor.room
                         }

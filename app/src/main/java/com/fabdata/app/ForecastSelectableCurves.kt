@@ -13,6 +13,7 @@ const val FORECAST_FAB_SENSOR_ID = -6902900105L
 const val FORECAST_FAB_STABLE_KEY = "forecast-fab-local"
 
 private const val CURVE_HOUR_MS = 60L * 60L * 1000L
+private fun curveHourBucket(timestamp: Long): Long = (timestamp / CURVE_HOUR_MS) * CURVE_HOUR_MS
 private const val CURVE_STEP_10M_MS = 10L * 60L * 1000L
 
 /**
@@ -141,6 +142,7 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
         ForecastMemoryStore.ensure(writable)
         ForecastLocalSnapshotStore.ensure(writable)
         ForecastPastArchiveStore.ensure(writable)
+        ForecastCurve10mStore.ensure(writable)
 
         val archive = loadArchive(referenceKey, from, to)
             .filter { it.issuedAt <= now && it.issuedAt < it.targetAt - 5L * 60L * 1000L }
@@ -211,9 +213,35 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
             }
         }
 
+        val generatedWeather = interpolatePrediction10Minutes(reconstructedAnchors)
+        val generatedFab = interpolatePrediction10Minutes(fabAnchors)
+
+        // Once a 10-minute point becomes past, freeze both values together. This makes
+        // weather-vs-Fab comparison auditable and keeps exactly the same curve after restore.
+        ForecastCurve10mStore.persistAlignedPast(
+            db, referenceKey, generatedWeather, generatedFab, now
+        )
+        val frozenPast = ForecastCurve10mStore.query(
+            db, referenceKey, from, minOf(to, now)
+        )
+        val frozenWeather = frozenPast.map { p ->
+            SamplePoint(
+                FORECAST_RECONSTRUCTED_SENSOR_ID, p.targetAt, p.weatherTemperature, p.humidity,
+                PointSource.FORECAST, p.weatherConfidence
+            )
+        }
+        val frozenFab = frozenPast.map { p ->
+            SamplePoint(
+                FORECAST_FAB_SENSOR_ID, p.targetAt, p.fabTemperature, p.humidity,
+                PointSource.FORECAST, p.fabConfidence
+            )
+        }
+
         return ForecastSelectableCurves(
-            reconstructed = interpolatePrediction10Minutes(reconstructedAnchors),
-            fab = interpolatePrediction10Minutes(fabAnchors)
+            reconstructed = (frozenWeather + generatedWeather.filter { it.timestamp > now })
+                .associateBy { it.timestamp }.values.sortedBy { it.timestamp },
+            fab = (frozenFab + generatedFab.filter { it.timestamp > now })
+                .associateBy { it.timestamp }.values.sortedBy { it.timestamp }
         )
     }
 

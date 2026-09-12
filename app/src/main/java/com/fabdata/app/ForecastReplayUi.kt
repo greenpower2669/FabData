@@ -227,9 +227,9 @@ fun ForecastReplayCard(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Mémoire prévisionnelle", fontWeight = FontWeight.Bold)
+                    Text("Archives de prévisions météo", fontWeight = FontWeight.Bold)
                     Text(
-                        "Prévisions sauvegardées à gauche · prévision active à droite",
+                        "Prévisions émises/archivées à gauche · prévision active à droite",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

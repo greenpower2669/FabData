@@ -1,6 +1,5 @@
 package com.fabdata.app
 
-import android.content.ContentValues
 import android.database.sqlite.SQLiteDatabase
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -68,18 +67,35 @@ object ForecastPastArchiveStore {
         fetchedAt: Long
     ) {
         ensure(sql)
-        val values = ContentValues().apply {
-            put("reference_key", referenceKey)
-            put("target_ts", targetAt)
-            put("weather_temperature", weatherTemperature)
-            put("humidity", humidity.coerceIn(0.0, 100.0))
-            if (fabTemperature == null) putNull("fab_temperature") else put("fab_temperature", fabTemperature)
-            put("weather_confidence", weatherConfidence.coerceIn(0.0, 1.0))
-            if (fabConfidence == null) putNull("fab_confidence") else put("fab_confidence", fabConfidence.coerceIn(0.0, 1.0))
-            put("provider", provider.ifBlank { PROVIDER })
-            put("fetched_at", fetchedAt)
-        }
-        sql.insertWithOnConflict(TABLE, null, values, SQLiteDatabase.CONFLICT_REPLACE)
+        val safeProvider = provider.ifBlank { PROVIDER }
+        sql.execSQL(
+            """
+            INSERT OR IGNORE INTO $TABLE(
+                reference_key, target_ts, weather_temperature, humidity, fab_temperature,
+                weather_confidence, fab_confidence, provider, fetched_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """.trimIndent(),
+            arrayOf(
+                referenceKey, targetAt, weatherTemperature, humidity.coerceIn(0.0, 100.0),
+                fabTemperature, weatherConfidence.coerceIn(0.0, 1.0), fabConfidence, safeProvider, fetchedAt
+            )
+        )
+        // API refresh may update the weather anchor, but must never erase a restored/user-specific
+        // Fab backtest. A non-null backup value is allowed to restore/replace it explicitly.
+        sql.execSQL(
+            """
+            UPDATE $TABLE SET
+                weather_temperature=?, humidity=?, weather_confidence=?, fetched_at=?,
+                fab_temperature=COALESCE(?, fab_temperature),
+                fab_confidence=COALESCE(?, fab_confidence)
+            WHERE reference_key=? AND target_ts=? AND provider=?
+            """.trimIndent(),
+            arrayOf(
+                weatherTemperature, humidity.coerceIn(0.0, 100.0),
+                weatherConfidence.coerceIn(0.0, 1.0), fetchedAt,
+                fabTemperature, fabConfidence, referenceKey, targetAt, safeProvider
+            )
+        )
     }
 
     fun query(
