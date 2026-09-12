@@ -1,14 +1,15 @@
-name: Build selectable forecast curves
+name: Build past forecast archive and 10-minute curves
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - 'feature/forecast-selectable-curves'
+      - 'feature/forecast-past-archive-10m'
     paths:
       - 'app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastReplayUi.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastPastArchive.kt'
       - 'app/src/main/java/com/fabdata/app/BackupV3Support.kt'
       - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
       - 'app/src/main/AndroidManifest.xml'
@@ -18,6 +19,7 @@ on:
       - 'tools/patch_main_forecast_selector.py'
       - 'tools/patch_backup_forecast_local.py'
       - 'tools/patch_overlay_forecast_materialize.py'
+      - 'tools/patch_forecast_past_archive_10m.py'
       - '.github/workflows/build-forecast-memory-cadrans.yml'
 
 permissions:
@@ -31,7 +33,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: feature/forecast-selectable-curves
+          ref: feature/forecast-past-archive-10m
           fetch-depth: 0
 
       - name: Apply progressive dial palette
@@ -49,6 +51,9 @@ jobs:
           python3 tools/patch_backup_forecast_local.py
           python3 tools/patch_overlay_forecast_materialize.py
 
+      - name: Add cached historical forecast reconstruction
+        run: python3 tools/patch_forecast_past_archive_10m.py
+
       - name: Regression guard
         run: |
           git diff --check
@@ -58,11 +63,12 @@ jobs:
           grep -n 'cascade latest-edge au relâchement' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'FORECAST_RECONSTRUCTED_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'FORECAST_FAB_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
-          grep -n 'forecast_local_snapshot_archive' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
-          grep -n 'Prévision reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'Prévision Fab' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'FORECAST_LOCAL_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
-          grep -n 'never persisted or exported' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'CURVE_STEP_10M_MS' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'Prévision météo reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Prévision Fab reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'historical-forecast-api.open-meteo.com' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
+          grep -n 'FORECAST_PAST_API_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -n 'ForecastPastArchiveBackfill' app/src/main/java/com/fabdata/app/MainActivity.kt
           ! grep -n 'source=.reconstructed.' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
 
       - name: Set up JDK 17
@@ -88,29 +94,31 @@ jobs:
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
 
-      - name: Normalize beta APK filename
+      - name: Normalize release APK filename
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk \
-             app/build/outputs/apk/debug/FabData-v0.21.5-beta-previsions-selectionnables.apk
+             app/build/outputs/apk/debug/FabData-v0.21.5-release-archives-previsions-10min.apk
 
       - name: Commit validated source
         run: |
-          if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
-            echo "Selectable forecast source already committed"
+          if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo "Forecast archive source already committed"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
                     app/src/main/java/com/fabdata/app/ForecastReplayUi.kt \
+                    app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt \
+                    app/src/main/java/com/fabdata/app/ForecastPastArchive.kt \
                     app/src/main/java/com/fabdata/app/BackupV3Support.kt \
                     app/src/main/java/com/fabdata/app/MainActivity.kt
-            git commit -m "Add selectable archived and Fab forecast curves [skip ci]"
-            git push origin HEAD:feature/forecast-selectable-curves
+            git commit -m "Cache past forecast archive and 10-minute user backtest [skip ci]"
+            git push origin HEAD:feature/forecast-past-archive-10m
           fi
 
-      - name: Upload beta APK
+      - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.21.5-beta-previsions-selectionnables
-          path: app/build/outputs/apk/debug/FabData-v0.21.5-beta-previsions-selectionnables.apk
+          name: FabData-v0.21.5-release-archives-previsions-10min
+          path: app/build/outputs/apk/debug/FabData-v0.21.5-release-archives-previsions-10min.apk
           if-no-files-found: error
