@@ -527,7 +527,7 @@ class FabDataBackupV3Support(
             fabTemperature = nullableDouble(o, "fabTemperature"),
             weatherConfidence = o.optDouble("weatherConfidence", 0.78),
             fabConfidence = nullableDouble(o, "fabConfidence"),
-            provider = o.optString("provider", ForecastPastArchiveStore.PROVIDER),
+            provider = o.optString("provider", ForecastPastArchiveStore.PROVIDER).ifBlank { ForecastPastArchiveStore.PROVIDER },
             fetchedAt = o.optLong("fetchedAt", System.currentTimeMillis())
         )
     }

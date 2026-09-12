@@ -23,8 +23,8 @@ data class ForecastCurve10mPoint(
 
 object ForecastCurve10mStore {
     const val TABLE = "forecast_curve_10m_archive"
-    const val MODEL_VERSION = "fab-local-causal-v1"
-    const val ORIGIN = "archived-or-api-cosine-10m"
+    const val MODEL_VERSION = "fab-local-causal-h24-v2"
+    const val ORIGIN = "meteofrance-h24-cosine-10m"
 
     fun ensure(sql: SQLiteDatabase) {
         sql.execSQL(
