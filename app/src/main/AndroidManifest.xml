@@ -11,6 +11,11 @@
         android:label="FabData"
         android:supportsRtl="true"
         android:theme="@style/Theme.FabData">
+        <provider
+            android:name=".ForecastMemoryBootstrapProvider"
+            android:authorities="${applicationId}.forecast-memory-bootstrap"
+            android:exported="false"
+            android:initOrder="110" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
