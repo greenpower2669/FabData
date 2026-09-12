@@ -3,6 +3,9 @@ from pathlib import Path
 path = Path("app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt")
 text = path.read_text(encoding="utf-8")
 
+# Narrow compile fix: the provider must reference the dial view companion explicitly.
+text = text.replace("            tag = TAG\n", "            tag = ForecastDialStripView.TAG\n")
+
 old = '''    private fun officialBorder(sample: DialSample, night: Boolean): Int {
         val error = sample.officialError ?: return if (night) Color.rgb(150, 155, 165) else Color.rgb(150, 150, 150)
         val strength = (error / 2.5).coerceIn(0.0, 1.0).toFloat()
@@ -62,9 +65,9 @@ new = '''    /*
 '''
 
 if old in text:
-    path.write_text(text.replace(old, new), encoding="utf-8")
-    print("Applied blue -> orange -> red -> violet dial palette")
-elif "private fun errorSeverityColor(errorC: Double): Int" in text:
-    print("Palette already applied")
-else:
+    text = text.replace(old, new)
+elif "private fun errorSeverityColor(errorC: Double): Int" not in text:
     raise SystemExit("Expected dial colour block not found; refusing broad rewrite")
+
+path.write_text(text, encoding="utf-8")
+print("Applied overlay compile fix and blue -> orange -> red -> violet dial palette")
