@@ -15,13 +15,6 @@ on:
       - 'app/src/main/java/com/fabdata/app/BackupV3Support.kt'
       - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
       - 'app/src/main/AndroidManifest.xml'
-      - 'tools/apply_forecast_dial_palette.py'
-      - 'tools/apply_forecast_history_v2.py'
-      - 'tools/apply_latest_edge_cascade.py'
-      - 'tools/patch_main_forecast_selector.py'
-      - 'tools/patch_backup_forecast_local.py'
-      - 'tools/patch_overlay_forecast_materialize.py'
-      - 'tools/patch_forecast_past_archive_10m.py'
       - 'tools/patch_forecast_fixed_lead_h24_v2.py'
       - '.github/workflows/build-forecast-memory-cadrans.yml'
 
@@ -38,24 +31,6 @@ jobs:
         with:
           ref: feature/forecast-fixed-lead-h24
           fetch-depth: 0
-
-      - name: Apply progressive dial palette
-        run: python3 tools/apply_forecast_dial_palette.py
-
-      - name: Apply prediction history v2
-        run: python3 tools/apply_forecast_history_v2.py
-
-      - name: Apply latest-edge cascade
-        run: python3 tools/apply_latest_edge_cascade.py
-
-      - name: Add selectable forecast curves
-        run: |
-          python3 tools/patch_main_forecast_selector.py
-          python3 tools/patch_backup_forecast_local.py
-          python3 tools/patch_overlay_forecast_materialize.py
-
-      - name: Add cached 10-minute prediction archive
-        run: python3 tools/patch_forecast_past_archive_10m.py
 
       - name: Switch past verification to Météo-France H24
         run: python3 tools/patch_forecast_fixed_lead_h24_v2.py
@@ -110,15 +85,12 @@ jobs:
 
       - name: Commit validated source
         run: |
-          if git diff --quiet -- app/build.gradle.kts app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
+          if git diff --quiet -- app/build.gradle.kts app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
             echo "H24 forecast source already committed"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add app/build.gradle.kts \
-                    app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
-                    app/src/main/java/com/fabdata/app/ForecastReplayUi.kt \
-                    app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt \
                     app/src/main/java/com/fabdata/app/ForecastPastArchive.kt \
                     app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt \
                     app/src/main/java/com/fabdata/app/BackupV3Support.kt \
