@@ -1,4 +1,20 @@
 from pathlib import Path
+
+# First make the new prediction-only curve source self-contained.  The app already has
+# multiple package-level hourBucket helpers, so this feature uses a unique helper name.
+curves=Path('app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt')
+cs=curves.read_text()
+if 'private fun curveHourBucket' not in cs:
+    cs=cs.replace(
+        'private const val CURVE_HOUR_MS = 60L * 60L * 1000L\n',
+        'private const val CURVE_HOUR_MS = 60L * 60L * 1000L\nprivate fun curveHourBucket(timestamp: Long): Long = (timestamp / CURVE_HOUR_MS) * CURVE_HOUR_MS\n',
+        1
+    )
+cs=cs.replace('hourBucket(', 'curveHourBucket(')
+# The replacement above also touches the helper declaration if re-run; normalize it.
+cs=cs.replace('private fun curvecurveHourBucket(', 'private fun curveHourBucket(')
+curves.write_text(cs)
+
 p=Path('app/src/main/java/com/fabdata/app/MainActivity.kt')
 s=p.read_text()
 def r(a,b,m):
