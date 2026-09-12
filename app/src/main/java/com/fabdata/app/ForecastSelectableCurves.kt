@@ -1,7 +1,9 @@
 package com.fabdata.app
 
 import android.database.sqlite.SQLiteDatabase
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.min
 
@@ -11,16 +13,21 @@ const val FORECAST_FAB_SENSOR_ID = -6902900105L
 const val FORECAST_FAB_STABLE_KEY = "forecast-fab-local"
 
 private const val CURVE_HOUR_MS = 60L * 60L * 1000L
+private const val CURVE_STEP_10M_MS = 10L * 60L * 1000L
 
 /**
- * Two selectable, prediction-only chart series.
+ * Two selectable prediction-only chart series.
  *
- * reconstructed = what the external forecast really predicted (archived past + current future).
- * fab = the immutable local Fab correction captured for the same forecast snapshot.
+ * Weather curve priority:
+ * 1. immutable snapshots really captured by FabData;
+ * 2. API historical-forecast backfill for older missing hours;
+ * 3. active future forecast.
  *
- * Neither series uses MEASURED nor RECONSTRUCTED weather to fill visual gaps. Missing short
- * gaps are interpolated only between two prediction anchors and those estimated points stay
- * in memory; they are never persisted or exported.
+ * Fab curve follows the exact same anchor timestamps. Locally emitted Fab snapshots win;
+ * otherwise the API past is passed through a causal, no-future-leakage backtest.
+ *
+ * Both visible curves are resampled on the same 10-minute grid with a cosine/sinusoidal
+ * interpolation. MEASURED and RECONSTRUCTED weather never become visible prediction anchors.
  */
 data class ForecastSelectableCurves(
     val reconstructed: List<SamplePoint>,
@@ -133,11 +140,12 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
         val writable = db.writableDatabase
         ForecastMemoryStore.ensure(writable)
         ForecastLocalSnapshotStore.ensure(writable)
+        ForecastPastArchiveStore.ensure(writable)
 
         val archive = loadArchive(referenceKey, from, to)
             .filter { it.issuedAt <= now && it.issuedAt < it.targetAt - 5L * 60L * 1000L }
-        val anchors = selectReplayAnchors(archive, now)
-        anchors.forEach { ensureLocalSnapshot(referenceKey, it) }
+        val actualAnchors = selectReplayAnchors(archive, now)
+        actualAnchors.forEach { ensureLocalSnapshot(referenceKey, it) }
 
         val localByKey = mutableMapOf<Pair<Long, Long>, Pair<Double, Double?>>()
         db.readableDatabase.rawQuery(
@@ -154,32 +162,58 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
             }
         }
 
-        val reconstructedAnchors = anchors.map {
-            SamplePoint(
-                sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
-                timestamp = it.targetAt,
-                temperature = it.temperature,
-                humidity = it.humidity,
-                source = PointSource.FORECAST,
-                confidence = it.confidence
-            )
-        }
-        val fabAnchors = anchors.mapNotNull { row ->
-            localByKey[row.issuedAt to row.targetAt]?.let { (temperature, confidence) ->
-                SamplePoint(
-                    sensorId = FORECAST_FAB_SENSOR_ID,
-                    timestamp = row.targetAt,
-                    temperature = temperature,
-                    humidity = row.humidity,
+        val backfill = ForecastPastArchiveStore.query(db, referenceKey, from, minOf(to, now))
+        val actualByBucket = actualAnchors.associateBy { forecastCurveHourBucket(it.targetAt) }
+        val backfillByBucket = backfill.associateBy { forecastCurveHourBucket(it.targetAt) }
+        val buckets = (actualByBucket.keys + backfillByBucket.keys).distinct().sorted()
+
+        val reconstructedAnchors = mutableListOf<SamplePoint>()
+        val fabAnchors = mutableListOf<SamplePoint>()
+        buckets.forEach { bucket ->
+            val actual = actualByBucket[bucket]
+            if (actual != null) {
+                reconstructedAnchors += SamplePoint(
+                    sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
+                    timestamp = actual.targetAt,
+                    temperature = actual.temperature,
+                    humidity = actual.humidity,
                     source = PointSource.FORECAST,
-                    confidence = confidence ?: row.confidence
+                    confidence = actual.confidence
                 )
+                val local = localByKey[actual.issuedAt to actual.targetAt]
+                fabAnchors += SamplePoint(
+                    sensorId = FORECAST_FAB_SENSOR_ID,
+                    timestamp = actual.targetAt,
+                    temperature = local?.first ?: actual.temperature,
+                    humidity = actual.humidity,
+                    source = PointSource.FORECAST,
+                    confidence = local?.second ?: actual.confidence * 0.45
+                )
+            } else {
+                backfillByBucket[bucket]?.let { p ->
+                    reconstructedAnchors += SamplePoint(
+                        sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
+                        timestamp = p.targetAt,
+                        temperature = p.weatherTemperature,
+                        humidity = p.humidity,
+                        source = PointSource.FORECAST,
+                        confidence = p.weatherConfidence
+                    )
+                    fabAnchors += SamplePoint(
+                        sensorId = FORECAST_FAB_SENSOR_ID,
+                        timestamp = p.targetAt,
+                        temperature = p.fabTemperature,
+                        humidity = p.humidity,
+                        source = PointSource.FORECAST,
+                        confidence = p.fabConfidence
+                    )
+                }
             }
         }
 
         return ForecastSelectableCurves(
-            reconstructed = interpolatePredictionOnly(reconstructedAnchors),
-            fab = interpolatePredictionOnly(fabAnchors)
+            reconstructed = interpolatePrediction10Minutes(reconstructedAnchors),
+            fab = interpolatePrediction10Minutes(fabAnchors)
         )
     }
 
@@ -209,17 +243,17 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
 
     private fun selectReplayAnchors(rows: List<SelectableForecastRow>, now: Long): List<SelectableForecastRow> {
         val past = rows.filter { it.targetAt <= now }
-            .groupBy { hourBucket(it.targetAt) }
+            .groupBy { forecastCurveHourBucket(it.targetAt) }
             .values
             .mapNotNull { group ->
                 group.minByOrNull { abs((it.targetAt - it.issuedAt) - CURVE_HOUR_MS) }
             }
         val future = rows.filter { it.targetAt > now && it.issuedAt <= now }
-            .groupBy { hourBucket(it.targetAt) }
+            .groupBy { forecastCurveHourBucket(it.targetAt) }
             .values
             .mapNotNull { group -> group.maxByOrNull { it.issuedAt } }
         return (past + future)
-            .associateBy { hourBucket(it.targetAt) }
+            .associateBy { forecastCurveHourBucket(it.targetAt) }
             .values
             .sortedBy { it.targetAt }
     }
@@ -259,7 +293,7 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
             }
         if (candidates.isEmpty()) return SelectableResidualModel()
 
-        val selected = candidates.groupBy { hourBucket(it.targetAt) }
+        val selected = candidates.groupBy { forecastCurveHourBucket(it.targetAt) }
             .values
             .mapNotNull { group -> group.minByOrNull { abs((it.targetAt - it.issuedAt) - CURVE_HOUR_MS) } }
             .sortedBy { it.targetAt }
@@ -339,27 +373,30 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
         ).use { c -> if (c.moveToFirst()) c.getDouble(0) else null }
     }
 
-    private fun interpolatePredictionOnly(points: List<SamplePoint>): List<SamplePoint> {
+    /** Smooth cosine interpolation on the same absolute 10-minute grid for both curves. */
+    private fun interpolatePrediction10Minutes(points: List<SamplePoint>): List<SamplePoint> {
         if (points.size < 2) return points.sortedBy { it.timestamp }
         val sorted = points.sortedBy { it.timestamp }
         val out = mutableListOf<SamplePoint>()
         sorted.zipWithNext().forEach { (left, right) ->
             out += left
             val gap = right.timestamp - left.timestamp
-            if (gap > CURVE_HOUR_MS + 10L * 60L * 1000L && gap <= 6L * CURVE_HOUR_MS) {
-                var ts = hourBucket(left.timestamp) + CURVE_HOUR_MS
+            if (gap > CURVE_STEP_10M_MS && gap <= 6L * CURVE_HOUR_MS) {
+                var ts = ((left.timestamp / CURVE_STEP_10M_MS) + 1L) * CURVE_STEP_10M_MS
                 while (ts < right.timestamp) {
-                    val fraction = ((ts - left.timestamp).toDouble() / gap.toDouble()).coerceIn(0.0, 1.0)
-                    val confidence = min(left.confidence ?: 0.6, right.confidence ?: 0.6) * 0.72
+                    val linear = ((ts - left.timestamp).toDouble() / gap.toDouble()).coerceIn(0.0, 1.0)
+                    val smooth = 0.5 - 0.5 * cos(PI * linear)
+                    val confidence = (left.confidence ?: 0.6) +
+                        ((right.confidence ?: 0.6) - (left.confidence ?: 0.6)) * linear
                     out += SamplePoint(
                         sensorId = left.sensorId,
                         timestamp = ts,
-                        temperature = left.temperature + (right.temperature - left.temperature) * fraction,
-                        humidity = left.humidity + (right.humidity - left.humidity) * fraction,
+                        temperature = left.temperature + (right.temperature - left.temperature) * smooth,
+                        humidity = left.humidity + (right.humidity - left.humidity) * smooth,
                         source = PointSource.FORECAST,
                         confidence = confidence.coerceIn(0.0, 1.0)
                     )
-                    ts += CURVE_HOUR_MS
+                    ts += CURVE_STEP_10M_MS
                 }
             }
         }
@@ -367,3 +404,5 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
         return out
     }
 }
+
+private fun forecastCurveHourBucket(ts: Long): Long = (ts / CURVE_HOUR_MS) * CURVE_HOUR_MS
