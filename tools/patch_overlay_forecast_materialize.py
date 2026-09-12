@@ -8,3 +8,7 @@ if marker not in s:
     if old not in s: raise SystemExit('overlay marker missing')
     s=s.replace(old,new,1)
 p.write_text(s)
+
+# v0.21.6: after the already-validated overlay patch, migrate the past verification
+# source from stitched Historical Forecast to a fair fixed-lead H+24 Météo-France archive.
+exec(Path('tools/patch_forecast_fixed_lead_h24.py').read_text(), {'__name__': '__main__'})
