@@ -1,11 +1,12 @@
-name: Build past forecast archive and 10-minute curves
+name: Build fixed-lead H24 forecast verification
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - 'feature/forecast-past-archive-10m'
+      - 'feature/forecast-fixed-lead-h24'
     paths:
+      - 'app/build.gradle.kts'
       - 'app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastReplayUi.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt'
@@ -21,6 +22,7 @@ on:
       - 'tools/patch_backup_forecast_local.py'
       - 'tools/patch_overlay_forecast_materialize.py'
       - 'tools/patch_forecast_past_archive_10m.py'
+      - 'tools/patch_forecast_fixed_lead_h24_v2.py'
       - '.github/workflows/build-forecast-memory-cadrans.yml'
 
 permissions:
@@ -34,7 +36,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: feature/forecast-past-archive-10m
+          ref: feature/forecast-fixed-lead-h24
           fetch-depth: 0
 
       - name: Apply progressive dial palette
@@ -52,28 +54,31 @@ jobs:
           python3 tools/patch_backup_forecast_local.py
           python3 tools/patch_overlay_forecast_materialize.py
 
-      - name: Add cached historical forecast reconstruction
+      - name: Add cached 10-minute prediction archive
         run: python3 tools/patch_forecast_past_archive_10m.py
+
+      - name: Switch past verification to Météo-France H24
+        run: python3 tools/patch_forecast_fixed_lead_h24_v2.py
 
       - name: Regression guard
         run: |
           git diff --check
           grep -n 'ForecastMemoryBootstrapProvider' app/src/main/AndroidManifest.xml
           grep -n 'forecast_snapshot_archive' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'KEY_WIDTH_DP' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'cascade latest-edge au relâchement' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'FORECAST_RECONSTRUCTED_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'FORECAST_FAB_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'CURVE_STEP_10M_MS' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
-          grep -n 'ForecastCurve10mStore.persistAlignedPast' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
           grep -n 'forecast_curve_10m_archive' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
+          grep -n 'fab-local-causal-h24-v2' app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt
+          grep -n 'previous-runs-api.open-meteo.com/v1/meteofrance' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
+          grep -n 'temperature_2m_previous_day1' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
+          grep -n 'open-meteo-previous-runs-h24-meteofrance' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
+          ! grep -n 'historical-forecast-api.open-meteo.com' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
+          grep -n 'versionName = "0.21.6"' app/build.gradle.kts
           grep -n 'Prévision météo reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'Prévision Fab reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'historical-forecast-api.open-meteo.com' app/src/main/java/com/fabdata/app/ForecastPastArchive.kt
           grep -n 'FORECAST_PAST_API_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
           grep -n 'FORECAST_CURVE_10M_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
-          grep -n 'ForecastPastArchiveBackfill' app/src/main/java/com/fabdata/app/MainActivity.kt
-          ! grep -n 'source=.reconstructed.' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -101,29 +106,30 @@ jobs:
       - name: Normalize release APK filename
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk \
-             app/build/outputs/apk/debug/FabData-v0.21.5-release-archives-previsions-10min.apk
+             app/build/outputs/apk/debug/FabData-v0.21.6-release-h24-previsions-10min.apk
 
       - name: Commit validated source
         run: |
-          if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
-            echo "Forecast archive source already committed"
+          if git diff --quiet -- app/build.gradle.kts app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt app/src/main/java/com/fabdata/app/ForecastPastArchive.kt app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo "H24 forecast source already committed"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
+            git add app/build.gradle.kts \
+                    app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
                     app/src/main/java/com/fabdata/app/ForecastReplayUi.kt \
                     app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt \
                     app/src/main/java/com/fabdata/app/ForecastPastArchive.kt \
                     app/src/main/java/com/fabdata/app/ForecastCurve10mStore.kt \
                     app/src/main/java/com/fabdata/app/BackupV3Support.kt \
                     app/src/main/java/com/fabdata/app/MainActivity.kt
-            git commit -m "Cache past forecast archive and 10-minute user backtest [skip ci]"
-            git push origin HEAD:feature/forecast-past-archive-10m
+            git commit -m "Use Météo-France fixed-lead H24 forecast archive [skip ci]"
+            git push origin HEAD:feature/forecast-fixed-lead-h24
           fi
 
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.21.5-release-archives-previsions-10min
-          path: app/build/outputs/apk/debug/FabData-v0.21.5-release-archives-previsions-10min.apk
+          name: FabData-v0.21.6-release-h24-previsions-10min
+          path: app/build/outputs/apk/debug/FabData-v0.21.6-release-h24-previsions-10min.apk
           if-no-files-found: error
