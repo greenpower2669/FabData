@@ -1687,8 +1687,11 @@ private fun SensorSourcesCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
+            Column(
+                Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(Modifier.fillMaxWidth()) {
                     Text("Source météo", fontWeight = FontWeight.SemiBold)
                     Text(
                         if (lyon?.latestTimestamp != null) "Synchronisation disponible" else "En attente de données",
@@ -1696,11 +1699,17 @@ private fun SensorSourcesCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (showLyonSpecificTools) {
-                    TextButton(onClick = onOpenLyon) { Text("Détail") }
-                    TextButton(onClick = onCompleteLyon) { Text("《 Compléter 》") }
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (showLyonSpecificTools) {
+                        TextButton(onClick = onOpenLyon) { Text("Détail") }
+                        TextButton(onClick = onCompleteLyon) { Text("《 Compléter 》") }
+                    }
+                    OutlinedButton(onClick = onSyncLyon) { Text("Actualiser") }
                 }
-                OutlinedButton(onClick = onSyncLyon) { Text("Actualiser") }
             }
 
             remoteConfigs.forEach { config ->

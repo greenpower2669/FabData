@@ -7,7 +7,8 @@ import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.min
 
-const val FORECAST_RECONSTRUCTED_SENSOR_ID = -6902900104L
+// -6902900104L is reserved by THERMAL_INERTIA_SENSOR_ID. Synthetic IDs must stay unique.
+const val FORECAST_RECONSTRUCTED_SENSOR_ID = -6902900106L
 const val FORECAST_RECONSTRUCTED_STABLE_KEY = "forecast-reconstructed"
 const val FORECAST_FAB_SENSOR_ID = -6902900105L
 const val FORECAST_FAB_STABLE_KEY = "forecast-fab-local"
