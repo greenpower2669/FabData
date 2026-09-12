@@ -518,6 +518,8 @@ class FabDataBackupV3Support(
         val weather = o.optDouble("weatherTemperature", Double.NaN)
         val humidity = o.optDouble("humidity", Double.NaN)
         if (key.isBlank() || targetAt < 0L || !weather.isFinite() || !humidity.isFinite()) return
+        val restoredProvider = o.optString("provider", ForecastPastArchiveStore.PROVIDER)
+        if (restoredProvider == "open-meteo-historical-forecast") return
         ForecastPastArchiveStore.restore(
             sql = db.writableDatabase,
             referenceKey = key,
@@ -527,7 +529,7 @@ class FabDataBackupV3Support(
             fabTemperature = nullableDouble(o, "fabTemperature"),
             weatherConfidence = o.optDouble("weatherConfidence", 0.78),
             fabConfidence = nullableDouble(o, "fabConfidence"),
-            provider = o.optString("provider", ForecastPastArchiveStore.PROVIDER),
+            provider = restoredProvider,
             fetchedAt = o.optLong("fetchedAt", System.currentTimeMillis())
         )
     }

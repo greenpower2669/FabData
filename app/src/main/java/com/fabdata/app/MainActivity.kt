@@ -855,8 +855,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         latestTimestamp = inertiaEstimate?.surfacePoints?.lastOrNull()?.timestamp
             ?: explorationOverviewSampleMap[THERMAL_INERTIA_SENSOR_ID]?.lastOrNull()?.timestamp
     )
-    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo reconstruite", "Archives de prévisions + futur actif · rendu 10 min", 13, forecastReconstructedSamples.lastOrNull()?.timestamp)
-    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab reconstruite", "Modèle local utilisateur · rendu 10 min", 8, forecastFabSamples.lastOrNull()?.timestamp)
+    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo reconstruite", "Passé Météo-France H+24 · futur actif · rendu 10 min", 13, forecastReconstructedSamples.lastOrNull()?.timestamp)
+    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab reconstruite", "Correction locale H+24 · rendu 10 min", 8, forecastFabSamples.lastOrNull()?.timestamp)
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
     val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
     val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +

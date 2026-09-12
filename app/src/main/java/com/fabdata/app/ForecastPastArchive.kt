@@ -1,6 +1,7 @@
 package com.fabdata.app
 
 import android.database.sqlite.SQLiteDatabase
+import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -30,7 +31,7 @@ data class ForecastPastArchivePoint(
 
 object ForecastPastArchiveStore {
     const val TABLE = "forecast_past_api_archive"
-    const val PROVIDER = "open-meteo-historical-forecast"
+    const val PROVIDER = "open-meteo-previous-runs-h24-meteofrance"
 
     fun ensure(sql: SQLiteDatabase) {
         sql.execSQL(
@@ -52,6 +53,9 @@ object ForecastPastArchiveStore {
         sql.execSQL(
             "CREATE INDEX IF NOT EXISTS idx_forecast_past_api_target ON $TABLE(reference_key, target_ts)"
         )
+        // v0.21.6: historical-forecast-api.open-meteo.com is intentionally NOT used for
+        // verification: its stitched first hours closely track observations.
+        sql.delete(TABLE, "provider=?", arrayOf("open-meteo-historical-forecast"))
     }
 
     fun restore(
@@ -111,10 +115,10 @@ object ForecastPastArchiveStore {
             SELECT target_ts, weather_temperature, humidity, fab_temperature,
                    weather_confidence, fab_confidence, provider
             FROM $TABLE
-            WHERE reference_key=? AND target_ts BETWEEN ? AND ?
+            WHERE reference_key=? AND target_ts BETWEEN ? AND ? AND provider=?
             ORDER BY target_ts
             """.trimIndent(),
-            arrayOf(referenceKey, from.toString(), to.toString())
+            arrayOf(referenceKey, from.toString(), to.toString(), PROVIDER)
         ).use { c ->
             while (c.moveToNext()) {
                 val weather = c.getDouble(1)
@@ -136,10 +140,12 @@ object ForecastPastArchiveStore {
 class ForecastPastArchiveBackfill(private val db: FabDataDb) {
     private val zone = ZoneId.of("Europe/Paris")
     private val hourMs = 60L * 60L * 1000L
-    private val earliest = LocalDate.of(2022, 1, 1).atStartOfDay(zone).toInstant().toEpochMilli()
+    private val earliest = LocalDate.of(2024, 1, 2).atStartOfDay(zone).toInstant().toEpochMilli()
+    private val fixedLeadMs = 24L * hourMs
 
     /**
-     * Completes missing past forecast anchors from Open-Meteo Historical Forecast API.
+     * Completes missing past forecast anchors from Open-Meteo Previous Runs at fixed H+24.
+     * Météo-France seamless is used so each point was forecast one day before valid time.
      * The remote archive is stored separately and is used for display/backtest only.
      */
     fun ensure(
@@ -152,17 +158,25 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
         val safeFrom = maxOf(from, earliest)
         val safeTo = minOf(to, now - hourMs)
         if (safeTo <= safeFrom) return 0
-        if (hasDenseCoverage(reference.key, safeFrom, safeTo)) return 0
+        if (hasDenseCoverage(reference.key, safeFrom, safeTo)) {
+            rebuildFabCausally(reference.key, safeFrom, safeTo)
+            return 0
+        }
 
         var added = 0
+        var failures = 0
         val fromDate = Instant.ofEpochMilli(safeFrom).atZone(zone).toLocalDate()
         val toDate = Instant.ofEpochMilli(safeTo).atZone(zone).toLocalDate()
         var cursor = fromDate
         while (!cursor.isAfter(toDate)) {
             val chunkEnd = minOf(cursor.plusDays(30), toDate)
             val rows = runCatching {
-                fetchHistorical(reference, cursor, chunkEnd, safeFrom, safeTo)
-            }.getOrDefault(emptyList())
+                fetchFixedLeadH24(reference, cursor, chunkEnd, safeFrom, safeTo)
+            }.getOrElse { error ->
+                failures++
+                Log.w("FabDataForecast", "Previous Runs H+24 failed for $cursor..$chunkEnd", error)
+                emptyList()
+            }
             if (rows.isNotEmpty()) {
                 db.inTransaction {
                     rows.forEach { p ->
@@ -185,6 +199,9 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
             cursor = chunkEnd.plusDays(1)
         }
         rebuildFabCausally(reference.key, safeFrom, safeTo)
+        if (failures > 0) {
+            Log.w("FabDataForecast", "H+24 archive completed with $failures failed chunk(s), $added point(s) added")
+        }
         return added
     }
 
@@ -194,9 +211,9 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
             """
             SELECT COUNT(*), MIN(target_ts), MAX(target_ts)
             FROM ${ForecastPastArchiveStore.TABLE}
-            WHERE reference_key=? AND target_ts BETWEEN ? AND ?
+            WHERE reference_key=? AND target_ts BETWEEN ? AND ? AND provider=?
             """.trimIndent(),
-            arrayOf(referenceKey, from.toString(), to.toString())
+            arrayOf(referenceKey, from.toString(), to.toString(), ForecastPastArchiveStore.PROVIDER)
         ).use { c ->
             if (!c.moveToFirst() || c.isNull(1) || c.isNull(2)) return@use false
             val count = c.getLong(0)
@@ -208,23 +225,25 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
         }
     }
 
-    private fun fetchHistorical(
+    private fun fetchFixedLeadH24(
         reference: WeatherReference,
         fromDate: LocalDate,
         toDate: LocalDate,
         clipFrom: Long,
         clipTo: Long
     ): List<ForecastPastArchivePoint> {
-        val url = "https://historical-forecast-api.open-meteo.com/v1/forecast" +
+        // Previous Runs keeps lead time fixed. _previous_day1 is forecast 24 h before
+        // valid time. /v1/meteofrance defaults to Météo-France seamless.
+        val url = "https://previous-runs-api.open-meteo.com/v1/meteofrance" +
             "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
             "&start_date=$fromDate&end_date=$toDate" +
-            "&hourly=temperature_2m,relative_humidity_2m" +
+            "&hourly=temperature_2m_previous_day1,relative_humidity_2m_previous_day1" +
             "&timezone=Europe%2FParis"
         val raw = httpGet(url)
         val hourly = JSONObject(raw).getJSONObject("hourly")
         val times = hourly.getJSONArray("time")
-        val temps = hourly.getJSONArray("temperature_2m")
-        val hums = hourly.getJSONArray("relative_humidity_2m")
+        val temps = hourly.getJSONArray("temperature_2m_previous_day1")
+        val hums = hourly.getJSONArray("relative_humidity_2m_previous_day1")
         val out = mutableListOf<ForecastPastArchivePoint>()
         for (i in 0 until minOf(times.length(), temps.length(), hums.length())) {
             val local = runCatching { LocalDateTime.parse(times.getString(i)) }.getOrNull() ?: continue
@@ -238,7 +257,7 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
                 weatherTemperature = t,
                 humidity = h,
                 fabTemperature = t,
-                weatherConfidence = 0.78,
+                weatherConfidence = 0.72,
                 fabConfidence = 0.40,
                 provider = ForecastPastArchiveStore.PROVIDER
             )
@@ -248,13 +267,13 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
 
     /**
      * Backtests the Fab local corrector without future leakage.
-     * For target T, only measured residuals available at or before T-1h are used.
+     * For target T, only residuals whose verifying observation was known by T-24h are used.
      * The result is explicitly a reconstructed Fab history, never an emitted snapshot.
      */
     private fun rebuildFabCausally(referenceKey: String, from: Long, to: Long) {
-        val rows = ForecastPastArchiveStore.query(db, referenceKey, from - 25L * hourMs, to)
+        val rows = ForecastPastArchiveStore.query(db, referenceKey, from - fixedLeadMs - 25L * hourMs, to)
         if (rows.isEmpty()) return
-        val measured = measuredByHour(referenceKey, from - 26L * hourMs, to)
+        val measured = measuredByHour(referenceKey, from - fixedLeadMs - 26L * hourMs, to)
         val residualCandidates = rows.mapNotNull { row ->
             measured[row.targetAt / hourMs]?.let { actual ->
                 BackfillResidual(row.targetAt, actual - row.weatherTemperature)
@@ -264,7 +283,7 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
         val window = ArrayDeque<BackfillResidual>()
 
         rows.filter { it.targetAt in from..to }.forEach { row ->
-            val cutoff = row.targetAt - hourMs
+            val cutoff = row.targetAt - fixedLeadMs
             while (addIndex < residualCandidates.size && residualCandidates[addIndex].targetAt <= cutoff) {
                 window.addLast(residualCandidates[addIndex])
                 addIndex++
@@ -273,7 +292,9 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
                 window.removeFirst()
             }
             val model = fit(window.toList(), cutoff)
-            val correction = (model.bias + model.slope + 0.5 * model.acceleration).coerceIn(-5.0, 5.0)
+            val horizonHours = fixedLeadMs.toDouble() / hourMs.toDouble()
+            val correction = (model.bias + model.slope * horizonHours +
+                0.5 * model.acceleration * horizonHours * horizonHours).coerceIn(-5.0, 5.0)
             val fab = (row.weatherTemperature + correction).coerceIn(-70.0, 70.0)
             val confidenceFactor = (0.40 + (model.samples.coerceAtMost(12) / 12.0) * 0.55).coerceIn(0.40, 0.95)
             db.writableDatabase.execSQL(
@@ -377,7 +398,7 @@ class ForecastPastArchiveBackfill(private val db: FabDataDb) {
         }
         return try {
             val code = c.responseCode
-            if (code !in 200..299) error("Historical forecast HTTP $code")
+            if (code !in 200..299) error("Previous Runs H+24 HTTP $code")
             c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
         } finally {
             c.disconnect()
