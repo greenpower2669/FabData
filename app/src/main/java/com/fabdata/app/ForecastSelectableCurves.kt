@@ -21,9 +21,9 @@ private const val CURVE_STEP_10M_MS = 10L * 60L * 1000L
  * Two selectable prediction-only chart series.
  *
  * Weather curve priority:
- * 1. past = fixed-lead Météo-France H+24 archive only;
- * 2. future = the currently active forecast captured by FabData.
- * Old near-H+1 replay snapshots are deliberately excluded from past verification.
+ * 1. past = fixed-lead Météo-France H+24 archive when available;
+ * 2. local memory = snapshot captured closest to exactly H+24, for past or future.
+ * The current/gliding forecast is a separate selectable curve and never contaminates H+24.
  *
  * Fab curve follows the exact same anchor timestamps. Locally emitted Fab snapshots win;
  * otherwise the API past is passed through a causal, no-future-leakage backtest.
@@ -199,7 +199,7 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
                     )
                 }
             } else if (actual != null) {
-                // Future side stays live/current.
+                // Future H+24 is also fixed lead. The gliding/current curve lives separately.
                 reconstructedAnchors += SamplePoint(
                     sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
                     timestamp = actual.targetAt,
@@ -277,19 +277,16 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
     }
 
     private fun selectReplayAnchors(rows: List<SelectableForecastRow>, now: Long): List<SelectableForecastRow> {
-        val past = rows.filter { it.targetAt <= now }
+        val fixedLead = 24L * CURVE_HOUR_MS
+        val tolerance = 35L * 60L * 1000L
+        return rows.asSequence()
+            .filter { it.issuedAt <= now && it.issuedAt < it.targetAt - 5L * 60L * 1000L }
             .groupBy { forecastCurveHourBucket(it.targetAt) }
             .values
             .mapNotNull { group ->
-                group.minByOrNull { abs((it.targetAt - it.issuedAt) - CURVE_HOUR_MS) }
+                group.minByOrNull { abs((it.targetAt - it.issuedAt) - fixedLead) }
+                    ?.takeIf { abs((it.targetAt - it.issuedAt) - fixedLead) <= tolerance }
             }
-        val future = rows.filter { it.targetAt > now && it.issuedAt <= now }
-            .groupBy { forecastCurveHourBucket(it.targetAt) }
-            .values
-            .mapNotNull { group -> group.maxByOrNull { it.issuedAt } }
-        return (past + future)
-            .associateBy { forecastCurveHourBucket(it.targetAt) }
-            .values
             .sortedBy { it.targetAt }
     }
 
