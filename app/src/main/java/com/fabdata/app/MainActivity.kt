@@ -1209,6 +1209,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
+                    ForecastReplayCard(
+                        db = db,
+                        reference = visualReference,
+                        refreshToken = reloadToken
+                    )
+                }
+
+                item {
                     TimeTabs(preset = preset, onSelect = {
                         customViewSpanMs = null
                         preset = it

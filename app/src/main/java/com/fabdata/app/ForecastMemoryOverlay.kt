@@ -514,6 +514,8 @@ private class ForecastDialStripView(
         private const val PREFS = "fabdata_forecast_dial_overlay"
         private const val KEY_X = "x_fraction"
         private const val KEY_Y = "y_fraction"
+        private const val KEY_WIDTH_DP = "width_dp"
+        private const val KEY_HEIGHT_DP = "height_dp"
     }
 
     private val dataSource = ForecastDialDataSource(context, db)
@@ -526,6 +528,9 @@ private class ForecastDialStripView(
     private var lastRawY = 0f
     private var startX = 0f
     private var startY = 0f
+    private var resizing = false
+    private var startWidth = 0
+    private var startHeight = 0
 
     private val refresh = object : Runnable {
         override fun run() {
@@ -558,12 +563,23 @@ private class ForecastDialStripView(
 
     fun restorePosition(root: ViewGroup) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val maxX = (root.width - width).coerceAtLeast(0).toFloat()
-        val maxY = (root.height - height).coerceAtLeast(0).toFloat()
-        val xFraction = prefs.getFloat(KEY_X, -1f)
-        val yFraction = prefs.getFloat(KEY_Y, -1f)
-        x = if (xFraction >= 0f) maxX * xFraction.coerceIn(0f, 1f) else dp(8f)
-        y = if (yFraction >= 0f) maxY * yFraction.coerceIn(0f, 1f) else dp(96f)
+        val minWidth = dp(270f).toInt()
+        val minHeight = dp(130f).toInt()
+        val maxWidth = maxOf(minWidth, root.width - dp(8f).toInt())
+        val maxHeight = maxOf(minHeight, root.height - dp(8f).toInt())
+        layoutParams = layoutParams.apply {
+            width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(minWidth, maxWidth)
+            height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(minHeight, maxHeight)
+        }
+        requestLayout()
+        post {
+            val maxX = (root.width - width).coerceAtLeast(0).toFloat()
+            val maxY = (root.height - height).coerceAtLeast(0).toFloat()
+            val xFraction = prefs.getFloat(KEY_X, -1f)
+            val yFraction = prefs.getFloat(KEY_Y, -1f)
+            x = if (xFraction >= 0f) maxX * xFraction.coerceIn(0f, 1f) else dp(8f)
+            y = if (yFraction >= 0f) maxY * yFraction.coerceIn(0f, 1f) else dp(96f)
+        }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -574,21 +590,38 @@ private class ForecastDialStripView(
                 lastRawY = event.rawY
                 startX = x
                 startY = y
+                startWidth = width
+                startHeight = height
+                val handle = dp(36f)
+                resizing = event.x >= width - handle && event.y >= height - handle
                 parentView.requestDisallowInterceptTouchEvent(true)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 val dx = event.rawX - lastRawX
                 val dy = event.rawY - lastRawY
-                val maxX = (parentView.width - width).coerceAtLeast(0).toFloat()
-                val maxY = (parentView.height - height).coerceAtLeast(0).toFloat()
-                x = (startX + dx).coerceIn(0f, maxX)
-                y = (startY + dy).coerceIn(0f, maxY)
+                if (resizing) {
+                    val minWidth = dp(270f).toInt()
+                    val minHeight = dp(130f).toInt()
+                    val maxWidth = maxOf(minWidth, (parentView.width - x).toInt())
+                    val maxHeight = maxOf(minHeight, (parentView.height - y).toInt())
+                    layoutParams = layoutParams.apply {
+                        width = (startWidth + dx).toInt().coerceIn(minWidth, maxWidth)
+                        height = (startHeight + dy).toInt().coerceIn(minHeight, maxHeight)
+                    }
+                    requestLayout()
+                } else {
+                    val maxX = (parentView.width - width).coerceAtLeast(0).toFloat()
+                    val maxY = (parentView.height - height).coerceAtLeast(0).toFloat()
+                    x = (startX + dx).coerceIn(0f, maxX)
+                    y = (startY + dy).coerceIn(0f, maxY)
+                }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 parentView.requestDisallowInterceptTouchEvent(false)
-                persistPosition(parentView)
+                persistGeometry(parentView)
+                resizing = false
                 performClick()
                 return true
             }
@@ -601,12 +634,14 @@ private class ForecastDialStripView(
         return true
     }
 
-    private fun persistPosition(root: ViewGroup) {
+    private fun persistGeometry(root: ViewGroup) {
         val maxX = (root.width - width).coerceAtLeast(1).toFloat()
         val maxY = (root.height - height).coerceAtLeast(1).toFloat()
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putFloat(KEY_X, (x / maxX).coerceIn(0f, 1f))
             .putFloat(KEY_Y, (y / maxY).coerceIn(0f, 1f))
+            .putFloat(KEY_WIDTH_DP, width / resources.displayMetrics.density.coerceAtLeast(0.1f))
+            .putFloat(KEY_HEIGHT_DP, height / resources.displayMetrics.density.coerceAtLeast(0.1f))
             .apply()
     }
 
@@ -637,6 +672,20 @@ private class ForecastDialStripView(
             val radius = min(slotWidth * 0.41f, availableH * 0.35f)
             drawDial(canvas, sample, cx, cy, radius, index, night)
         }
+        drawResizeHandle(canvas, night)
+    }
+
+    private fun drawResizeHandle(canvas: Canvas, night: Boolean) {
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(1.5f)
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, 105)
+        val pad = dp(7f)
+        for (i in 0..2) {
+            val o = dp(5f * i)
+            canvas.drawLine(width - pad - o - dp(8f), height - pad, width - pad, height - pad - o - dp(8f), paint)
+        }
+        paint.strokeCap = Paint.Cap.BUTT
     }
 
     private fun drawLegend(canvas: Canvas, night: Boolean, reference: String) {

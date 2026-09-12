@@ -32,6 +32,7 @@ class FabDataBackupV3Support(
         ThermalWallConfigStore.ensure(db.writableDatabase)
         ThermalWallSolarModelStore.ensure(db.writableDatabase)
         WeatherReferenceStore.ensure(db.writableDatabase)
+        ForecastMemoryStore.ensure(db.writableDatabase)
 
         writeJson(writer, "WEATHER_META", weatherMetaJson())
         WeatherReferenceStore(db).allReferenceMetadata().forEach { meta ->
@@ -110,6 +111,26 @@ class FabDataBackupV3Support(
         // from ordinary sensor samples and therefore must be explicitly backed up.
         db.readableDatabase.rawQuery(
             """
+            SELECT reference_key, issued_at, target_ts, temperature, humidity, confidence, provider
+            FROM ${ForecastMemoryStore.TABLE}
+            ORDER BY reference_key, target_ts, issued_at
+            """.trimIndent(), null
+        ).use { c ->
+            while (c.moveToNext()) {
+                writeJson(writer, "FORECAST_ARCHIVE", JSONObject().apply {
+                    put("referenceKey", c.getString(0))
+                    put("issuedAt", c.getLong(1))
+                    put("targetAt", c.getLong(2))
+                    put("temperature", c.getDouble(3))
+                    putNullable("humidity", if (c.isNull(4)) null else c.getDouble(4))
+                    putNullable("confidence", if (c.isNull(5)) null else c.getDouble(5))
+                    put("provider", c.getString(6))
+                })
+            }
+        }
+
+        db.readableDatabase.rawQuery(
+            """
             SELECT reference_key, timestamp, temperature, humidity, source, confidence
             FROM weather_reference_samples
             ORDER BY reference_key, timestamp
@@ -143,6 +164,7 @@ class FabDataBackupV3Support(
                 "WALL_SOLAR_MODEL" -> restoreWallSolarModel(json(values))
                 "TRAINING_POLICY" -> restoreTrainingPolicy(json(values))
                 "TRAINING_EXCLUSION" -> restoreTrainingExclusion(json(values))
+                "FORECAST_ARCHIVE" -> restoreForecastArchive(json(values))
                 "WEATHER" -> restoreWeather(values)
                 else -> return false
             }
@@ -376,6 +398,33 @@ class FabDataBackupV3Support(
             o.getLong("from"),
             o.getLong("to"),
             o.optString("reason", "Sauvegarde v3")
+        )
+    }
+
+    private fun restoreForecastArchive(o: JSONObject) {
+        ForecastMemoryStore.ensure(db.writableDatabase)
+        val key = o.optString("referenceKey", "").trim()
+        val issuedAt = o.optLong("issuedAt", -1L)
+        val targetAt = o.optLong("targetAt", -1L)
+        val temperature = o.optDouble("temperature", Double.NaN)
+        if (key.isBlank() || issuedAt < 0L || targetAt < 0L || !temperature.isFinite()) return
+        val humidity = nullableDouble(o, "humidity")
+        val confidence = nullableDouble(o, "confidence")
+        val provider = o.optString("provider", "active_reference").ifBlank { "active_reference" }
+        db.writableDatabase.execSQL(
+            """
+            INSERT INTO ${ForecastMemoryStore.TABLE}(reference_key, issued_at, target_ts, temperature, humidity, confidence, provider)
+            SELECT ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ${ForecastMemoryStore.TABLE}
+                WHERE reference_key=? AND issued_at=? AND target_ts=? AND provider=?
+                  AND ABS(temperature-?) < 0.001
+            )
+            """.trimIndent(),
+            arrayOf(
+                key, issuedAt, targetAt, temperature, humidity, confidence, provider,
+                key, issuedAt, targetAt, provider, temperature
+            )
         )
     }
 

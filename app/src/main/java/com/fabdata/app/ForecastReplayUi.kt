@@ -42,13 +42,13 @@ import kotlin.math.min
  *
  * Left of "now": immutable forecast snapshots that really existed before their target.
  * Right of "now": the currently active forecast.
- * Missing past slots may be bridged with the existing measured/reconstructed weather
- * reference, but those bridge points are display-only and are never training samples.
+ * This curve is prediction-only. MEASURED and RECONSTRUCTED values never enter it.
+ * Missing slots are transient estimates between prediction anchors and are never persisted.
  */
 private enum class ForecastReplayKind {
     ARCHIVED,
     CURRENT,
-    BRIDGE
+    ESTIMATED
 }
 
 private data class ForecastReplayPoint(
@@ -65,7 +65,7 @@ private data class ForecastReplayState(
     val points: List<ForecastReplayPoint>,
     val archivedCount: Int,
     val currentCount: Int,
-    val bridgeCount: Int
+    val estimatedCount: Int
 )
 
 private data class ForecastArchiveReplayRow(
@@ -154,41 +154,37 @@ private class ForecastReplayStore(private val db: FabDataDb) {
                 }
         }
 
-        // Existing real/reconstructed weather only fills holes on the left. It never
-        // replaces an archived prediction and never enters the residual learner.
-        val archivedBuckets = archived.map { replayHourBucket(it.timestamp) }.toSet()
-        val bridgeCandidates = linkedMapOf<Long, ForecastReplayPoint>()
-        db.readableDatabase.rawQuery(
-            """
-            SELECT timestamp, temperature, source, confidence
-            FROM weather_reference_samples
-            WHERE reference_key=?
-              AND source!='forecast'
-              AND timestamp BETWEEN ? AND ?
-            ORDER BY timestamp
-            """.trimIndent(),
-            arrayOf(referenceKey, from.toString(), now.toString())
-        ).use { c ->
-            while (c.moveToNext()) {
-                val ts = c.getLong(0)
-                val bucket = replayHourBucket(ts)
-                if (bucket in archivedBuckets) continue
-                val source = PointSource.fromDb(c.getString(2))
-                val point = ForecastReplayPoint(
-                    timestamp = ts,
-                    temperature = c.getDouble(1),
-                    confidence = if (c.isNull(3)) 0.60 else c.getDouble(3).coerceIn(0.0, 1.0),
-                    kind = ForecastReplayKind.BRIDGE
-                )
-                val existing = bridgeCandidates[bucket]
-                if (existing == null || source.priority >= PointSource.RECONSTRUCTED.priority) {
-                    bridgeCandidates[bucket] = point
+        // Build a single prediction-only chronology. For small gaps we estimate
+        // between two prediction anchors. These estimates exist in RAM only.
+        val anchors = (archived + future)
+            .groupBy { replayHourBucket(it.timestamp) }
+            .values
+            .mapNotNull { group ->
+                group.maxByOrNull { if (it.kind == ForecastReplayKind.CURRENT) 2 else 1 }
+            }
+            .sortedBy { it.timestamp }
+
+        val points = mutableListOf<ForecastReplayPoint>()
+        if (anchors.isNotEmpty()) {
+            anchors.zipWithNext().forEach { (left, right) ->
+                points += left
+                val gap = right.timestamp - left.timestamp
+                if (gap > REPLAY_HOUR_MS && gap <= 6L * REPLAY_HOUR_MS) {
+                    var ts = replayHourBucket(left.timestamp) + REPLAY_HOUR_MS
+                    while (ts < right.timestamp) {
+                        val f = ((ts - left.timestamp).toDouble() / gap.toDouble()).coerceIn(0.0, 1.0)
+                        points += ForecastReplayPoint(
+                            timestamp = ts,
+                            temperature = left.temperature + (right.temperature - left.temperature) * f,
+                            confidence = (left.confidence + (right.confidence - left.confidence) * f).coerceIn(0.0, 1.0),
+                            kind = ForecastReplayKind.ESTIMATED
+                        )
+                        ts += REPLAY_HOUR_MS
+                    }
                 }
             }
+            points += anchors.last()
         }
-
-        val points = (bridgeCandidates.values + archived + future)
-            .sortedBy { it.timestamp }
 
         return ForecastReplayState(
             from = from,
@@ -197,7 +193,7 @@ private class ForecastReplayStore(private val db: FabDataDb) {
             points = points,
             archivedCount = archived.size,
             currentCount = future.size,
-            bridgeCount = bridgeCandidates.size
+            estimatedCount = points.count { it.kind == ForecastReplayKind.ESTIMATED }
         )
     }
 }
@@ -256,12 +252,12 @@ fun ForecastReplayCard(
                     ForecastReplayChart(state)
                     Text(
                         "${state.archivedCount} prévision(s) archivées · ${state.currentCount} future(s) · " +
-                            "${state.bridgeCount} point(s) de continuité",
+                            "${state.estimatedCount} estimation(s) visuelle(s)",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        "Les segments pointillés servent seulement à combler un trou d’affichage avec le réel/reconstruit existant ; ils ne servent jamais à entraîner le correcteur.",
+                        "Cette courbe n’utilise jamais le réel ni les données reconstruites. Les pointillés sont estimés uniquement entre deux prévisions et ne sont jamais sauvegardés.",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -275,7 +271,7 @@ fun ForecastReplayCard(
 private fun ForecastReplayChart(state: ForecastReplayState) {
     val archivedColor = Color(0xFF2C6EBD)
     val currentColor = Color(0xFFE28A1A)
-    val bridgeColor = MaterialTheme.colorScheme.outline
+    val estimatedColor = MaterialTheme.colorScheme.outline
     val nowColor = MaterialTheme.colorScheme.primary
     val surface = MaterialTheme.colorScheme.surface.copy(alpha = 0.52f)
     val textColor = MaterialTheme.colorScheme.onSurfaceVariant
@@ -310,18 +306,18 @@ private fun ForecastReplayChart(state: ForecastReplayState) {
         points.zipWithNext().forEach { (a, b) ->
             val gap = b.timestamp - a.timestamp
             if (gap <= 4L * REPLAY_HOUR_MS) {
-                val bridge = a.kind == ForecastReplayKind.BRIDGE || b.kind == ForecastReplayKind.BRIDGE
+                val estimated = a.kind == ForecastReplayKind.ESTIMATED || b.kind == ForecastReplayKind.ESTIMATED
                 val color = when {
-                    bridge -> bridgeColor
+                    estimated -> estimatedColor
                     b.timestamp > state.now -> currentColor
                     else -> archivedColor
                 }
                 drawLine(
-                    color = color.copy(alpha = if (bridge) 0.72f else 0.95f),
+                    color = color.copy(alpha = if (estimated) 0.72f else 0.95f),
                     start = Offset(x(a.timestamp), y(a.temperature)),
                     end = Offset(x(b.timestamp), y(b.temperature)),
-                    strokeWidth = if (bridge) 1.5.dp.toPx() else 2.4.dp.toPx(),
-                    pathEffect = if (bridge) {
+                    strokeWidth = if (estimated) 1.5.dp.toPx() else 2.4.dp.toPx(),
+                    pathEffect = if (estimated) {
                         PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 5.dp.toPx()))
                     } else null
                 )
@@ -332,9 +328,9 @@ private fun ForecastReplayChart(state: ForecastReplayState) {
             val color = when (p.kind) {
                 ForecastReplayKind.ARCHIVED -> archivedColor
                 ForecastReplayKind.CURRENT -> currentColor
-                ForecastReplayKind.BRIDGE -> bridgeColor
+                ForecastReplayKind.ESTIMATED -> estimatedColor
             }
-            drawCircle(color.copy(alpha = if (p.kind == ForecastReplayKind.BRIDGE) 0.55f else 0.9f), 2.1.dp.toPx(), Offset(x(p.timestamp), y(p.temperature)))
+            drawCircle(color.copy(alpha = if (p.kind == ForecastReplayKind.ESTIMATED) 0.50f else 0.9f), 2.1.dp.toPx(), Offset(x(p.timestamp), y(p.temperature)))
         }
     }
 
@@ -346,7 +342,7 @@ private fun ForecastReplayChart(state: ForecastReplayState) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("● archive", color = archivedColor, style = MaterialTheme.typography.labelSmall)
         Text("● futur", color = currentColor, style = MaterialTheme.typography.labelSmall)
-        Text("┄ continuité", color = bridgeColor, style = MaterialTheme.typography.labelSmall)
+        Text("┄ estimé", color = estimatedColor, style = MaterialTheme.typography.labelSmall)
     }
 }
 
