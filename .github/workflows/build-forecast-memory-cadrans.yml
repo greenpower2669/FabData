@@ -8,7 +8,11 @@ on:
     paths:
       - 'app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt'
       - 'app/src/main/AndroidManifest.xml'
+      - 'tools/apply_forecast_dial_palette.py'
       - '.github/workflows/build-forecast-memory-cadrans.yml'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -21,13 +25,18 @@ jobs:
           ref: feature/forecast-memory-cadrans
           fetch-depth: 0
 
+      - name: Apply progressive dial palette
+        run: python3 tools/apply_forecast_dial_palette.py
+
       - name: Regression guard
         run: |
-          git diff --check HEAD~3..HEAD || true
+          git diff --check
           grep -n 'ForecastMemoryBootstrapProvider' app/src/main/AndroidManifest.xml
           grep -n 'forecast_snapshot_archive' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           grep -n 'source=.measured.' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           grep -n '24L \* HOUR_MS' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'errorSeverityColor' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'blue -> orange -> red -> violet' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -51,6 +60,18 @@ jobs:
 
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
+
+      - name: Commit validated palette source
+        run: |
+          if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt; then
+            echo "Palette source already committed"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+            git commit -m "Apply progressive dial severity palette [skip ci]"
+            git push origin HEAD:feature/forecast-memory-cadrans
+          fi
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
