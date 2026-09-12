@@ -19,3 +19,12 @@
   - Afficher qu’un **réentraînement manuel** est nécessaire pour que le modèle profite de la nouvelle profondeur historique.
   - Conserver le comportement actuel : modèle figé tant que l’utilisateur ne relance pas explicitement l’entraînement.
   - Si la référence météo active change, rendre l’état **« Référence météo différente · réentraînement requis »** beaucoup plus visible.
+
+## Cadrans météo — mode compact
+
+- [ ] **Permettre de réduire les cadrans en un petit paquet de points circulaires.**
+  - Un **double-clic / double-tap sur le cadre des cadrans** bascule entre le mode complet et le mode compact.
+  - En mode compact, remplacer les cadrans par un **petit groupe de points circulaires**, suffisamment lisible pour se repérer sans masquer les courbes.
+  - Le **cadre et le remplissage du paquet compact** doivent reprendre l’identité visuelle du **cadran PRÉSENT** (même couleur / état visuel principal).
+  - Un nouveau double-clic / double-tap restaure les cadrans complets.
+  - Mémoriser le choix **compact / complet** comme une personnalisation utilisateur persistante.
