@@ -1,0 +1,135 @@
+name: Build v0.23.0 TODO complete
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/forecast-fixed-lead-h24'
+    paths:
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/fabdata/app/ForecastAdaptive.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt'
+      - 'app/src/main/java/com/fabdata/app/ThermalLearningReferenceUi.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt'
+      - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
+      - 'app/src/main/java/com/fabdata/app/BackupV3Support.kt'
+      - 'TODO.md'
+      - 'tools/patch_todo_ui_v0230.py'
+      - 'tools/patch_adaptive_backup_v0230.py'
+      - '.github/workflows/build-v0230-todo-complete.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: feature/forecast-fixed-lead-h24
+          fetch-depth: 0
+
+      - name: Validate patch scripts
+        run: python3 -m py_compile tools/patch_todo_ui_v0230.py tools/patch_adaptive_backup_v0230.py
+
+      - name: Apply TODO completion patches
+        run: |
+          python3 tools/patch_todo_ui_v0230.py
+          python3 tools/patch_adaptive_backup_v0230.py
+
+      - name: Regression guard
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.23.0"' app/build.gradle.kts
+          grep -n 'FORECAST_ADAPTIVE_HORIZONS: List<Int> = listOf(3, 6, 12, 24)' app/src/main/java/com/fabdata/app/ForecastAdaptive.kt
+          grep -n 'fab-adaptive-regime-tangent-v1' app/src/main/java/com/fabdata/app/ForecastAdaptive.kt
+          grep -n 'forecast_adaptive_archive' app/src/main/java/com/fabdata/app/ForecastAdaptive.kt
+          grep -n 'Prévision Fab adaptative' app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt
+          grep -n 'ThermalLearningReferenceStatusCard' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Référence météo différente · réentraînement requis' app/src/main/java/com/fabdata/app/ThermalLearningReferenceUi.kt
+          grep -n 'Historique météo étendu · réentraînement requis pour en profiter' app/src/main/java/com/fabdata/app/ThermalLearningReferenceUi.kt
+          grep -n 'KEY_COMPACT' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'drawCompact' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'FORECAST_ADAPTIVE_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -n 'ForecastSelectableCurveStore(db).query' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'fixedLead = 24L' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          if grep -n 'ForecastAdaptiveEngine' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt; then
+            echo 'Adaptive engine must not change the existing H+24 dials' >&2
+            exit 1
+          fi
+          if grep -n -- '- \[ \]' TODO.md; then
+            echo 'TODO still contains unchecked work' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          adaptive_text = Path('app/src/main/java/com/fabdata/app/ForecastAdaptive.kt').read_text()
+          if 'INSERT INTO weather_reference_samples' in adaptive_text or 'UPDATE weather_reference_samples' in adaptive_text:
+              raise SystemExit('adaptive layer must not write to terrain weather table')
+          existing = {-6902900102, -6902900103, -6902900104, -6902900105, -6902900106, -6902900110}
+          weather = {-6902900200 - h for h in range(1, 25)}
+          fab_reserved = {-6902900300 - h for h in range(1, 25)}
+          adaptive = {-6902900400 - h for h in (3, 6, 12, 24)}
+          union = set()
+          for group in (existing, weather, fab_reserved, adaptive):
+              clash = union & group
+              if clash:
+                  raise SystemExit(f'synthetic sensor collision: {clash}')
+              union |= group
+          print('Synthetic IDs unique:', len(union))
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Normalize release APK filename
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             app/build/outputs/apk/debug/FabData-v0.23.0-release-todo-complete-adaptive.apk
+
+      - name: Commit validated source
+        run: |
+          if git diff --quiet; then
+            echo "v0.23.0 source already committed"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/build.gradle.kts \
+                    app/src/main/java/com/fabdata/app/ForecastAdaptive.kt \
+                    app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
+                    app/src/main/java/com/fabdata/app/MainActivity.kt \
+                    app/src/main/java/com/fabdata/app/BackupV3Support.kt \
+                    TODO.md
+            git commit -m "Complete FabData TODO: adaptive forecast, compact dials, learning provenance [skip ci]"
+            git push origin HEAD:feature/forecast-fixed-lead-h24
+          fi
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.23.0-release-todo-complete-adaptive
+          path: app/build/outputs/apk/debug/FabData-v0.23.0-release-todo-complete-adaptive.apk
+          if-no-files-found: error
