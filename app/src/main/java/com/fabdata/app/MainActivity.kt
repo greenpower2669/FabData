@@ -303,6 +303,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val remoteSensorSync = remember { RemoteSensorHttpSync(db) }
     val draftStore = remember { AnnotationDraftStore(context) }
     val prefsStore = remember { FabPrefs(context) }
+    val uiPrefs = remember { UiPreferenceStore(context) }
     val scope = rememberCoroutineScope()
     val reloadMutex = remember { Mutex() }
     val snackbar = remember { SnackbarHostState() }
@@ -321,10 +322,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
     var wideOverviewRange by remember { mutableStateOf<LongRange?>(null) }
     var explorationOverviewRange by remember { mutableStateOf<LongRange?>(null) }
-    var preset by rememberSaveable { mutableStateOf(TimePreset.TWO_DAYS) }
-    var windowCenterTimestamp by remember { mutableStateOf<Long?>(null) }
-    var customViewSpanMs by remember { mutableStateOf<Long?>(null) }
-    var showAllAnnotations by rememberSaveable { mutableStateOf(true) }
+    var preset by remember {
+        mutableStateOf(TimePreset.entries.firstOrNull { it.name == uiPrefs.timePresetName() } ?: TimePreset.TWO_DAYS)
+    }
+    var windowCenterTimestamp by remember { mutableStateOf(uiPrefs.windowCenter()) }
+    var customViewSpanMs by remember { mutableStateOf(uiPrefs.customViewSpan()) }
+    var showAllAnnotations by remember { mutableStateOf(uiPrefs.showAllAnnotations()) }
     var reloadToken by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var lowerCascadeVeil by remember { mutableStateOf(false) }
@@ -352,6 +355,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val showTemp = remember { mutableStateMapOf<Long, Boolean>() }
     val showHumidity = remember { mutableStateMapOf<Long, Boolean>() }
     var initialHandled by remember { mutableStateOf(false) }
+
+    // v0.22.0 : les choix utilisateur survivent aux recréations d'Activity et aux redémarrages.
+    // Les écritures de navigation sont légèrement temporisées pour éviter de marteler les prefs pendant un glisser.
+    LaunchedEffect(preset) { uiPrefs.saveTimePresetName(preset.name) }
+    LaunchedEffect(showAllAnnotations) { uiPrefs.saveShowAllAnnotations(showAllAnnotations) }
+    LaunchedEffect(windowCenterTimestamp, customViewSpanMs) {
+        delay(250L)
+        uiPrefs.saveWindowCenter(windowCenterTimestamp)
+        uiPrefs.saveCustomViewSpan(customViewSpanMs)
+    }
 
     // v0.17 : cet orchestrateur reste composé même quand les réglages thermiques
     // sont loin sous le viewport du LazyColumn.
@@ -893,6 +906,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val forecastHorizonSampleMap = forecastHorizonSamples.mapKeys { (lead, _) -> forecastHorizonSensorId(lead) }
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
     val chartSensors = physicalChartSensors + lyonReconstructedSensor + forecastActiveSensor + forecastHorizonSensors + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
+    LaunchedEffect(chartSensors.map { it.stableKey }) {
+        chartSensors.forEach { sensor ->
+            uiPrefs.curveTemperature(sensor.stableKey)?.let { showTemp[sensor.id] = it }
+            uiPrefs.curveHumidity(sensor.stableKey)?.let { showHumidity[sensor.id] = it }
+        }
+    }
     val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
         (LYON_RECONSTRUCTED_SENSOR_ID to terrainWeatherSamples) +
         (FORECAST_ACTIVE_SENSOR_ID to forecastActiveSamples) +
@@ -1925,15 +1944,29 @@ private fun SeriesSelector(
     onEditSensor: (Sensor) -> Unit,
     onStyleEdit: (Sensor) -> Unit
 ) {
+    val context = LocalContext.current
+    val uiPrefs = remember(context) { UiPreferenceStore(context) }
+    var archiveExpanded by rememberSaveable { mutableStateOf(uiPrefs.forecastArchiveExpanded()) }
+    val archiveSensors = sensors
+        .filter { sensor -> forecastHorizonLeadForSensorId(sensor.id)?.let { it in 1..23 } == true }
+        .sortedBy { forecastHorizonLeadForSensorId(it.id) ?: Int.MAX_VALUE }
+    val archiveIds = archiveSensors.map { it.id }.toSet()
+    val mainSensors = sensors.filterNot { it.id in archiveIds }
+
+    LaunchedEffect(archiveExpanded) { uiPrefs.saveForecastArchiveExpanded(archiveExpanded) }
+
     Card(shape = RoundedCornerShape(20.dp)) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Superposition", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Chaque courbe est indépendante : terrain, prévision météo, prévision Fab et sol inertiel.",
+                "Chaque courbe est indépendante. Les horizons H+1 à H+23 restent rangés dans Archives météo.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            sensors.forEach { sensor ->
+
+            @Composable
+            fun SensorRow(sensor: Sensor) {
+                val lead = forecastHorizonLeadForSensorId(sensor.id)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         Modifier.size(12.dp)
@@ -1948,11 +1981,19 @@ private fun SeriesSelector(
                             FORECAST_FAB_SENSOR_ID -> "Prévision Fab H+24"
                             FORECAST_ACTIVE_SENSOR_ID -> "Prévision météo active · dernière disponible"
                             THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
-                            else -> sensor.room
+                            else -> lead?.let { "Prévision météo H+$it" } ?: sensor.room
                         }
                         Text(displayRoom, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         if (sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) {
                             Text(sensor.room, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else if (lead != null) {
+                            Text(
+                                "Archive locale fixe H+$lead · conservée avant remplacement",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         } else if (sensor.name != sensor.room && sensor.id != THERMAL_INERTIA_SENSOR_ID) {
                             Text(
                                 sensor.name,
@@ -1964,13 +2005,23 @@ private fun SeriesSelector(
                     Text("T°", style = MaterialTheme.typography.labelMedium)
                     Checkbox(
                         checked = showTemp[sensor.id] == true,
-                        onCheckedChange = { showTemp[sensor.id] = it }
+                        onCheckedChange = { checked ->
+                            showTemp[sensor.id] = checked
+                            uiPrefs.saveCurveTemperature(sensor.stableKey, checked)
+                        }
                     )
-                    if (sensor.id != THERMAL_INERTIA_SENSOR_ID && sensor.id != FORECAST_RECONSTRUCTED_SENSOR_ID && sensor.id != FORECAST_FAB_SENSOR_ID && !isForecastArchiveSensorId(sensor.id)) {
+                    if (sensor.id != THERMAL_INERTIA_SENSOR_ID &&
+                        sensor.id != FORECAST_RECONSTRUCTED_SENSOR_ID &&
+                        sensor.id != FORECAST_FAB_SENSOR_ID &&
+                        !isForecastArchiveSensorId(sensor.id)
+                    ) {
                         Text("%", style = MaterialTheme.typography.labelMedium)
                         Checkbox(
                             checked = showHumidity[sensor.id] == true,
-                            onCheckedChange = { showHumidity[sensor.id] = it }
+                            onCheckedChange = { checked ->
+                                showHumidity[sensor.id] = checked
+                                uiPrefs.saveCurveHumidity(sensor.stableKey, checked)
+                            }
                         )
                     } else {
                         Spacer(Modifier.size(48.dp))
@@ -1983,6 +2034,42 @@ private fun SeriesSelector(
                             Icon(Icons.Default.Edit, contentDescription = "Modifier la sonde")
                         }
                     }
+                }
+            }
+
+            mainSensors.forEach { sensor -> SensorRow(sensor) }
+
+            if (archiveSensors.isNotEmpty()) {
+                HorizontalDivider()
+                val visibleCount = archiveSensors.count { showTemp[it.id] == true }
+                OutlinedButton(
+                    onClick = { archiveExpanded = !archiveExpanded },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "Archives météo H+1 → H+23 · $visibleCount/${archiveSensors.size} " +
+                            if (archiveExpanded) "▴" else "▾"
+                    )
+                }
+                if (archiveExpanded) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = {
+                            archiveSensors.forEach { sensor ->
+                                showTemp[sensor.id] = true
+                                uiPrefs.saveCurveTemperature(sensor.stableKey, true)
+                            }
+                        }) { Text("Tout afficher") }
+                        TextButton(onClick = {
+                            archiveSensors.forEach { sensor ->
+                                showTemp[sensor.id] = false
+                                uiPrefs.saveCurveTemperature(sensor.stableKey, false)
+                            }
+                        }) { Text("Tout masquer") }
+                    }
+                    archiveSensors.forEach { sensor -> SensorRow(sensor) }
                 }
             }
         }
@@ -2202,11 +2289,19 @@ private fun HistoryOverviewCard(
             if (bounds == null) {
                 Text("Historique global indisponible", style = MaterialTheme.typography.bodySmall)
             } else {
-                var previewPreset by rememberSaveable { mutableStateOf(PreviewPreset.M6) }
-                var previewZoom by rememberSaveable { mutableFloatStateOf(1f) }
+                val historyContext = LocalContext.current
+                val historyUiPrefs = remember(historyContext) { UiPreferenceStore(historyContext) }
+                var previewPreset by rememberSaveable {
+                    mutableStateOf(
+                        PreviewPreset.entries.firstOrNull { it.name == historyUiPrefs.previewPresetName() }
+                            ?: PreviewPreset.M6
+                    )
+                }
+                var previewZoom by rememberSaveable { mutableFloatStateOf(historyUiPrefs.previewZoom()) }
                 var previewCenter by remember(bounds.first, bounds.last) {
                     mutableStateOf(
-                        viewBounds?.let { it.first + (it.last - it.first) / 2L }
+                        historyUiPrefs.previewCenter()?.coerceIn(bounds.first, bounds.last)
+                            ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
                             ?: (bounds.first + (bounds.last - bounds.first) / 2L)
                     )
                 }
@@ -2220,9 +2315,17 @@ private fun HistoryOverviewCard(
                 var secondBandDraftCenter by remember { mutableStateOf<Long?>(null) }
                 var wideCenter by remember(bounds.first, bounds.last) {
                     mutableStateOf(
-                        viewBounds?.let { it.first + (it.last - it.first) / 2L }
+                        historyUiPrefs.wideCenter()?.coerceIn(bounds.first, bounds.last)
+                            ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
                             ?: (bounds.first + (bounds.last - bounds.first) / 2L)
                     )
+                }
+                LaunchedEffect(previewPreset, previewZoom, previewCenter, wideCenter) {
+                    delay(300L)
+                    historyUiPrefs.savePreviewPresetName(previewPreset.name)
+                    historyUiPrefs.savePreviewZoom(previewZoom)
+                    historyUiPrefs.savePreviewCenter(previewCenter)
+                    historyUiPrefs.saveWideCenter(wideCenter)
                 }
                 var rangeSelectionMode by rememberSaveable { mutableStateOf(false) }
                 var rangeStart by remember { mutableStateOf<Long?>(null) }
@@ -2237,9 +2340,11 @@ private fun HistoryOverviewCard(
                 }
                 val availableBandSensorIds = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
                     sensors.filter { sensor ->
-                        gigaSampleMap[sensor.id].orEmpty().isNotEmpty() ||
-                            navigatorSampleMap[sensor.id].orEmpty().isNotEmpty() ||
-                            sampleMap[sensor.id].orEmpty().isNotEmpty()
+                        forecastHorizonLeadForSensorId(sensor.id) == null && (
+                            gigaSampleMap[sensor.id].orEmpty().isNotEmpty() ||
+                                navigatorSampleMap[sensor.id].orEmpty().isNotEmpty() ||
+                                sampleMap[sensor.id].orEmpty().isNotEmpty()
+                        )
                     }.map { it.id }.toSet()
                 }
                 val bandSignature = remember(availableBandSensorIds) { availableBandSensorIds.sorted().joinToString(",") }
@@ -2256,7 +2361,8 @@ private fun HistoryOverviewCard(
                     }
                     mutableStateOf(if (configured) stored else defaults)
                 }
-                var bandChooserOpen by rememberSaveable { mutableStateOf(false) }
+                var bandChooserOpen by rememberSaveable { mutableStateOf(historyUiPrefs.bandChooserOpen()) }
+                LaunchedEffect(bandChooserOpen) { historyUiPrefs.saveBandChooserOpen(bandChooserOpen) }
                 fun saveBandSensors(next: Set<Long>) {
                     bandSensorIds = next
                     bandPrefs.edit()
