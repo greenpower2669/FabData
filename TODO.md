@@ -28,3 +28,15 @@
   - Le **cadre et le remplissage du paquet compact** doivent reprendre l’identité visuelle du **cadran PRÉSENT** (même couleur / état visuel principal).
   - Un nouveau double-clic / double-tap restaure les cadrans complets.
   - Mémoriser le choix **compact / complet** comme une personnalisation utilisateur persistante.
+
+## Prévision Fab adaptative — H+3 / H+6 / H+12 / H+24
+
+- [ ] **Construire une prévision Fab adaptative à quatre horizons fixes : H+3, H+6, H+12 et H+24.**
+  - Chaque horizon doit disposer de sa propre évaluation et pouvoir être comparé à la **Référence terrain** lorsque l’échéance devient réelle.
+  - Exploiter l’historique immuable des prévisions météo déjà archivé afin de mesurer l’erreur propre à chaque horizon.
+  - En situation météo normale, utiliser l’apprentissage historique pertinent pour l’horizon concerné.
+  - En cas de **changement de régime / météo exceptionnelle**, réduire fortement l’influence d’un passé devenu peu représentatif et privilégier la dynamique récente.
+  - Intégrer la logique de **tangente / pente / accélération** du présent comme information de projection, puis apprendre les erreurs habituelles de cette projection selon les situations comparables.
+  - Rester strictement causal : une prévision faite à T ne doit utiliser que des informations disponibles à T, sans fuite de données futures.
+  - Conserver séparément les résultats H+3, H+6, H+12 et H+24 pour mesurer à quel horizon l’adaptation Fab apporte réellement un gain sur la météo brute.
+  - Ne pas modifier les cadrans H+24 actuels tant que cette prévision adaptative multi-horizon n’est pas validée.
