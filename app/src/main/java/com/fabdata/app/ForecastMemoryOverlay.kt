@@ -194,6 +194,17 @@ private data class ArchivedForecast(
     val confidence: Double
 )
 
+private data class TerrainDialPoint(
+    val temperature: Double,
+    val measured: Boolean
+)
+
+private data class CurveKinematics(
+    val temperature: Double,
+    val slope: Double?,
+    val acceleration: Double?
+)
+
 private data class ResidualPoint(
     val targetTs: Long,
     val residual: Double
@@ -218,6 +229,7 @@ private data class DialSample(
     val officialTemp: Double?,
     val localTemp: Double?,
     val actualTemp: Double?,
+    val actualIsMeasured: Boolean,
     val officialSlope: Double?,
     val localSlope: Double?,
     val actualSlope: Double?,
@@ -244,54 +256,111 @@ private class ForecastDialDataSource(
         ForecastMemoryStore.ensure(db.writableDatabase)
         val reference = WeatherReferencePrefs(appContext).selectedReference()
         runCatching {
-            ForecastSelectableCurveStore(db).materializeLocalSnapshots(reference.key, now - 48L * HOUR_MS, now + 24L * HOUR_MS, now)
+            ForecastPastArchiveBackfill(db).ensure(reference, now - 4L * HOUR_MS, now - HOUR_MS, now)
         }
+        val curves = runCatching {
+            ForecastSelectableCurveStore(db).query(reference.key, now - 4L * HOUR_MS, now + 3L * HOUR_MS, now)
+        }.getOrDefault(ForecastSelectableCurves.EMPTY)
         val nowHour = hourBucket(now)
         val targets = listOf(
             "PASSÉ" to (nowHour - HOUR_MS),
             "PRÉSENT" to nowHour,
             "FUTUR" to (nowHour + HOUR_MS)
         )
-        val result = targets.map { (label, target) -> buildDial(reference.key, label, target, now) }
+        // Passé = H+24 fixe; futur = prévision active. Terrain = réel prioritaire, reconstruction sinon.
+        val result = targets.map { (label, target) -> buildDial(reference.key, label, target, curves) }
         return DialState(reference.label, result)
     }
 
-    private fun buildDial(referenceKey: String, label: String, target: Long, now: Long): DialSample {
-        val forecast = bestOneHourForecast(referenceKey, target, now)
-        val model = forecast?.let { residualModel(referenceKey, min(now, it.issuedAt)) } ?: ResidualModel()
-        val actual = measuredAt(referenceKey, target)
-
-        val officialSlope = forecast?.let { forecastSlope(referenceKey, it) }
-        val officialAcceleration = forecast?.let { forecastAcceleration(referenceKey, it) }
-        val localSlope = officialSlope?.let { (it + model.slopePerHour).coerceIn(-3.0, 3.0) }
-        val localAcceleration = officialAcceleration?.let {
-            (it + model.accelerationPerHour2).coerceIn(-1.5, 1.5)
-        }
-        val actualSlope = if (actual != null) measuredSlope(referenceKey, target) else null
-        val actualAcceleration = if (actual != null) measuredAcceleration(referenceKey, target) else null
-
-        val localTemp = forecast?.let {
-            (it.temperature + model.residualAt(target, min(now, it.issuedAt))).coerceIn(-70.0, 70.0)
-        }
-        val officialError = if (forecast != null && actual != null) abs(forecast.temperature - actual) else null
-        val localError = if (localTemp != null && actual != null) abs(localTemp - actual) else null
+    private fun buildDial(
+        referenceKey: String,
+        label: String,
+        target: Long,
+        curves: ForecastSelectableCurves
+    ): DialSample {
+        val official = curveKinematics(curves.reconstructed, target)
+        val local = curveKinematics(curves.fab, target)
+        val terrain = terrainAt(referenceKey, target)
+        val actual = terrain?.temperature
+        val actualSlope = if (terrain != null) terrainSlope(referenceKey, target) else null
+        val actualAcceleration = if (terrain != null) terrainAcceleration(referenceKey, target) else null
+        val officialError = if (official != null && actual != null) abs(official.temperature - actual) else null
+        val localError = if (local != null && actual != null) abs(local.temperature - actual) else null
 
         return DialSample(
             label = label,
             targetTs = target,
-            officialTemp = forecast?.temperature,
-            localTemp = localTemp,
+            officialTemp = official?.temperature,
+            localTemp = local?.temperature,
             actualTemp = actual,
-            officialSlope = officialSlope,
-            localSlope = localSlope,
+            actualIsMeasured = terrain?.measured == true,
+            officialSlope = official?.slope,
+            localSlope = local?.slope,
             actualSlope = actualSlope,
-            officialAcceleration = officialAcceleration,
-            localAcceleration = localAcceleration,
+            officialAcceleration = official?.acceleration,
+            localAcceleration = local?.acceleration,
             actualAcceleration = actualAcceleration,
             officialError = officialError,
             localError = localError,
-            trainingSamples = model.samples
+            trainingSamples = 0
         )
+    }
+
+    private fun curveKinematics(points: List<SamplePoint>, target: Long): CurveKinematics? {
+        fun nearest(at: Long): SamplePoint? = points.minByOrNull { abs(it.timestamp - at) }
+            ?.takeIf { abs(it.timestamp - at) <= 22L * 60L * 1000L }
+        val center = nearest(target) ?: return null
+        val previous = nearest(target - HOUR_MS)
+        val next = nearest(target + HOUR_MS)
+        val slope = when {
+            previous != null && next != null -> (next.temperature - previous.temperature) / 2.0
+            next != null -> next.temperature - center.temperature
+            previous != null -> center.temperature - previous.temperature
+            else -> null
+        }?.coerceIn(-3.0, 3.0)
+        val acceleration = if (previous != null && next != null)
+            (next.temperature - 2.0 * center.temperature + previous.temperature).coerceIn(-1.5, 1.5)
+        else null
+        return CurveKinematics(center.temperature, slope, acceleration)
+    }
+
+    private fun terrainAt(referenceKey: String, target: Long): TerrainDialPoint? {
+        fun query(source: String, tolerance: Long, measured: Boolean): TerrainDialPoint? =
+            db.readableDatabase.rawQuery(
+                """
+                SELECT temperature
+                FROM weather_reference_samples
+                WHERE reference_key=? AND source=? AND timestamp BETWEEN ? AND ?
+                ORDER BY ABS(timestamp-?) ASC
+                LIMIT 1
+                """.trimIndent(),
+                arrayOf(
+                    referenceKey, source,
+                    (target - tolerance).toString(), (target + tolerance).toString(), target.toString()
+                )
+            ).use { c -> if (c.moveToFirst()) TerrainDialPoint(c.getDouble(0), measured) else null }
+
+        return query("measured", 36L * 60L * 1000L, true)
+            ?: query("reconstructed", 75L * 60L * 1000L, false)
+    }
+
+    private fun terrainSlope(referenceKey: String, target: Long): Double? {
+        val center = terrainAt(referenceKey, target)?.temperature ?: return null
+        val previous = terrainAt(referenceKey, target - HOUR_MS)?.temperature
+        val next = terrainAt(referenceKey, target + HOUR_MS)?.temperature
+        return when {
+            previous != null && next != null -> (next - previous) / 2.0
+            next != null -> next - center
+            previous != null -> center - previous
+            else -> null
+        }?.coerceIn(-3.0, 3.0)
+    }
+
+    private fun terrainAcceleration(referenceKey: String, target: Long): Double? {
+        val center = terrainAt(referenceKey, target)?.temperature ?: return null
+        val previous = terrainAt(referenceKey, target - HOUR_MS)?.temperature ?: return null
+        val next = terrainAt(referenceKey, target + HOUR_MS)?.temperature ?: return null
+        return (next - 2.0 * center + previous).coerceIn(-1.5, 1.5)
     }
 
     /** Pick the snapshot that was closest to a genuine H+1 prediction for this target. */
@@ -704,7 +773,7 @@ private class ForecastDialStripView(
         var x = dp(10f)
         x = legendItem(canvas, x, y, OFFICIAL_RED, "Météo")
         x = legendItem(canvas, x + dp(8f), y, LOCAL_YELLOW, "Fab")
-        legendItem(canvas, x + dp(8f), y, REAL_GREEN, "Réel")
+        legendItem(canvas, x + dp(8f), y, REAL_GREEN, "Terrain")
     }
 
     private fun legendItem(canvas: Canvas, x: Float, y: Float, color: Int, label: String): Float {
@@ -766,7 +835,7 @@ private class ForecastDialStripView(
 
         drawNeedle(canvas, sample.officialSlope, cx, cy, r * 0.73f, OFFICIAL_RED, slotAlpha)
         drawNeedle(canvas, sample.localSlope, cx, cy, r * 0.69f, LOCAL_YELLOW, slotAlpha)
-        // Future green remains absent until a real MEASURED value exists.
+        // Future terrain remains absent until measured/reconstructed reference data exists.
         drawNeedle(canvas, sample.actualSlope, cx, cy, r * 0.63f, REAL_GREEN, slotAlpha)
 
         paint.style = Paint.Style.FILL
@@ -780,10 +849,13 @@ private class ForecastDialStripView(
         canvas.drawText(timeFormatter.format(Instant.ofEpochMilli(sample.targetTs)), cx, cy + r + dp(11f), paint)
 
         val status = when {
-            sample.actualTemp == null -> "réel en attente"
-            sample.officialError != null && sample.localError != null ->
-                "M ${oneDec(sample.officialError)}° · F ${oneDec(sample.localError)}°"
-            else -> "mesure disponible"
+            sample.actualTemp == null -> "terrain en attente"
+            sample.officialError != null && sample.localError != null -> {
+                val origin = if (sample.actualIsMeasured) "R" else "r"
+                "$origin · M ${oneDec(sample.officialError)}° · F ${oneDec(sample.localError)}°"
+            }
+            sample.actualIsMeasured -> "terrain réel"
+            else -> "terrain reconstruit"
         }
         paint.textSize = sp(7.4f)
         canvas.drawText(status, cx, cy + r + dp(21f), paint)
@@ -864,7 +936,7 @@ private class ForecastDialStripView(
             state.samples.forEach { s ->
                 append("${s.label.lowercase()} ${timeFormatter.format(Instant.ofEpochMilli(s.targetTs))}. ")
                 if (s.actualTemp == null) {
-                    append("Réel en attente. ")
+                    append("Terrain en attente. ")
                 } else if (s.officialError != null && s.localError != null) {
                     append("Erreur météo ${oneDec(s.officialError)} degré, erreur Fab ${oneDec(s.localError)} degré. ")
                 }
@@ -873,7 +945,7 @@ private class ForecastDialStripView(
     }
 
     private fun emptyDial(label: String) = DialSample(
-        label, System.currentTimeMillis(), null, null, null,
+        label, System.currentTimeMillis(), null, null, null, false,
         null, null, null, null, null, null, null, null, 0
     )
 

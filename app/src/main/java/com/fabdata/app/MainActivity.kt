@@ -823,21 +823,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val weatherReconstructedSamples = lyonReconstructedSamples
         .filter { it.source == PointSource.RECONSTRUCTED }
         .map { it.copy(sensorId = LYON_RECONSTRUCTED_SENSOR_ID) }
-    val weatherOfficialSensor = Sensor(
-        id = WEATHER_OFFICIAL_SENSOR_ID,
-        stableKey = WEATHER_OFFICIAL_STABLE_KEY,
-        name = "Station météo officielle",
-        room = visualReference.label,
-        colorIndex = 2,
-        latestTimestamp = weatherOfficialSamples.lastOrNull()?.timestamp
-    )
+    val terrainWeatherSamples = mergeTerrainReference(weatherOfficialSamples, weatherReconstructedSamples)
     val lyonReconstructedSensor = Sensor(
         id = LYON_RECONSTRUCTED_SENSOR_ID,
         stableKey = LYON_RECONSTRUCTED_STABLE_KEY,
-        name = "Station météo reconstruite",
-        room = visualReference.label,
-        colorIndex = 3,
-        latestTimestamp = weatherReconstructedSamples.lastOrNull()?.timestamp
+        name = "Référence terrain",
+        room = "${visualReference.label} · réel prioritaire + reconstruction",
+        colorIndex = 2,
+        latestTimestamp = terrainWeatherSamples.lastOrNull()?.timestamp
     )
     // Les deux pseudo-capteurs météo sont uniquement des vues de la référence sélectionnée.
     // Aucun doublon n'est persisté et les anciennes clés internes restent compatibles.
@@ -855,29 +848,45 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         latestTimestamp = inertiaEstimate?.surfacePoints?.lastOrNull()?.timestamp
             ?: explorationOverviewSampleMap[THERMAL_INERTIA_SENSOR_ID]?.lastOrNull()?.timestamp
     )
-    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo reconstruite", "Passé Météo-France H+24 · futur actif · rendu 10 min", 13, forecastReconstructedSamples.lastOrNull()?.timestamp)
-    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab reconstruite", "Correction locale H+24 · rendu 10 min", 8, forecastFabSamples.lastOrNull()?.timestamp)
+    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo H+24", "Passé Météo-France H+24 · futur actif · rendu 10 min", 12, forecastReconstructedSamples.lastOrNull()?.timestamp)
+    val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab H+24", "Correction locale H+24 · rendu 10 min", 11, forecastFabSamples.lastOrNull()?.timestamp)
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
-    val chartSensors = physicalChartSensors + weatherOfficialSensor + lyonReconstructedSensor + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
+    val chartSensors = physicalChartSensors + lyonReconstructedSensor + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
     val chartSampleMap = sampleMap.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
-        (WEATHER_OFFICIAL_SENSOR_ID to weatherOfficialSamples) +
-        (LYON_RECONSTRUCTED_SENSOR_ID to weatherReconstructedSamples) +
+        (LYON_RECONSTRUCTED_SENSOR_ID to terrainWeatherSamples) +
         (FORECAST_RECONSTRUCTED_SENSOR_ID to forecastReconstructedSamples) +
         (FORECAST_FAB_SENSOR_ID to forecastFabSamples) +
         (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
 
-    fun chartLodMap(source: Map<Long, List<SamplePoint>>): Map<Long, List<SamplePoint>> {
+    fun predictionLod(points: List<SamplePoint>, bucketMs: Long): List<SamplePoint> =
+        points.groupBy { (it.timestamp / bucketMs) * bucketMs }
+            .mapNotNull { (bucket, values) ->
+                if (values.isEmpty()) null else SamplePoint(
+                    sensorId = values.first().sensorId,
+                    timestamp = bucket + bucketMs / 2L,
+                    temperature = values.map { it.temperature }.average(),
+                    humidity = values.map { it.humidity }.average(),
+                    source = PointSource.FORECAST,
+                    confidence = values.mapNotNull { it.confidence }.takeIf { it.isNotEmpty() }?.average()
+                )
+            }
+            .sortedBy { it.timestamp }
+
+    fun chartLodMap(source: Map<Long, List<SamplePoint>>, bucketMs: Long): Map<Long, List<SamplePoint>> {
         val reference = source[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty()
+        val measured = reference.filter { it.source == PointSource.MEASURED }
+        val reconstructed = reference.filter { it.source == PointSource.RECONSTRUCTED }
+        val terrain = if (reference.isNotEmpty()) mergeTerrainReference(measured, reconstructed)
+            else predictionLod(terrainWeatherSamples, bucketMs).map { it.copy(source = PointSource.RECONSTRUCTED) }
         return source.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
-            (WEATHER_OFFICIAL_SENSOR_ID to reference.filter { it.source == PointSource.MEASURED }
-                .map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }) +
-            (LYON_RECONSTRUCTED_SENSOR_ID to reference.filter { it.source == PointSource.RECONSTRUCTED }
-                .map { it.copy(sensorId = LYON_RECONSTRUCTED_SENSOR_ID) }) +
+            (LYON_RECONSTRUCTED_SENSOR_ID to terrain) +
+            (FORECAST_RECONSTRUCTED_SENSOR_ID to predictionLod(forecastReconstructedSamples, bucketMs)) +
+            (FORECAST_FAB_SENSOR_ID to predictionLod(forecastFabSamples, bucketMs)) +
             (THERMAL_INERTIA_SENSOR_ID to source[THERMAL_INERTIA_SENSOR_ID].orEmpty())
     }
-    val chartGigaOverviewSampleMap = chartLodMap(gigaOverviewSampleMap)
-    val chartNavigatorOverviewSampleMap = chartLodMap(navigatorOverviewSampleMap)
-    val chartExplorationOverviewSampleMap = chartLodMap(explorationOverviewSampleMap)
+    val chartGigaOverviewSampleMap = chartLodMap(gigaOverviewSampleMap, OVERVIEW_LOD_MONTH_MS)
+    val chartNavigatorOverviewSampleMap = chartLodMap(navigatorOverviewSampleMap, OVERVIEW_LOD_DAY_MS)
+    val chartExplorationOverviewSampleMap = chartLodMap(explorationOverviewSampleMap, OVERVIEW_LOD_6H_MS)
 
     fun centeredTemporalRange(center: Long, requestedSpan: Long, outer: LongRange): LongRange {
         val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
@@ -1861,7 +1870,7 @@ private fun SeriesSelector(
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Superposition", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Chaque pièce peut afficher T°, humidité, les deux ou aucune.",
+                "Chaque courbe est indépendante : terrain, prévision météo, prévision Fab et sol inertiel.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -1875,9 +1884,9 @@ private fun SeriesSelector(
                     Column(Modifier.weight(1f)) {
                         val displayRoom = when (sensor.id) {
                             WEATHER_OFFICIAL_SENSOR_ID -> "Station météo officielle"
-                            LYON_RECONSTRUCTED_SENSOR_ID -> "Station météo reconstruite"
-                            FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision météo reconstruite"
-                            FORECAST_FAB_SENSOR_ID -> "Prévision Fab reconstruite"
+                            LYON_RECONSTRUCTED_SENSOR_ID -> "Référence terrain · réel > reconstruit"
+                            FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision météo H+24"
+                            FORECAST_FAB_SENSOR_ID -> "Prévision Fab H+24"
                             THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
                             else -> sensor.room
                         }
@@ -1918,6 +1927,32 @@ private fun SeriesSelector(
             }
         }
     }
+}
+
+private fun mergeTerrainReference(
+    measured: List<SamplePoint>,
+    reconstructed: List<SamplePoint>
+): List<SamplePoint> {
+    if (measured.isEmpty()) {
+        return reconstructed.map { it.copy(sensorId = LYON_RECONSTRUCTED_SENSOR_ID) }.sortedBy { it.timestamp }
+    }
+    val tolerance = 36L * 60L * 1000L
+    val measuredTimes = measured.map { it.timestamp }.sorted()
+    fun hasMeasuredNear(timestamp: Long): Boolean {
+        val index = measuredTimes.binarySearch(timestamp)
+        if (index >= 0) return true
+        val insertion = -index - 1
+        val before = measuredTimes.getOrNull(insertion - 1)
+        val after = measuredTimes.getOrNull(insertion)
+        return (before != null && kotlin.math.abs(before - timestamp) <= tolerance) ||
+            (after != null && kotlin.math.abs(after - timestamp) <= tolerance)
+    }
+    val fallback = reconstructed.filterNot { hasMeasuredNear(it.timestamp) }
+    return (fallback + measured)
+        .map { it.copy(sensorId = LYON_RECONSTRUCTED_SENSOR_ID) }
+        .associateBy { it.timestamp }
+        .values
+        .sortedBy { it.timestamp }
 }
 
 private fun navigationWeatherPoints(sampleMap: Map<Long, List<SamplePoint>>): List<SamplePoint> =

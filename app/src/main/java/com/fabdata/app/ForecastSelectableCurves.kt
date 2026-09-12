@@ -20,9 +20,9 @@ private const val CURVE_STEP_10M_MS = 10L * 60L * 1000L
  * Two selectable prediction-only chart series.
  *
  * Weather curve priority:
- * 1. immutable snapshots really captured by FabData;
- * 2. API historical-forecast backfill for older missing hours;
- * 3. active future forecast.
+ * 1. past = fixed-lead Météo-France H+24 archive only;
+ * 2. future = the currently active forecast captured by FabData.
+ * Old near-H+1 replay snapshots are deliberately excluded from past verification.
  *
  * Fab curve follows the exact same anchor timestamps. Locally emitted Fab snapshots win;
  * otherwise the API past is passed through a causal, no-future-leakage backtest.
@@ -171,28 +171,15 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
 
         val reconstructedAnchors = mutableListOf<SamplePoint>()
         val fabAnchors = mutableListOf<SamplePoint>()
+        val nowBucket = forecastCurveHourBucket(now)
         buckets.forEach { bucket ->
             val actual = actualByBucket[bucket]
-            if (actual != null) {
-                reconstructedAnchors += SamplePoint(
-                    sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
-                    timestamp = actual.targetAt,
-                    temperature = actual.temperature,
-                    humidity = actual.humidity,
-                    source = PointSource.FORECAST,
-                    confidence = actual.confidence
-                )
-                val local = localByKey[actual.issuedAt to actual.targetAt]
-                fabAnchors += SamplePoint(
-                    sensorId = FORECAST_FAB_SENSOR_ID,
-                    timestamp = actual.targetAt,
-                    temperature = local?.first ?: actual.temperature,
-                    humidity = actual.humidity,
-                    source = PointSource.FORECAST,
-                    confidence = local?.second ?: actual.confidence * 0.45
-                )
-            } else {
-                backfillByBucket[bucket]?.let { p ->
+            val backfilled = backfillByBucket[bucket]
+
+            if (bucket <= nowBucket) {
+                // Scientific comparison: never fall back to the old H+1-ish local replay.
+                // If H+24 history is unavailable, leave a visible gap instead of inventing history.
+                backfilled?.let { p ->
                     reconstructedAnchors += SamplePoint(
                         sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
                         timestamp = p.targetAt,
@@ -210,6 +197,25 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
                         confidence = p.fabConfidence
                     )
                 }
+            } else if (actual != null) {
+                // Future side stays live/current.
+                reconstructedAnchors += SamplePoint(
+                    sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID,
+                    timestamp = actual.targetAt,
+                    temperature = actual.temperature,
+                    humidity = actual.humidity,
+                    source = PointSource.FORECAST,
+                    confidence = actual.confidence
+                )
+                val local = localByKey[actual.issuedAt to actual.targetAt]
+                fabAnchors += SamplePoint(
+                    sensorId = FORECAST_FAB_SENSOR_ID,
+                    timestamp = actual.targetAt,
+                    temperature = local?.first ?: actual.temperature,
+                    humidity = actual.humidity,
+                    source = PointSource.FORECAST,
+                    confidence = local?.second ?: actual.confidence * 0.45
+                )
             }
         }
 
