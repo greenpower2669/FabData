@@ -1,19 +1,23 @@
-name: Build forecast memory tangent dials
+name: Build selectable forecast curves
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - 'feature/forecast-memory-cadrans'
+      - 'feature/forecast-selectable-curves'
     paths:
       - 'app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt'
       - 'app/src/main/java/com/fabdata/app/ForecastReplayUi.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt'
       - 'app/src/main/java/com/fabdata/app/BackupV3Support.kt'
       - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
       - 'app/src/main/AndroidManifest.xml'
       - 'tools/apply_forecast_dial_palette.py'
       - 'tools/apply_forecast_history_v2.py'
       - 'tools/apply_latest_edge_cascade.py'
+      - 'tools/patch_main_forecast_selector.py'
+      - 'tools/patch_backup_forecast_local.py'
+      - 'tools/patch_overlay_forecast_materialize.py'
       - '.github/workflows/build-forecast-memory-cadrans.yml'
 
 permissions:
@@ -27,7 +31,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: feature/forecast-memory-cadrans
+          ref: feature/forecast-selectable-curves
           fetch-depth: 0
 
       - name: Apply progressive dial palette
@@ -39,23 +43,27 @@ jobs:
       - name: Apply latest-edge cascade
         run: python3 tools/apply_latest_edge_cascade.py
 
+      - name: Add selectable forecast curves
+        run: |
+          python3 tools/patch_main_forecast_selector.py
+          python3 tools/patch_backup_forecast_local.py
+          python3 tools/patch_overlay_forecast_materialize.py
+
       - name: Regression guard
         run: |
           git diff --check
           grep -n 'ForecastMemoryBootstrapProvider' app/src/main/AndroidManifest.xml
           grep -n 'forecast_snapshot_archive' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'source=.measured.' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n '24L \* HOUR_MS' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'errorSeverityColor' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           grep -n 'KEY_WIDTH_DP' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'drawResizeHandle' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'FORECAST_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
-          grep -n 'ForecastReplayCard' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'MEASURED and RECONSTRUCTED values never enter it' app/src/main/java/com/fabdata/app/ForecastReplayUi.kt
-          grep -n 'ForecastReplayKind.ESTIMATED' app/src/main/java/com/fabdata/app/ForecastReplayUi.kt
           grep -n 'cascade latest-edge au relâchement' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'latestEdgeCenter' app/src/main/java/com/fabdata/app/MainActivity.kt
-          ! grep -n 'bridgeCandidates' app/src/main/java/com/fabdata/app/ForecastReplayUi.kt
+          grep -n 'FORECAST_RECONSTRUCTED_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'FORECAST_FAB_SENSOR_ID' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'forecast_local_snapshot_archive' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          grep -n 'Prévision reconstruite' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Prévision Fab' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'FORECAST_LOCAL_ARCHIVE' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -n 'never persisted or exported' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
+          ! grep -n 'source=.reconstructed.' app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -80,10 +88,15 @@ jobs:
       - name: Build debug APK
         run: gradle --no-daemon :app:assembleDebug
 
-      - name: Commit validated forecast-history source
+      - name: Normalize beta APK filename
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             app/build/outputs/apk/debug/FabData-v0.21.5-beta-previsions-selectionnables.apk
+
+      - name: Commit validated source
         run: |
           if git diff --quiet -- app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt app/src/main/java/com/fabdata/app/ForecastReplayUi.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt app/src/main/java/com/fabdata/app/MainActivity.kt; then
-            echo "Forecast history source already committed"
+            echo "Selectable forecast source already committed"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -91,13 +104,13 @@ jobs:
                     app/src/main/java/com/fabdata/app/ForecastReplayUi.kt \
                     app/src/main/java/com/fabdata/app/BackupV3Support.kt \
                     app/src/main/java/com/fabdata/app/MainActivity.kt
-            git commit -m "Align lower bands to latest selected edge [skip ci]"
-            git push origin HEAD:feature/forecast-memory-cadrans
+            git commit -m "Add selectable archived and Fab forecast curves [skip ci]"
+            git push origin HEAD:feature/forecast-selectable-curves
           fi
 
-      - name: Upload debug APK
+      - name: Upload beta APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-forecast-memory-cadrans-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: FabData-v0.21.5-beta-previsions-selectionnables
+          path: app/build/outputs/apk/debug/FabData-v0.21.5-beta-previsions-selectionnables.apk
           if-no-files-found: error
