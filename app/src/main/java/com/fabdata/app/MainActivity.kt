@@ -2083,6 +2083,11 @@ private fun HistoryOverviewCard(
                             ?: (bounds.first + (bounds.last - bounds.first) / 2L)
                     )
                 }
+                // v0.21.6 : cascade latest-edge au relâchement.
+                // Les sélecteurs supérieurs restent locaux pendant le drag : les niveaux
+                // inférieurs ne sont recadrés qu'au relâchement, sur la partie la plus récente
+                // de la sélection parente.
+                var firstBandDraftCenter by remember { mutableStateOf<Long?>(null) }
                 // Position provisoire du sélecteur du bandeau 2. Tant qu'elle existe,
                 // elle ne sort jamais du composable et ne déclenche aucune requête.
                 var secondBandDraftCenter by remember { mutableStateOf<Long?>(null) }
@@ -2176,6 +2181,18 @@ private fun HistoryOverviewCard(
                     val half = span / 2L
                     return value.coerceIn(outer.first + half, outer.last - (span - half))
                 }
+                fun rangeForCenter(value: Long, span: Long, outer: LongRange): LongRange {
+                    val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
+                    if (span >= outerSpan) return outer
+                    val center = clampCenterToRange(value, span, outer)
+                    val start = center - span / 2L
+                    return start..(start + span)
+                }
+                fun latestEdgeCenter(span: Long, outer: LongRange): Long {
+                    val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
+                    if (span >= outerSpan) return outer.first + outerSpan / 2L
+                    return clampCenterToRange(outer.last - span / 2L, span, outer)
+                }
 
                 // Niveau 1 : le giga est le seul historique complet.
                 // Sa sélection doit rester un VRAI niveau intermédiaire et non retomber
@@ -2188,6 +2205,9 @@ private fun HistoryOverviewCard(
                 val wideFrom = if (wideSpan >= fullSpan) bounds.first else effectiveWideCenter - wideSpan / 2L
                 val wideTo = if (wideSpan >= fullSpan) bounds.last else wideFrom + wideSpan
                 val wideWindow = wideFrom..wideTo
+                val displayWideCenter = firstBandDraftCenter?.let { clampCenter(it, wideSpan) } ?: effectiveWideCenter
+                val displayWideFrom = if (wideSpan >= fullSpan) bounds.first else displayWideCenter - wideSpan / 2L
+                val displayWideTo = if (wideSpan >= fullSpan) bounds.last else displayWideFrom + wideSpan
 
                 // Niveau 2 -> 3 : la fenêtre d'exploration est contrainte à la fenêtre large.
                 val effectiveCenter = clampCenterToRange(previewCenter, previewSpan, wideWindow)
@@ -2299,7 +2319,7 @@ private fun HistoryOverviewCard(
                 val displayPreviewTo = if (previewSpan >= wideSpan) wideTo
                     else displayPreviewFrom + previewSpan
 
-                val gigaSelectionCenter = wideFrom + (wideTo - wideFrom) / 2L
+                val gigaSelectionCenter = displayWideFrom + (displayWideTo - displayWideFrom) / 2L
                 val gigaSelectionTemp = nearestWeatherTemperature(
                     gigaWeatherPoints, gigaSelectionCenter, 40L * 60L * 60L * 1000L
                 )
@@ -2332,22 +2352,67 @@ private fun HistoryOverviewCard(
                         .fillMaxWidth()
                         .height(34.dp)
                         .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.17f), RoundedCornerShape(10.dp))
-                        .pointerInput(bounds.first, bounds.last, wideSpan) {
-                            detectDragGestures { change, dragAmount ->
-                                val width = size.width.toFloat().coerceAtLeast(1f)
-                                val deltaTs = ((dragAmount.x / width) * fullSpan.toDouble()).toLong()
-                                wideCenter = clampCenter(wideCenter + deltaTs, wideSpan)
-                                change.consume()
-                            }
+                        .pointerInput(bounds.first, bounds.last, wideSpan, previewSpan, viewBounds?.first, viewBounds?.last) {
+                            detectDragGestures(
+                                onDragStart = {
+                                    firstBandDraftCenter = effectiveWideCenter
+                                    onLowerZonesInteractionStart()
+                                },
+                                onDrag = { change, dragAmount ->
+                                    val width = size.width.toFloat().coerceAtLeast(1f)
+                                    val deltaTs = ((dragAmount.x / width) * fullSpan.toDouble()).toLong()
+                                    val current = firstBandDraftCenter ?: effectiveWideCenter
+                                    firstBandDraftCenter = clampCenter(current + deltaTs, wideSpan)
+                                    change.consume()
+                                },
+                                onDragEnd = {
+                                    val target = firstBandDraftCenter
+                                    firstBandDraftCenter = null
+                                    if (target != null && target != effectiveWideCenter) {
+                                        val committedWideCenter = clampCenter(target, wideSpan)
+                                        val committedWideRange = rangeForCenter(committedWideCenter, wideSpan, bounds)
+                                        val newestPreviewCenter = latestEdgeCenter(previewSpan, committedWideRange)
+                                        val newestPreviewRange = rangeForCenter(newestPreviewCenter, previewSpan, committedWideRange)
+                                        val detailSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
+                                            ?.coerceAtMost(previewSpan) ?: previewSpan
+                                        val newestDetailCenter = latestEdgeCenter(detailSpan, newestPreviewRange)
+                                        wideCenter = committedWideCenter
+                                        previewCenter = newestPreviewCenter
+                                        onNavigate(newestDetailCenter)
+                                        onSelectTimestamp(newestPreviewRange.last)
+                                        onLowerZonesCommit()
+                                    } else {
+                                        onLowerZonesInteractionCancel()
+                                    }
+                                },
+                                onDragCancel = {
+                                    firstBandDraftCenter = null
+                                    onLowerZonesInteractionCancel()
+                                }
+                            )
                         }
-                        .pointerInput(bounds.first, bounds.last, wideSpan) {
+                        .pointerInput(bounds.first, bounds.last, wideSpan, previewSpan, viewBounds?.first, viewBounds?.last) {
                             detectTapGestures(onTap = { p ->
                                 val width = size.width.toFloat().coerceAtLeast(1f)
                                 val fraction = (p.x / width).coerceIn(0f, 1f)
-                                wideCenter = clampCenter(
+                                val target = clampCenter(
                                     bounds.first + (fullSpan * fraction).toLong(),
                                     wideSpan
                                 )
+                                if (target != effectiveWideCenter) {
+                                    onLowerZonesInteractionStart()
+                                    val committedWideRange = rangeForCenter(target, wideSpan, bounds)
+                                    val newestPreviewCenter = latestEdgeCenter(previewSpan, committedWideRange)
+                                    val newestPreviewRange = rangeForCenter(newestPreviewCenter, previewSpan, committedWideRange)
+                                    val detailSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
+                                        ?.coerceAtMost(previewSpan) ?: previewSpan
+                                    val newestDetailCenter = latestEdgeCenter(detailSpan, newestPreviewRange)
+                                    wideCenter = target
+                                    previewCenter = newestPreviewCenter
+                                    onNavigate(newestDetailCenter)
+                                    onSelectTimestamp(newestPreviewRange.last)
+                                    onLowerZonesCommit()
+                                }
                             })
                         }
                 ) {
@@ -2377,9 +2442,9 @@ private fun HistoryOverviewCard(
                             )
                         }
                     }
-                    val left = (((wideFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                    val left = (((displayWideFrom - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
                         .coerceIn(0f, size.width)
-                    val right = (((wideTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
+                    val right = (((displayWideTo - bounds.first).toDouble() / fullSpan.toDouble()).toFloat() * size.width)
                         .coerceIn(left, size.width)
                     drawRect(
                         gigaSelectorColor.copy(alpha = 0.16f),
@@ -2430,7 +2495,13 @@ private fun HistoryOverviewCard(
                                     val target = secondBandDraftCenter
                                     secondBandDraftCenter = null
                                     if (target != null && target != effectiveCenter) {
+                                        val targetPreviewRange = rangeForCenter(target, previewSpan, wideWindow)
+                                        val detailSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
+                                            ?.coerceAtMost(previewSpan) ?: previewSpan
+                                        val newestDetailCenter = latestEdgeCenter(detailSpan, targetPreviewRange)
                                         previewCenter = target
+                                        onNavigate(newestDetailCenter)
+                                        onSelectTimestamp(targetPreviewRange.last)
                                         onLowerZonesCommit()
                                     } else {
                                         onLowerZonesInteractionCancel()
@@ -2451,7 +2522,13 @@ private fun HistoryOverviewCard(
                                 )
                                 if (target != effectiveCenter) {
                                     onLowerZonesInteractionStart()
+                                    val targetPreviewRange = rangeForCenter(target, previewSpan, wideWindow)
+                                    val detailSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
+                                        ?.coerceAtMost(previewSpan) ?: previewSpan
+                                    val newestDetailCenter = latestEdgeCenter(detailSpan, targetPreviewRange)
                                     previewCenter = target
+                                    onNavigate(newestDetailCenter)
+                                    onSelectTimestamp(targetPreviewRange.last)
                                     onLowerZonesCommit()
                                 }
                             })
