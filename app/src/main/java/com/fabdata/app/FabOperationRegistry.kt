@@ -159,6 +159,12 @@ object FabOperationRegistry {
     }
 
     @Synchronized
+    fun discard(id: Long?) {
+        if (id == null) return
+        operations.removeAll { it.id == id }
+    }
+
+    @Synchronized
     fun clearFinished() {
         operations.removeAll { !it.active }
     }

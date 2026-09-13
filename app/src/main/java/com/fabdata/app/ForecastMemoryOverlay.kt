@@ -316,9 +316,9 @@ private class ForecastDialDataSource(
         ForecastHorizonArchiveStore.ensure(db.writableDatabase)
         ForecastAdaptiveStore.ensure(db.writableDatabase)
         val reference = WeatherReferencePrefs(appContext).selectedReference()
-        val weatherHorizon = dialPrefs.getInt(DIAL_WEATHER_HORIZON_KEY, 24).coerceIn(1, 48)
-        val requestedAdaptive = dialPrefs.getInt(DIAL_ADAPTIVE_HORIZON_KEY, 24)
-        val adaptiveHorizon = requestedAdaptive.takeIf { it in FORECAST_ADAPTIVE_HORIZONS } ?: 24
+        val weatherHorizon = dialPrefs.getInt(DIAL_WEATHER_HORIZON_KEY, 1).coerceIn(1, 48)
+        val requestedAdaptive = dialPrefs.getInt(DIAL_ADAPTIVE_HORIZON_KEY, 1)
+        val adaptiveHorizon = requestedAdaptive.takeIf { it in FORECAST_ADAPTIVE_HORIZONS } ?: 1
 
         // Materialise only a narrow target window from already archived raw snapshots.
         // No terrain/training data is modified by the cockpit.
@@ -349,7 +349,7 @@ private class ForecastDialDataSource(
     ): DialSample {
         val official = fixedWeatherKinematics(referenceKey, weatherHorizon, target)
         val local = adaptiveKinematics(referenceKey, adaptiveHorizon, target)
-        val terrain = terrainAt(referenceKey, target)
+        val terrain = if (label == "FUTUR") null else terrainAt(referenceKey, target)
         val actual = terrain?.temperature
         val actualSlope = if (terrain != null) terrainSlope(referenceKey, target) else null
         val actualAcceleration = if (terrain != null) terrainAcceleration(referenceKey, target) else null

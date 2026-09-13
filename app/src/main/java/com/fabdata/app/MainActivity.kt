@@ -473,7 +473,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     // v0.17 : la météo live est désormais pilotée par FabLiveUpdateCoordinator
-    // à l'ouverture, au retour au focus et ensuite toutes les 5 minutes au premier plan.
+    // à l'ouverture, au retour au focus et ensuite sur les créneaux fixes de 10 minutes au premier plan.
 
     // Les sondes HTTP ajoutées une fois restent automatiques ensuite.
     LaunchedEffect(Unit) {
@@ -510,6 +510,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs, wideOverviewRange, explorationOverviewRange) {
+        // Startup/preferences can settle through several Compose states in a few milliseconds.
+        // Debounce before registering work so Activity FabData shows one meaningful refresh,
+        // not a TERMINÉ/ANNULÉ/TERMINÉ burst.
+        delay(350L)
         reloadMutex.withLock {
         val reloadStarted = System.currentTimeMillis()
         val reloadOperation = FabOperationRegistry.tryStart(
@@ -830,7 +834,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         busy = false
         reloadSucceeded = true
         } catch (cancel: CancellationException) {
-            FabOperationRegistry.cancelled(reloadOperation, "Actualisation affichage annulée")
+            if (FabOperationRegistry.cancelRequested(reloadOperation)) {
+                FabOperationRegistry.cancelled(reloadOperation, "Actualisation affichage annulée")
+            } else {
+                FabOperationRegistry.discard(reloadOperation)
+            }
             throw cancel
         } catch (error: Throwable) {
             FabOperationRegistry.fail(
@@ -841,10 +849,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         } finally {
             busy = false
             if (reloadSucceeded) {
-                FabOperationRegistry.finish(
-                    reloadOperation,
-                    "Affichage prêt · ${System.currentTimeMillis() - reloadStarted} ms"
-                )
+                val elapsed = System.currentTimeMillis() - reloadStarted
+                if (elapsed < 750L) {
+                    FabOperationRegistry.discard(reloadOperation)
+                } else {
+                    FabOperationRegistry.finish(reloadOperation, "Affichage prêt · $elapsed ms")
+                }
             }
         }
         }
@@ -3098,6 +3108,11 @@ private fun HistoryOverviewCard(
                 }
 
                 if (helpOpen) {
+                    Text(
+                        "Cadrans flottants : appui long sur le cadran pour choisir séparément l’horizon météo et l’horizon Fab adaptatif. Double appui pour le mode compact/déplié.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                     Card(
                         shape = RoundedCornerShape(14.dp),
                         colors = CardDefaults.cardColors(
@@ -4569,12 +4584,19 @@ private fun SettingsDialog(
                     singleLine = true
                 )
                 HorizontalDivider()
-                Text("Politique de confidentialité · FabData v0.8", fontWeight = FontWeight.Bold)
+                Text("Aide · cadrans flottants", fontWeight = FontWeight.Bold)
                 Text(
-                    "Les mesures, noms de pièces et événements sont traités localement sur cet appareil. " +
-                        "FabData n'envoie aucune donnée utilisateur à un serveur, n'intègre ni publicité ni analytique " +
-                        "et ne crée aucun compte utilisateur. La sonde Lyon consulte uniquement une page publique " +
-                        "d'observations météo Lyon-Bron afin d'importer température et humidité.",
+                    "Appui long sur le cadran pour choisir la prévision météo et la prévision Fab adaptative à surveiller. " +
+                        "Double appui pour passer compact / déplié. Les choix, la position et la taille sont persistants et sauvegardés.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                HorizontalDivider()
+                Text("Politique de confidentialité · FabData v0.23.4", fontWeight = FontWeight.Bold)
+                Text(
+                    "Les mesures intérieures, noms de pièces, événements, modèles et personnalisations restent traités localement sur cet appareil. " +
+                        "FabData n'intègre ni publicité ni analytique et ne crée aucun compte utilisateur. " +
+                        "Les fonctions météo contactent uniquement les fournisseurs nécessaires avec la station ou les coordonnées météo sélectionnées ; " +
+                        "les mesures intérieures ne leur sont pas envoyées.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
