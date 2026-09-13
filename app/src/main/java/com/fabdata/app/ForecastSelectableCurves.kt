@@ -11,6 +11,7 @@ const val FORECAST_FAB_SENSOR_ID = -6902900105L
 const val FORECAST_FAB_STABLE_KEY = "forecast-fab-local"
 
 private const val CURVE_HOUR_MS = 60L * 60L * 1000L
+private fun selectableHourBucket(timestamp: Long): Long = (timestamp / CURVE_HOUR_MS) * CURVE_HOUR_MS
 
 /**
  * Two selectable, prediction-only chart series.
@@ -209,17 +210,17 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
 
     private fun selectReplayAnchors(rows: List<SelectableForecastRow>, now: Long): List<SelectableForecastRow> {
         val past = rows.filter { it.targetAt <= now }
-            .groupBy { hourBucket(it.targetAt) }
+            .groupBy { selectableHourBucket(it.targetAt) }
             .values
             .mapNotNull { group ->
                 group.minByOrNull { abs((it.targetAt - it.issuedAt) - CURVE_HOUR_MS) }
             }
         val future = rows.filter { it.targetAt > now && it.issuedAt <= now }
-            .groupBy { hourBucket(it.targetAt) }
+            .groupBy { selectableHourBucket(it.targetAt) }
             .values
             .mapNotNull { group -> group.maxByOrNull { it.issuedAt } }
         return (past + future)
-            .associateBy { hourBucket(it.targetAt) }
+            .associateBy { selectableHourBucket(it.targetAt) }
             .values
             .sortedBy { it.targetAt }
     }
@@ -259,7 +260,7 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
             }
         if (candidates.isEmpty()) return SelectableResidualModel()
 
-        val selected = candidates.groupBy { hourBucket(it.targetAt) }
+        val selected = candidates.groupBy { selectableHourBucket(it.targetAt) }
             .values
             .mapNotNull { group -> group.minByOrNull { abs((it.targetAt - it.issuedAt) - CURVE_HOUR_MS) } }
             .sortedBy { it.targetAt }
@@ -347,7 +348,7 @@ class ForecastSelectableCurveStore(private val db: FabDataDb) {
             out += left
             val gap = right.timestamp - left.timestamp
             if (gap > CURVE_HOUR_MS + 10L * 60L * 1000L && gap <= 6L * CURVE_HOUR_MS) {
-                var ts = hourBucket(left.timestamp) + CURVE_HOUR_MS
+                var ts = selectableHourBucket(left.timestamp) + CURVE_HOUR_MS
                 while (ts < right.timestamp) {
                     val fraction = ((ts - left.timestamp).toDouble() / gap.toDouble()).coerceIn(0.0, 1.0)
                     val confidence = min(left.confidence ?: 0.6, right.confidence ?: 0.6) * 0.72
