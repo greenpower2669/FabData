@@ -18,6 +18,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
+private const val LIVE_FORECAST_INTERVAL_MS = 10L * 60L * 1000L
+
 /**
  * Orchestrateur toujours composé, indépendant des cartes LazyColumn.
  *
@@ -71,9 +73,20 @@ fun FabLiveUpdateCoordinator(
         onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
-    suspend fun updateLive(): Boolean {
+    suspend fun lastForecastUpdatedAt(referenceKey: String): Long? = withContext(Dispatchers.IO) {
+        db.readableDatabase.rawQuery(
+            "SELECT MAX(updated_at) FROM weather_reference_samples WHERE reference_key=? AND source='forecast'",
+            arrayOf(referenceKey)
+        ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null }
+    }
+
+    suspend fun updateLive(force: Boolean = false): Boolean {
         if (!foreground || working) return false
         val referenceForOperation = weatherPrefs.selectedReference()
+        if (!force) {
+            val last = lastForecastUpdatedAt(referenceForOperation.key)
+            if (last != null && System.currentTimeMillis() - last < LIVE_FORECAST_INTERVAL_MS) return false
+        }
         val operationId = FabOperationRegistry.tryStart(
             "weather:${referenceForOperation.key}",
             "Mise à jour automatique",
@@ -157,29 +170,32 @@ fun FabLiveUpdateCoordinator(
         measuredRevision = current
         if (previous != null && current != previous) {
             pendingMeasuredRefresh = true
-            if (foreground && updateLive()) {
+            if (foreground && updateLive(force = true)) {
                 pendingMeasuredRefresh = false
             }
         }
     }
 
-    // Le retour au premier plan rafraîchit uniquement la référence déjà choisie.
-    // Aucun scan de secteur et aucun changement automatique de station ne sont autorisés ici.
+    // La dernière écriture FORECAST cadence le réseau : retour au focus, bouton manuel
+    // et worker Android partagent ainsi la même horloge sans spammer l'affichage.
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
-
-        val hadPendingMeasured = pendingMeasuredRefresh
-        if (updateLive() && hadPendingMeasured) {
-            pendingMeasuredRefresh = false
-        }
-
-        while (true) {
-            delay(600_000L)
-            if (!foreground) break
+        while (foreground) {
             val hadPending = pendingMeasuredRefresh
-            if (updateLive() && hadPending) {
-                pendingMeasuredRefresh = false
+            if (!hadPending) {
+                val reference = weatherPrefs.selectedReference()
+                val last = lastForecastUpdatedAt(reference.key)
+                val waitMs = last?.let {
+                    (LIVE_FORECAST_INTERVAL_MS - (System.currentTimeMillis() - it)).coerceAtLeast(0L)
+                } ?: 0L
+                if (waitMs > 0L) {
+                    delay(waitMs)
+                    if (!foreground) break
+                }
             }
+            val ran = updateLive(force = hadPending)
+            if (ran && hadPending) pendingMeasuredRefresh = false
+            if (!ran) delay(5_000L)
         }
     }
 }

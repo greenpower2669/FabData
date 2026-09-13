@@ -9,7 +9,7 @@ import kotlin.math.exp
 import kotlin.math.max
 
 /**
- * Causal Fab adaptive forecast at five fixed horizons.
+ * Causal Fab adaptive forecast at six fixed horizons.
  *
  * The weather forecast remains the baseline. Fab learns the baseline residual for the same
  * horizon, learns the usual error of a present-time tangent projection, and changes the blend
@@ -17,7 +17,7 @@ import kotlin.math.max
  * never retro-invented: only predictions that really exist while their target is still future are
  * frozen in [ForecastAdaptiveStore].
  */
-val FORECAST_ADAPTIVE_HORIZONS: List<Int> = listOf(3, 6, 12, 24, 48)
+val FORECAST_ADAPTIVE_HORIZONS: List<Int> = listOf(1, 3, 6, 12, 24, 48)
 private const val FORECAST_ADAPTIVE_SENSOR_ID_BASE = -6902900400L
 private const val ADAPTIVE_HOUR_MS = 60L * 60L * 1000L
 private const val ADAPTIVE_DAY_MS = 24L * ADAPTIVE_HOUR_MS

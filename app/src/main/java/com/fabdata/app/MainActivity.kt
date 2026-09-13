@@ -863,7 +863,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             val queryTo = maxOf(history.last, now + FORECAST_DISPLAY_FUTURE_MS + 60L * 60L * 1000L)
             val curves = withContext(Dispatchers.IO) {
                 // API H+24 stays a best-effort historical backfill. Local snapshots are the
-                // durable source for H+1..H+24 and for the Météo-France-like gliding curve.
+                // durable source for fixed H+1..H+48 and for the provider-like gliding curve.
                 ForecastPastArchiveBackfill(db).ensure(
                     visualReference, history.first, minOf(history.last, now - 60L * 60L * 1000L), now
                 )
@@ -955,7 +955,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             forecastAdaptiveSensorId(lead), forecastAdaptiveStableKey(lead),
             "Prévision Fab adaptative H+$lead",
             "Tangente + changement de régime · archive causale H+$lead",
-            listOf(10, 5, 13, 8, 6)[index], points.lastOrNull()?.timestamp
+            (6 + index * 3) % palette.size, points.lastOrNull()?.timestamp
         )
     }
     val forecastHorizonSampleMap = forecastHorizonSamples.mapKeys { (lead, _) -> forecastHorizonSensorId(lead) }
@@ -2033,10 +2033,16 @@ private fun SeriesSelector(
     }
 
     val weatherForecastSensors = sensors
-        .filter { sensor -> sensor.id == FORECAST_ACTIVE_SENSOR_ID || fixedWeatherLead(sensor) != null }
+        .filter { sensor ->
+            val lead = fixedWeatherLead(sensor)
+            sensor.id == FORECAST_ACTIVE_SENSOR_ID || (lead != null && lead != 24)
+        }
         .sortedWith(compareBy<Sensor> { if (it.id == FORECAST_ACTIVE_SENSOR_ID) -1 else fixedWeatherLead(it) ?: Int.MAX_VALUE })
     val adaptiveForecastSensors = sensors
-        .filter { sensor -> sensor.id == FORECAST_FAB_SENSOR_ID || isAdaptiveForecastSensorId(sensor.id) }
+        .filter { sensor ->
+            val lead = forecastAdaptiveLeadForSensorId(sensor.id)
+            sensor.id == FORECAST_FAB_SENSOR_ID || (lead != null && lead != 24)
+        }
         .sortedWith(compareBy<Sensor> { if (it.id == FORECAST_FAB_SENSOR_ID) -1 else forecastAdaptiveLeadForSensorId(it.id) ?: Int.MAX_VALUE })
     val groupedIds = (weatherForecastSensors + adaptiveForecastSensors).map { it.id }.toSet()
     val mainSensors = sensors.filterNot { it.id in groupedIds }
@@ -2152,7 +2158,7 @@ private fun SeriesSelector(
                 val visibleCount = weatherForecastSensors.count { showTemp[it.id] == true }
                 OutlinedButton(onClick = { weatherExpanded = !weatherExpanded }, modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        "Prévisions météo · active + H+1 → H+48 · $visibleCount/${weatherForecastSensors.size} " +
+                        "Prévisions météo · autres horizons jusqu’à H+48 · $visibleCount/${weatherForecastSensors.size} " +
                             if (weatherExpanded) "▴" else "▾"
                     )
                 }
@@ -2170,7 +2176,7 @@ private fun SeriesSelector(
                 val visibleCount = adaptiveForecastSensors.count { showTemp[it.id] == true }
                 OutlinedButton(onClick = { adaptiveExpanded = !adaptiveExpanded }, modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        "Prévisions Fab · adaptatives jusqu’à H+48 · $visibleCount/${adaptiveForecastSensors.size} " +
+                        "Prévisions Fab · autres horizons jusqu’à H+48 · $visibleCount/${adaptiveForecastSensors.size} " +
                             if (adaptiveExpanded) "▴" else "▾"
                     )
                 }
