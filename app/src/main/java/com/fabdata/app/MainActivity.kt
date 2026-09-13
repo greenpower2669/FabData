@@ -808,7 +808,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         if (!showTemp.containsKey(FORECAST_RECONSTRUCTED_SENSOR_ID)) showTemp[FORECAST_RECONSTRUCTED_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_RECONSTRUCTED_STABLE_KEY) ?: true
         if (!showTemp.containsKey(FORECAST_FAB_SENSOR_ID)) showTemp[FORECAST_FAB_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_FAB_STABLE_KEY) ?: false
         if (!showTemp.containsKey(FORECAST_ACTIVE_SENSOR_ID)) showTemp[FORECAST_ACTIVE_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_ACTIVE_STABLE_KEY) ?: false
-        FORECAST_HORIZON_HOURS.filter { it < 24 }.forEach { lead ->
+        FORECAST_HORIZON_HOURS.filter { it != 24 }.forEach { lead ->
             val id = forecastHorizonSensorId(lead)
             val stableKey = "forecast-weather-h$lead"
             if (!showTemp.containsKey(id)) showTemp[id] = uiPrefs.curveTemperature(stableKey) ?: false
