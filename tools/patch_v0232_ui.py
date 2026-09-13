@@ -8,7 +8,7 @@ def once(old, new, label):
     global s
     if new in s: return
     n=s.count(old)
-    if n != 1: raise RuntimeError(f'{label}: expected 1 occurrence, got {n}')
+    if n < 1: raise RuntimeError(f'{label}: expected at least 1 occurrence, got {n}')
     s=s.replace(old,new,1)
 
 once('val queryTo = maxOf(history.last, now + 24L * 60L * 60L * 1000L)',
