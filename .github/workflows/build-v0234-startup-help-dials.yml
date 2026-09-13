@@ -26,6 +26,9 @@ jobs:
       - name: Validate patch
         run: python3 -m py_compile tools/patch_v0235_priority_reload_buffer.py
 
+      - name: Repair patch target
+        run: sed -i 's/fun requestTemporalPage/val visualReference/g' tools/patch_v0235_priority_reload_buffer.py
+
       - name: Apply v0.23.5 patch
         run: python3 tools/patch_v0235_priority_reload_buffer.py
 
@@ -68,17 +71,16 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Normalize APK filename
-        run: |
-          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.5-release-priority-buffer.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.5-release-priority-buffer.apk
 
       - name: Commit validated source
         run: |
-          if git diff --quiet; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          if git diff --cached --quiet; then
             echo "v0.23.5 source already committed"
           else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
             git commit -m "Serialize UI refreshes with priority buffer [skip ci]"
             git push origin HEAD:feature/forecast-fixed-lead-h24
           fi
