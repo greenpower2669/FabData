@@ -618,10 +618,15 @@ class WeatherReferenceManager(
         )
     }
 
-    /** Rafraîchit seulement H+6 sans retélécharger l'historique. */
+    /**
+     * Rafraîchit uniquement le futur météo sans retélécharger l'historique.
+     * La collecte reste volontairement plus large que l'affichage : H+48 est archivé
+     * même si l'utilisateur regarde seulement H+3/H+6. Ainsi H+24 existe réellement
+     * avant d'être remplacé par une émission plus récente.
+     */
     fun refreshForecast(reference: WeatherReference): Int {
         val now = System.currentTimeMillis()
-        val oldForecasts = store.query(reference.key, now - hourMs, now + 12L * hourMs)
+        val oldForecasts = store.query(reference.key, now - hourMs, now + 50L * hourMs)
             .filter { it.source == PointSource.FORECAST }
         if (oldForecasts.isNotEmpty()) {
             db.inTransaction {
@@ -908,14 +913,14 @@ class WeatherReferenceManager(
     private fun fetchOpenMeteoForecast(reference: WeatherReference): List<WeatherReferencePoint> {
         val url = "https://api.open-meteo.com/v1/forecast" +
             "?latitude=${reference.latitude}&longitude=${reference.longitude}" +
-            "&hourly=temperature_2m,relative_humidity_2m&forecast_days=2&timezone=Europe%2FParis"
+            "&hourly=temperature_2m,relative_humidity_2m&forecast_days=3&timezone=Europe%2FParis"
         val raw = httpGet(url, null)
         val hourly = JSONObject(raw).getJSONObject("hourly")
         val times = hourly.getJSONArray("time")
         val temps = hourly.getJSONArray("temperature_2m")
         val hums = hourly.getJSONArray("relative_humidity_2m")
         val now = System.currentTimeMillis()
-        val end = now + 6L * hourMs + 70L * 60L * 1000L
+        val end = now + 48L * hourMs + 70L * 60L * 1000L
         val out = mutableListOf<WeatherReferencePoint>()
         for (i in 0 until times.length()) {
             val local = runCatching { LocalDateTime.parse(times.getString(i), DateTimeFormatter.ISO_LOCAL_DATE_TIME) }.getOrNull() ?: continue

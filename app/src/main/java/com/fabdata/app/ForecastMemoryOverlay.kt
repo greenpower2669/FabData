@@ -134,10 +134,12 @@ object ForecastMemoryStore {
 
         // De-duplicate identical refreshes for thirty minutes while preserving genuine
         // forecast revisions. No past snapshot is ever updated or replaced.
-        sql.execSQL("DROP TRIGGER IF EXISTS $TRIGGER")
+        // Normal reads may call ensure() concurrently (UI, adaptive layer, WorkManager).
+        // Never DROP/CREATE here: CREATE IF NOT EXISTS is atomic/idempotent for this schema.
+        // A future trigger definition change must use an explicit versioned migration.
         sql.execSQL(
             """
-            CREATE TRIGGER $TRIGGER
+            CREATE TRIGGER IF NOT EXISTS $TRIGGER
             AFTER INSERT ON weather_reference_samples
             WHEN NEW.source='forecast'
             BEGIN

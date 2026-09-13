@@ -115,6 +115,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val db = FabDataDb(applicationContext)
+        // Scientific memory must not depend on how many future hours are currently visible.
+        ForecastArchiveWorker.schedule(applicationContext)
         val initialUri = intent?.data
         setContent {
             FabDataTheme {
@@ -151,6 +153,7 @@ private enum class TemporalPageDirection {
 private const val OVERVIEW_LOD_6H_MS = 6L * 60L * 60L * 1000L
 private const val OVERVIEW_LOD_DAY_MS = 24L * 60L * 60L * 1000L
 private const val OVERVIEW_LOD_MONTH_MS = 30L * 24L * 60L * 60L * 1000L
+private const val FORECAST_DISPLAY_FUTURE_MS = 48L * 60L * 60L * 1000L
 private const val LYON_DETAIL_GAP_MS = 90L * 60L * 1000L
 private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
 private const val WEATHER_OFFICIAL_SENSOR_ID = -6902900102L
@@ -320,8 +323,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var explorationOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var globalBounds by remember { mutableStateOf<LongRange?>(null) }
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
-    var wideOverviewRange by remember { mutableStateOf<LongRange?>(null) }
-    var explorationOverviewRange by remember { mutableStateOf<LongRange?>(null) }
+    var wideOverviewRange by remember { mutableStateOf(uiPrefs.wideOverviewRange()) }
+    var explorationOverviewRange by remember { mutableStateOf(uiPrefs.explorationOverviewRange()) }
     var preset by remember {
         mutableStateOf(TimePreset.entries.firstOrNull { it.name == uiPrefs.timePresetName() } ?: TimePreset.TWO_DAYS)
     }
@@ -337,7 +340,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var temporalPageSyncCenter by remember { mutableStateOf<Long?>(null) }
     var thermalBusy by remember { mutableStateOf(false) }
     var thermalProgressText by remember { mutableStateOf<String?>(null) }
-    var selectedTimestamp by remember { mutableStateOf<Long?>(null) }
+    var selectedTimestamp by remember { mutableStateOf(uiPrefs.selectedTimestamp()) }
     var selectedAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var detailAnnotation by remember { mutableStateOf<AnnotationItem?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
@@ -356,15 +359,19 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val showHumidity = remember { mutableStateMapOf<Long, Boolean>() }
     var initialHandled by remember { mutableStateOf(false) }
 
-    // v0.22.0 : les choix utilisateur survivent aux recréations d'Activity et aux redémarrages.
-    // Les écritures de navigation sont légèrement temporisées pour éviter de marteler les prefs pendant un glisser.
+    // v0.23.1 : les choix utilisateur sont écrits dès leur validation. Les états de
+    // navigation ne sont plus perdus si une nouvelle mesure étend les bornes pendant l'usage.
     LaunchedEffect(preset) { uiPrefs.saveTimePresetName(preset.name) }
     LaunchedEffect(showAllAnnotations) { uiPrefs.saveShowAllAnnotations(showAllAnnotations) }
     LaunchedEffect(windowCenterTimestamp, customViewSpanMs) {
-        delay(250L)
         uiPrefs.saveWindowCenter(windowCenterTimestamp)
         uiPrefs.saveCustomViewSpan(customViewSpanMs)
     }
+    LaunchedEffect(wideOverviewRange, explorationOverviewRange) {
+        uiPrefs.saveWideOverviewRange(wideOverviewRange)
+        uiPrefs.saveExplorationOverviewRange(explorationOverviewRange)
+    }
+    LaunchedEffect(selectedTimestamp) { uiPrefs.saveSelectedTimestamp(selectedTimestamp) }
 
     // v0.17 : cet orchestrateur reste composé même quand les réglages thermiques
     // sont loin sous le viewport du LazyColumn.
@@ -522,10 +529,17 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             val physicalBounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
             val selectedWeatherReference = WeatherReferencePrefs(context).selectedReference()
             val weatherBounds = weatherReferenceStore.historyBounds(selectedWeatherReference.key)
-            val all = when {
+            val historicalBounds = when {
                 physicalBounds == null -> weatherBounds
                 weatherBounds == null -> physicalBounds
                 else -> minOf(physicalBounds.first, weatherBounds.first)..maxOf(physicalBounds.last, weatherBounds.last)
+            }
+            // Display bounds and acquisition bounds are deliberately independent. The user
+            // may show only 1 h while the app still captures H+48. A 48 h detail view centered
+            // on now naturally shows roughly the previous day + the next day.
+            val nowForDisplay = System.currentTimeMillis()
+            val all = historicalBounds?.let { bounds ->
+                bounds.first..maxOf(bounds.last, nowForDisplay + FORECAST_DISPLAY_FUTURE_MS)
             }
             val chosen = all?.let { bounds ->
                 val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
@@ -533,7 +547,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 if (requested >= fullSpan) {
                     bounds
                 } else {
-                    val defaultCenter = bounds.last - requested / 2L
+                    val defaultCenter = nowForDisplay.coerceIn(bounds.first, bounds.last)
                     val center = (windowCenterTimestamp ?: defaultCenter).coerceIn(bounds.first, bounds.last)
                     var windowStart = center - requested / 2L
                     var windowEnd = windowStart + requested
@@ -772,40 +786,43 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
         sensors.forEach { sensor ->
             if (!showTemp.containsKey(sensor.id)) {
-                showTemp[sensor.id] = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
+                val defaultVisible = if (sensor.stableKey == LyonWeatherSync.STABLE_KEY) {
                     loaded.lyonReconstructedSamples.isEmpty()
                 } else true
+                showTemp[sensor.id] = uiPrefs.curveTemperature(sensor.stableKey) ?: defaultVisible
             }
-            if (!showHumidity.containsKey(sensor.id)) showHumidity[sensor.id] = false
+            if (!showHumidity.containsKey(sensor.id)) {
+                showHumidity[sensor.id] = uiPrefs.curveHumidity(sensor.stableKey) ?: false
+            }
         }
-        if (!showTemp.containsKey(WEATHER_OFFICIAL_SENSOR_ID)) showTemp[WEATHER_OFFICIAL_SENSOR_ID] = true
+        if (!showTemp.containsKey(WEATHER_OFFICIAL_SENSOR_ID)) showTemp[WEATHER_OFFICIAL_SENSOR_ID] = uiPrefs.curveTemperature(WEATHER_OFFICIAL_STABLE_KEY) ?: true
         if (!showHumidity.containsKey(WEATHER_OFFICIAL_SENSOR_ID)) showHumidity[WEATHER_OFFICIAL_SENSOR_ID] = false
         if (!showTemp.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
-            // Always checked: if data arrives later the curve appears without another user action.
-            showTemp[LYON_RECONSTRUCTED_SENSOR_ID] = true
+            showTemp[LYON_RECONSTRUCTED_SENSOR_ID] = uiPrefs.curveTemperature(LYON_RECONSTRUCTED_STABLE_KEY) ?: true
         }
         if (!showHumidity.containsKey(LYON_RECONSTRUCTED_SENSOR_ID)) {
             showHumidity[LYON_RECONSTRUCTED_SENSOR_ID] = false
         }
         // v0.19.7: on montre la surface/sol inertiel sur la période MEASURED uniquement.
         // La masse énergétique profonde reste cachée et n'est jamais branchée au graphe.
-        if (!showTemp.containsKey(FORECAST_RECONSTRUCTED_SENSOR_ID)) showTemp[FORECAST_RECONSTRUCTED_SENSOR_ID] = true
-        if (!showTemp.containsKey(FORECAST_FAB_SENSOR_ID)) showTemp[FORECAST_FAB_SENSOR_ID] = true
-        if (!showTemp.containsKey(FORECAST_ACTIVE_SENSOR_ID)) showTemp[FORECAST_ACTIVE_SENSOR_ID] = true
+        if (!showTemp.containsKey(FORECAST_RECONSTRUCTED_SENSOR_ID)) showTemp[FORECAST_RECONSTRUCTED_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_RECONSTRUCTED_STABLE_KEY) ?: true
+        if (!showTemp.containsKey(FORECAST_FAB_SENSOR_ID)) showTemp[FORECAST_FAB_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_FAB_STABLE_KEY) ?: true
+        if (!showTemp.containsKey(FORECAST_ACTIVE_SENSOR_ID)) showTemp[FORECAST_ACTIVE_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_ACTIVE_STABLE_KEY) ?: true
         FORECAST_HORIZON_HOURS.filter { it < 24 }.forEach { lead ->
             val id = forecastHorizonSensorId(lead)
-            if (!showTemp.containsKey(id)) showTemp[id] = false
+            val stableKey = "forecast-weather-h$lead"
+            if (!showTemp.containsKey(id)) showTemp[id] = uiPrefs.curveTemperature(stableKey) ?: false
             showHumidity[id] = false
         }
         FORECAST_ADAPTIVE_HORIZONS.forEach { lead ->
             val id = forecastAdaptiveSensorId(lead)
-            if (!showTemp.containsKey(id)) showTemp[id] = false
+            if (!showTemp.containsKey(id)) showTemp[id] = uiPrefs.curveTemperature(forecastAdaptiveStableKey(lead)) ?: false
             showHumidity[id] = false
         }
         showHumidity[FORECAST_RECONSTRUCTED_SENSOR_ID] = false
         showHumidity[FORECAST_FAB_SENSOR_ID] = false
         showHumidity[FORECAST_ACTIVE_SENSOR_ID] = false
-        if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = true
+        if (!showTemp.containsKey(THERMAL_INERTIA_SENSOR_ID)) showTemp[THERMAL_INERTIA_SENSOR_ID] = uiPrefs.curveTemperature(THERMAL_INERTIA_STABLE_KEY) ?: true
         showHumidity[THERMAL_INERTIA_SENSOR_ID] = false
         busy = false
         reloadSucceeded = true
@@ -2174,7 +2191,8 @@ private fun mergeTerrainReference(
 
 private fun navigationWeatherPoints(sampleMap: Map<Long, List<SamplePoint>>): List<SamplePoint> =
     (sampleMap[WEATHER_OFFICIAL_SENSOR_ID].orEmpty() +
-        sampleMap[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty())
+        sampleMap[LYON_RECONSTRUCTED_SENSOR_ID].orEmpty() +
+        sampleMap[FORECAST_ACTIVE_SENSOR_ID].orEmpty())
         .groupBy { it.timestamp }
         .mapNotNull { (_, values) -> values.maxByOrNull { it.source.priority } }
         .sortedBy { it.timestamp }
@@ -2368,7 +2386,7 @@ private fun HistoryOverviewCard(
                     )
                 }
                 var previewZoom by rememberSaveable { mutableFloatStateOf(historyUiPrefs.previewZoom()) }
-                var previewCenter by remember(bounds.first, bounds.last) {
+                var previewCenter by remember {
                     mutableStateOf(
                         historyUiPrefs.previewCenter()?.coerceIn(bounds.first, bounds.last)
                             ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
@@ -2383,15 +2401,18 @@ private fun HistoryOverviewCard(
                 // Position provisoire du sélecteur du bandeau 2. Tant qu'elle existe,
                 // elle ne sort jamais du composable et ne déclenche aucune requête.
                 var secondBandDraftCenter by remember { mutableStateOf<Long?>(null) }
-                var wideCenter by remember(bounds.first, bounds.last) {
+                var wideCenter by remember {
                     mutableStateOf(
                         historyUiPrefs.wideCenter()?.coerceIn(bounds.first, bounds.last)
                             ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
                             ?: (bounds.first + (bounds.last - bounds.first) / 2L)
                     )
                 }
+                LaunchedEffect(bounds.first, bounds.last) {
+                    previewCenter = previewCenter.coerceIn(bounds.first, bounds.last)
+                    wideCenter = wideCenter.coerceIn(bounds.first, bounds.last)
+                }
                 LaunchedEffect(previewPreset, previewZoom, previewCenter, wideCenter) {
-                    delay(300L)
                     historyUiPrefs.savePreviewPresetName(previewPreset.name)
                     historyUiPrefs.savePreviewZoom(previewZoom)
                     historyUiPrefs.savePreviewCenter(previewCenter)
@@ -2408,7 +2429,7 @@ private fun HistoryOverviewCard(
                 val bandPrefs = remember {
                     helpContext.getSharedPreferences("fabdata_overview_band_curves", Context.MODE_PRIVATE)
                 }
-                val availableBandSensorIds = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
+                val availableBandSensors = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
                     sensors.filter { sensor ->
                         forecastHorizonLeadForSensorId(sensor.id) == null &&
                             forecastAdaptiveLeadForSensorId(sensor.id) == null && (
@@ -2416,15 +2437,24 @@ private fun HistoryOverviewCard(
                                 navigatorSampleMap[sensor.id].orEmpty().isNotEmpty() ||
                                 sampleMap[sensor.id].orEmpty().isNotEmpty()
                         )
-                    }.map { it.id }.toSet()
+                    }
                 }
-                val bandSignature = remember(availableBandSensorIds) { availableBandSensorIds.sorted().joinToString(",") }
+                val availableBandSensorIds = availableBandSensors.map { it.id }.toSet()
+                val bandKeyById = availableBandSensors.associate { it.id to it.stableKey }
+                val bandIdByKey = availableBandSensors.associate { it.stableKey to it.id }
+                val bandSignature = remember(availableBandSensors) {
+                    availableBandSensors.map { it.stableKey }.sorted().joinToString(",")
+                }
                 var bandSensorIds by remember(bandSignature, preferredIndoorSensorId) {
                     val configured = bandPrefs.getBoolean("configured", false)
-                    val stored = bandPrefs.getStringSet("sensor_ids", emptySet()).orEmpty()
+                    val stableStored = bandPrefs.getStringSet("sensor_keys", emptySet()).orEmpty()
+                        .mapNotNull { bandIdByKey[it] }
+                        .toSet()
+                    val legacyStored = bandPrefs.getStringSet("sensor_ids", emptySet()).orEmpty()
                         .mapNotNull { it.toLongOrNull() }
                         .filter { it in availableBandSensorIds }
                         .toSet()
+                    val stored = if (stableStored.isNotEmpty() || bandPrefs.contains("sensor_keys")) stableStored else legacyStored
                     val defaults = linkedSetOf<Long>().apply {
                         preferredIndoorSensorId?.takeIf { it in availableBandSensorIds }?.let { add(it) }
                         THERMAL_INERTIA_SENSOR_ID.takeIf { it in availableBandSensorIds }?.let { add(it) }
@@ -2439,6 +2469,7 @@ private fun HistoryOverviewCard(
                     bandPrefs.edit()
                         .putBoolean("configured", true)
                         .putStringSet("sensor_ids", next.map { it.toString() }.toSet())
+                        .putStringSet("sensor_keys", next.mapNotNull { bandKeyById[it] }.toSet())
                         .apply()
                 }
                 var helpOpen by rememberSaveable { mutableStateOf(false) }
@@ -2647,7 +2678,7 @@ private fun HistoryOverviewCard(
                 }
 
                 Text(
-                    "Navigation giga · météo extérieure · historique complet",
+                    "Navigation giga · météo extérieure · historique + futur capturé",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

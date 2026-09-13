@@ -62,4 +62,45 @@ class UiPreferenceStore(context: Context) {
 
     fun wideCenter(): Long? = if (prefs.contains("wide_center")) prefs.getLong("wide_center", 0L) else null
     fun saveWideCenter(value: Long) { prefs.edit().putLong("wide_center", value).apply() }
+
+    fun selectedTimestamp(): Long? = nullableLong("selected_timestamp")
+    fun saveSelectedTimestamp(value: Long?) = saveNullableLong("selected_timestamp", value)
+
+    fun wideOverviewRange(): LongRange? = loadRange("wide_overview_range")
+    fun saveWideOverviewRange(value: LongRange?) = saveRange("wide_overview_range", value)
+
+    fun explorationOverviewRange(): LongRange? = loadRange("exploration_overview_range")
+    fun saveExplorationOverviewRange(value: LongRange?) = saveRange("exploration_overview_range", value)
+
+    private fun nullableLong(key: String): Long? =
+        if (prefs.contains(key)) prefs.getLong(key, 0L) else null
+
+    private fun saveNullableLong(key: String, value: Long?) {
+        prefs.edit().apply {
+            if (value == null) remove(key) else putLong(key, value)
+        }.apply()
+    }
+
+    private fun loadRange(key: String): LongRange? {
+        val startKey = "$key:start"
+        val endKey = "$key:end"
+        if (!prefs.contains(startKey) || !prefs.contains(endKey)) return null
+        val start = prefs.getLong(startKey, 0L)
+        val end = prefs.getLong(endKey, 0L)
+        return if (end > start) start..end else null
+    }
+
+    private fun saveRange(key: String, value: LongRange?) {
+        prefs.edit().apply {
+            val startKey = "$key:start"
+            val endKey = "$key:end"
+            if (value == null) {
+                remove(startKey)
+                remove(endKey)
+            } else {
+                putLong(startKey, value.first)
+                putLong(endKey, value.last)
+            }
+        }.apply()
+    }
 }

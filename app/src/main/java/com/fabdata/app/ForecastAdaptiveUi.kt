@@ -56,8 +56,10 @@ fun ForecastAdaptiveCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            error?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            error?.let { raw ->
+                val short = raw.lineSequence().firstOrNull().orEmpty().trim().take(220)
+                val prefix = if (summary != null) "Dernières valeurs connues · actualisation impossible : " else "Actualisation impossible : "
+                Text(prefix + short, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             }
 
             val state = summary
