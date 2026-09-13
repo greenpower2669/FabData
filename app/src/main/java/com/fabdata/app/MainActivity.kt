@@ -464,13 +464,42 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
             scope.launch {
+                val importOperation = FabOperationRegistry.tryStart(
+                    key = "import-data",
+                    title = "Importation prioritaire",
+                    detail = "Préparation · priorité maximale",
+                    cancellable = false
+                )
+                if (importOperation == null) {
+                    snackbar.showSnackbar("Une importation est déjà en cours")
+                    return@launch
+                }
+                // L'import est annoncé avant l'attente du verrou afin que météo et affichage
+                // cèdent la place au prochain checkpoint sûr.
+                FabOperationRegistry.requestYieldForImport()
                 busy = true
-                val results = withContext(Dispatchers.IO) {
-                    uris.map { uri ->
-                        runCatching {
-                            backup.importIfBackup(uri) ?: importer.import(uri).toFabDataImportSummary()
+                val results = try {
+                    FabDataWorkArbiter.withCriticalImport {
+                        FabOperationRegistry.update(importOperation, "Import prioritaire · lecture des fichiers…", 0, uris.size)
+                        withContext(Dispatchers.IO) {
+                            uris.mapIndexed { index, uri ->
+                                FabOperationRegistry.update(
+                                    importOperation,
+                                    "Import prioritaire · fichier ${index + 1}/${uris.size}",
+                                    index,
+                                    uris.size
+                                )
+                                runCatching {
+                                    backup.importIfBackup(uri) ?: importer.import(uri).toFabDataImportSummary()
+                                }
+                            }
                         }
                     }
+                } catch (error: Throwable) {
+                    FabOperationRegistry.fail(importOperation, error.message ?: "Import impossible")
+                    busy = false
+                    snackbar.showSnackbar("Import impossible : ${error.message ?: "erreur inconnue"}")
+                    return@launch
                 }
                 val ok = results.mapNotNull { it.getOrNull() }
                 val errors = results.count { it.isFailure }
@@ -481,7 +510,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 val invalid = ok.sumOf { it.invalid }
                 busy = false
                 reloadToken++
+                FabOperationRegistry.update(importOperation, "Données importées · affichage prioritaire en file", uris.size, uris.size)
                 queueUiReload(UiReloadPriority.CRITICAL)
+                FabOperationRegistry.finish(
+                    importOperation,
+                    "Import terminé · $measuresAdded mesure(s) ajoutée(s) · affichage prioritaire demandé"
+                )
                 snackbar.showSnackbar(
                     "Import : $measuresAdded mesure(s) ajoutée(s) · $measuresDuplicates déjà présente(s) · " +
                         "$eventsAdded événement(s) restauré(s) · $eventsDuplicates événement(s) déjà présent(s) · " +
@@ -509,15 +543,39 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     LaunchedEffect(initialImport, initialHandled) {
         if (!initialHandled && initialImport != null) {
             initialHandled = true
+            val importOperation = FabOperationRegistry.tryStart(
+                key = "import-data",
+                title = "Importation prioritaire",
+                detail = "Ouverture du fichier · priorité maximale",
+                cancellable = false
+            )
+            if (importOperation == null) return@LaunchedEffect
+            FabOperationRegistry.requestYieldForImport()
             busy = true
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    backup.importIfBackup(initialImport) ?: importer.import(initialImport).toFabDataImportSummary()
+            val result = try {
+                FabDataWorkArbiter.withCriticalImport {
+                    FabOperationRegistry.update(importOperation, "Import prioritaire · restauration des données…")
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            backup.importIfBackup(initialImport) ?: importer.import(initialImport).toFabDataImportSummary()
+                        }
+                    }
                 }
+            } catch (error: Throwable) {
+                Result.failure(error)
             }
             busy = false
             reloadToken++
             queueUiReload(UiReloadPriority.CRITICAL)
+            result.fold(
+                onSuccess = {
+                    FabOperationRegistry.finish(
+                        importOperation,
+                        "Import terminé · ${it.measurementsAdded} mesure(s) ajoutée(s) · affichage prioritaire demandé"
+                    )
+                },
+                onFailure = { FabOperationRegistry.fail(importOperation, it.message ?: "Import impossible") }
+            )
             snackbar.showSnackbar(
                 result.fold(
                     onSuccess = {
@@ -547,6 +605,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             .collect {
                 val priorityRank = reloadPendingPriority
                 reloadPendingPriority = 0
+                if (FabDataWorkArbiter.criticalImportPending()) {
+                    reloadPendingPriority = maxOf(reloadPendingPriority, priorityRank)
+                    return@collect
+                }
                 reloadMutex.withLock {
         val reloadStarted = System.currentTimeMillis()
         val reloadOperation = if (priorityRank >= UiReloadPriority.DATA.rank) {
@@ -4626,8 +4688,9 @@ private fun SettingsDialog(
                 HorizontalDivider()
                 Text("Aide · activité et cadrans", fontWeight = FontWeight.Bold)
                 Text(
-                    "Les actualisations d’affichage sont mises en file avec priorités : import/restauration, données, puis navigation. " +
-                        "Une tâche déjà lancée n’est plus annulée par un simple changement d’écran ; les demandes suivantes sont fusionnées dans le buffer.",
+                    "Les actualisations sont mises en file avec priorités : import/restauration d’abord, puis données météo, puis navigation. " +
+                        "Un import apparaît dans Activité FabData, fait céder météo/affichage au prochain point sûr, puis son affichage est recalculé en priorité. " +
+                        "Les simples changements de vue restent fusionnés dans le buffer.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
@@ -4636,7 +4699,7 @@ private fun SettingsDialog(
                     style = MaterialTheme.typography.bodySmall
                 )
                 HorizontalDivider()
-                Text("Politique de confidentialité · FabData v0.23.5", fontWeight = FontWeight.Bold)
+                Text("Politique de confidentialité · FabData v0.23.6", fontWeight = FontWeight.Bold)
                 Text(
                     "Les mesures intérieures, noms de pièces, événements, modèles et personnalisations restent traités localement sur cet appareil. " +
                         "FabData n'intègre ni publicité ni analytique et ne crée aucun compte utilisateur. " +

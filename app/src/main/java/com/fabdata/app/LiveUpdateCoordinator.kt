@@ -79,84 +79,80 @@ fun FabLiveUpdateCoordinator(
         }
 
     suspend fun updateLive(force: Boolean = false): Boolean {
-        if (!foreground || working) return false
-        val referenceForOperation = weatherPrefs.selectedReference()
-        if (!force && currentForecastSlotCaptured(referenceForOperation.key)) return false
-        val operationId = FabOperationRegistry.tryStart(
-            "weather:${referenceForOperation.key}",
-            "Mise à jour automatique",
-            "${referenceForOperation.label} · ouverture / focus"
-        ) ?: return false
-        working = true
-        return try {
-            withContext(Dispatchers.IO) {
-                // Important : le focus ne choisit jamais une autre station.
-                // La référence ne peut changer que depuis l'écran de choix explicite.
-                val reference = referenceForOperation
-                FabOperationRegistry.ensureNotCancelled(operationId)
-                FabOperationRegistry.update(operationId, "${reference.label} · météo récente…")
+        if (!foreground || working || FabDataWorkArbiter.criticalImportPending()) return false
+        return FabDataWorkArbiter.withDataProducer producer@{
+            if (!foreground || working) return@producer false
+            val referenceForOperation = weatherPrefs.selectedReference()
+            if (!force && currentForecastSlotCaptured(referenceForOperation.key)) return@producer false
+            val operationId = FabOperationRegistry.tryStart(
+                "weather:${referenceForOperation.key}",
+                "Mise à jour automatique",
+                "${referenceForOperation.label} · ouverture / focus"
+            ) ?: return@producer false
+            working = true
+            try {
+                withContext(Dispatchers.IO) {
+                    // Important : le focus ne choisit jamais une autre station.
+                    val reference = referenceForOperation
+                    FabOperationRegistry.ensureNotCancelled(operationId)
+                    FabOperationRegistry.update(operationId, "${reference.label} · météo récente…")
 
-                if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
-                    if (credentials.hasCredential()) {
-                        runCatching { meteoOfficial.syncSixMinute24h() }
-                    } else {
-                        runCatching { lyonWeather.syncToday() }
+                    if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
+                        if (credentials.hasCredential()) {
+                            runCatching { meteoOfficial.syncSixMinute24h() }
+                        } else {
+                            runCatching { lyonWeather.syncToday() }
+                        }
+                    }
+
+                    FabOperationRegistry.ensureNotCancelled(operationId)
+                    val dominanceNow = System.currentTimeMillis()
+                    val recentFrom = dominanceNow - 48L * 60L * 60L * 1000L
+                    val recentTo = dominanceNow + 12L * 60L * 60L * 1000L
+                    FabOperationRegistry.update(operationId, "${reference.label} · cohérence récente…")
+                    PointSourceStore.reconcileMeasuredDominance(db, recentFrom, recentTo)
+
+                    FabOperationRegistry.ensureNotCancelled(operationId)
+                    FabOperationRegistry.update(operationId, "${reference.label} · référence récente…")
+                    manager.refreshRecent(reference)
+                    FabOperationRegistry.ensureNotCancelled(operationId)
+
+                    FabOperationRegistry.update(operationId, "${reference.label} · prévision / cohérence…")
+                    val profile = profileStore.load()
+                    val mode = profileStore.forecastMode()
+                    val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
+                    val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
+                    if (trainedModel != null) {
+                        FabOperationRegistry.ensureNotCancelled(operationId)
+                        engine.refreshForecasts(
+                            reference, trainedModel.sensorId, profile, mode,
+                            precalibratedModel = trainedModel
+                        )
+                        FabOperationRegistry.ensureNotCancelled(operationId)
                     }
                 }
-
-                FabOperationRegistry.ensureNotCancelled(operationId)
-                val dominanceNow = System.currentTimeMillis()
-                val recentFrom = dominanceNow - 48L * 60L * 60L * 1000L
-                val recentTo = dominanceNow + 12L * 60L * 60L * 1000L
-                FabOperationRegistry.update(operationId, "${reference.label} · cohérence récente…")
-                // v0.21.2 : jamais de réparation historique globale au focus.
-                PointSourceStore.reconcileMeasuredDominance(db, recentFrom, recentTo)
-
-                FabOperationRegistry.ensureNotCancelled(operationId)
-                FabOperationRegistry.update(operationId, "${reference.label} · référence récente…")
-                manager.refreshRecent(reference)
-                FabOperationRegistry.ensureNotCancelled(operationId)
-
-                FabOperationRegistry.update(operationId, "${reference.label} · prévision / cohérence…")
-                val profile = profileStore.load()
-                val mode = profileStore.forecastMode()
-                val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
-
-                // v0.19.8+ : seul le modèle explicitement entraîné et persisté peut servir au live.
-                // Une nouvelle mesure ne le remplace pas et aucun historique n'est recalculé ici.
-                val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
-                if (trainedModel != null) {
-                    FabOperationRegistry.ensureNotCancelled(operationId)
-                    engine.refreshForecasts(
-                        reference, trainedModel.sensorId, profile, mode,
-                        precalibratedModel = trainedModel
-                    )
-                    FabOperationRegistry.ensureNotCancelled(operationId)
+                if (FabOperationRegistry.cancelRequested(operationId)) {
+                    FabOperationRegistry.cancelled(operationId, "Mise à jour automatique arrêtée · priorité supérieure")
+                } else {
+                    onDataChanged()
+                    FabOperationRegistry.finish(operationId, "Météo et prévision à jour")
                 }
+                true
+            } catch (cancel: CancellationException) {
+                val requested = FabOperationRegistry.cancelRequested(operationId)
+                FabOperationRegistry.cancelled(
+                    operationId,
+                    if (requested) "Mise à jour automatique arrêtée · priorité supérieure" else "Routine remplacée / composition quittée"
+                )
+                if (!requested || !currentCoroutineContext().isActive) throw cancel
+                false
+            } catch (error: Throwable) {
+                FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour automatique impossible")
+                false
+            } finally {
+                working = false
             }
-            if (FabOperationRegistry.cancelRequested(operationId)) {
-                FabOperationRegistry.cancelled(operationId, "Mise à jour automatique arrêtée")
-            } else {
-                onDataChanged()
-                FabOperationRegistry.finish(operationId, "Météo et prévision à jour")
-            }
-            true
-        } catch (cancel: CancellationException) {
-            val userRequested = FabOperationRegistry.cancelRequested(operationId)
-            FabOperationRegistry.cancelled(
-                operationId,
-                if (userRequested) "Mise à jour automatique arrêtée" else "Routine remplacée / composition quittée"
-            )
-            // Un clic utilisateur termine seulement CE passage. Une vraie annulation du
-            // LaunchedEffect (composition/lifecycle) doit continuer à se propager.
-            if (!userRequested || !currentCoroutineContext().isActive) throw cancel
-            false
-        } catch (error: Throwable) {
-            FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour automatique impossible")
-            false
-        } finally {
-            working = false
-        }
+        } ?: false
     }
 
     LaunchedEffect(dataVersion) {

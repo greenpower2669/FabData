@@ -28,6 +28,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -64,6 +66,36 @@ data class FabOperation(
  * - l'annulation est coopérative : le calcul s'arrête au prochain point de contrôle sûr ;
  * - les quelques dernières opérations terminées restent visibles pour diagnostiquer un faux blocage.
  */
+/**
+ * Arbitration des producteurs de données. Un import annonce sa priorité AVANT
+ * d'attendre le verrou : les routines automatiques cessent d'en démarrer de nouvelles,
+ * puis rendent la main au prochain point sûr. L'import ne partage donc plus SQLite
+ * avec une météo automatique longue.
+ */
+object FabDataWorkArbiter {
+    private val dataMutex = Mutex()
+    private val stateLock = Any()
+    private var criticalImports = 0
+
+    fun criticalImportPending(): Boolean = synchronized(stateLock) { criticalImports > 0 }
+
+    suspend fun <T> withCriticalImport(block: suspend () -> T): T {
+        synchronized(stateLock) { criticalImports++ }
+        return try {
+            dataMutex.withLock { block() }
+        } finally {
+            synchronized(stateLock) { criticalImports = (criticalImports - 1).coerceAtLeast(0) }
+        }
+    }
+
+    suspend fun <T> withDataProducer(block: suspend () -> T): T? {
+        if (criticalImportPending()) return null
+        return dataMutex.withLock {
+            if (criticalImportPending()) null else block()
+        }
+    }
+}
+
 object FabOperationRegistry {
     private val nextId = AtomicLong(System.currentTimeMillis())
     val operations = mutableStateListOf<FabOperation>()
@@ -174,6 +206,23 @@ object FabOperationRegistry {
 
     @Synchronized
     fun activeId(key: String): Long? = operations.firstOrNull { it.key == key && it.active }?.id
+
+    /** Import utilisateur = priorité maximale. Les lectures d'affichage et la météo
+     * automatique rendent la main au prochain checkpoint ; les sauvegardes et autres
+     * opérations explicites ne sont jamais brutalement interrompues. */
+    @Synchronized
+    fun requestYieldForImport() {
+        operations.indices.forEach { index ->
+            val old = operations[index]
+            val lowerPriority = old.key == "ui-reload" || old.key.startsWith("weather:")
+            if (old.active && old.cancellable && lowerPriority && old.state == FabOperationState.RUNNING) {
+                operations[index] = old.copy(
+                    state = FabOperationState.CANCEL_REQUESTED,
+                    detail = "${old.detail} · priorité import, arrêt au prochain point sûr"
+                )
+            }
+        }
+    }
 
     @Synchronized
     private fun trim() {

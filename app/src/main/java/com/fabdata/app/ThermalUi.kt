@@ -659,8 +659,13 @@ fun ThermalReferenceCard(
         triggerChartReload: Boolean
     ) {
         info = if (allHistory) "Actualisation complète de la référence météo…" else "Actualisation météo récente et futur…"
+        if (FabDataWorkArbiter.criticalImportPending()) {
+            info = "Import prioritaire en cours · actualisation météo reportée"
+            return
+        }
         busy = true
-        val result = withContext(Dispatchers.IO) {
+        val result = FabDataWorkArbiter.withDataProducer {
+            withContext(Dispatchers.IO) {
             runCatching {
                 val bounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
                     ?: error("Aucune donnée intérieure")
@@ -685,6 +690,12 @@ fun ThermalReferenceCard(
                 } else ThermalWriteSummary(0, 0, 0)
                 Triple(sync, thermalStatus, forecast)
             }
+            }
+        }
+        if (result == null) {
+            busy = false
+            info = "Import prioritaire en cours · actualisation météo reportée"
+            return
         }
         result.fold(
             onSuccess = { (sync, thermalStatus, forecast) ->
