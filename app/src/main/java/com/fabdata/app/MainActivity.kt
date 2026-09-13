@@ -387,6 +387,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             FORECAST_HORIZON_HOURS.filter { it < 24 }.forEach { lead ->
                 put(forecastHorizonSensorId(lead), curveStyleStore.load("forecast:weather:h$lead"))
             }
+            FORECAST_ADAPTIVE_HORIZONS.forEach { lead ->
+                put(forecastAdaptiveSensorId(lead), curveStyleStore.load("forecast:fab:adaptive:h$lead"))
+            }
             put(THERMAL_INERTIA_SENSOR_ID, curveStyleStore.load("thermal:inertia"))
         }
     }
@@ -794,6 +797,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             if (!showTemp.containsKey(id)) showTemp[id] = false
             showHumidity[id] = false
         }
+        FORECAST_ADAPTIVE_HORIZONS.forEach { lead ->
+            val id = forecastAdaptiveSensorId(lead)
+            if (!showTemp.containsKey(id)) showTemp[id] = false
+            showHumidity[id] = false
+        }
         showHumidity[FORECAST_RECONSTRUCTED_SENSOR_ID] = false
         showHumidity[FORECAST_FAB_SENSOR_ID] = false
         showHumidity[FORECAST_ACTIVE_SENSOR_ID] = false
@@ -855,6 +863,24 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val forecastFabSamples = selectableForecastCurves.fab
     val forecastActiveSamples = forecastHorizonCurves.activeWeather
     val forecastHorizonSamples = forecastHorizonCurves.weatherByLead.filterKeys { it < 24 }
+    var adaptiveForecastCurves by remember(visualReference.key) { mutableStateOf(ForecastAdaptiveCurveSet.EMPTY) }
+    LaunchedEffect(reloadToken, visualReference.key, globalBounds?.first, globalBounds?.last) {
+        val history = globalBounds
+        adaptiveForecastCurves = if (history == null) {
+            ForecastAdaptiveCurveSet.EMPTY
+        } else {
+            val now = System.currentTimeMillis()
+            withContext(Dispatchers.IO) {
+                ForecastAdaptiveEngine(db).queryCurves(
+                    visualReference.key,
+                    history.first,
+                    maxOf(history.last, now + 25L * 60L * 60L * 1000L),
+                    now
+                )
+            }
+        }
+    }
+    val adaptiveForecastSamples = adaptiveForecastCurves.byLead
     val weatherOfficialSamples = lyonReconstructedSamples
         .filter { it.source == PointSource.MEASURED }
         .map { it.copy(sensorId = WEATHER_OFFICIAL_SENSOR_ID) }
@@ -903,9 +929,19 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
     val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo H+24", "H+24 fixe · archive locale, backfill si disponible · rendu 10 min", 12, forecastReconstructedSamples.lastOrNull()?.timestamp)
     val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab H+24", "Correction locale H+24 · rendu 10 min", 11, forecastFabSamples.lastOrNull()?.timestamp)
+    val adaptiveForecastSensors = FORECAST_ADAPTIVE_HORIZONS.mapIndexed { index, lead ->
+        val points = adaptiveForecastSamples[lead].orEmpty()
+        Sensor(
+            forecastAdaptiveSensorId(lead), forecastAdaptiveStableKey(lead),
+            "Prévision Fab adaptative H+$lead",
+            "Tangente + changement de régime · archive causale H+$lead",
+            listOf(10, 5, 13, 8)[index], points.lastOrNull()?.timestamp
+        )
+    }
     val forecastHorizonSampleMap = forecastHorizonSamples.mapKeys { (lead, _) -> forecastHorizonSensorId(lead) }
+    val adaptiveForecastSampleMap = adaptiveForecastSamples.mapKeys { (lead, _) -> forecastAdaptiveSensorId(lead) }
     val physicalChartSensors = sensors.filterNot { it.stableKey == LyonWeatherSync.STABLE_KEY }
-    val chartSensors = physicalChartSensors + lyonReconstructedSensor + forecastActiveSensor + forecastHorizonSensors + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
+    val chartSensors = physicalChartSensors + lyonReconstructedSensor + forecastActiveSensor + forecastHorizonSensors + adaptiveForecastSensors + forecastReconstructedSensor + forecastFabSensor + inertiaSensor
     LaunchedEffect(chartSensors.map { it.stableKey }) {
         chartSensors.forEach { sensor ->
             uiPrefs.curveTemperature(sensor.stableKey)?.let { showTemp[sensor.id] = it }
@@ -916,6 +952,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         (LYON_RECONSTRUCTED_SENSOR_ID to terrainWeatherSamples) +
         (FORECAST_ACTIVE_SENSOR_ID to forecastActiveSamples) +
         forecastHorizonSampleMap +
+        adaptiveForecastSampleMap +
         (FORECAST_RECONSTRUCTED_SENSOR_ID to forecastReconstructedSamples) +
         (FORECAST_FAB_SENSOR_ID to forecastFabSamples) +
         (THERMAL_INERTIA_SENSOR_ID to inertiaVisible)
@@ -942,10 +979,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             else predictionLod(terrainWeatherSamples, bucketMs).map { it.copy(source = PointSource.RECONSTRUCTED) }
         val horizonLod = forecastHorizonSamples.mapKeys { (lead, _) -> forecastHorizonSensorId(lead) }
             .mapValues { (_, points) -> predictionLod(points, bucketMs) }
+        val adaptiveLod = adaptiveForecastSamples.mapKeys { (lead, _) -> forecastAdaptiveSensorId(lead) }
+            .mapValues { (_, points) -> predictionLod(points, bucketMs) }
         return source.filterKeys { id -> physicalChartSensors.any { it.id == id } } +
             (LYON_RECONSTRUCTED_SENSOR_ID to terrain) +
             (FORECAST_ACTIVE_SENSOR_ID to predictionLod(forecastActiveSamples, bucketMs)) +
             horizonLod +
+            adaptiveLod +
             (FORECAST_RECONSTRUCTED_SENSOR_ID to predictionLod(forecastReconstructedSamples, bucketMs)) +
             (FORECAST_FAB_SENSOR_ID to predictionLod(forecastFabSamples, bucketMs)) +
             (THERMAL_INERTIA_SENSOR_ID to source[THERMAL_INERTIA_SENSOR_ID].orEmpty())
@@ -1320,6 +1360,14 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
 
                 item {
+                    ForecastAdaptiveCard(
+                        db = db,
+                        reference = visualReference,
+                        refreshToken = reloadToken
+                    )
+                }
+
+                item {
                     TimeTabs(preset = preset, onSelect = {
                         customViewSpanMs = null
                         preset = it
@@ -1461,12 +1509,22 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 FORECAST_FAB_SENSOR_ID -> "forecast:fab"
                                 FORECAST_ACTIVE_SENSOR_ID -> "forecast:active"
                                 THERMAL_INERTIA_SENSOR_ID -> "thermal:inertia"
-                                else -> forecastHorizonLeadForSensorId(sensor.id)
-                                    ?.let { "forecast:weather:h$it" }
+                                else -> forecastAdaptiveLeadForSensorId(sensor.id)
+                                    ?.let { "forecast:fab:adaptive:h$it" }
+                                    ?: forecastHorizonLeadForSensorId(sensor.id)
+                                        ?.let { "forecast:weather:h$it" }
                                     ?: "sensor:${sensor.stableKey}"
                             }
                             styleEditKey = key to sensor.name
                         }
+                    )
+                }
+
+                item {
+                    ThermalLearningReferenceStatusCard(
+                        db = db,
+                        reference = visualReference,
+                        refreshToken = reloadToken
                     )
                 }
 
@@ -1967,6 +2025,7 @@ private fun SeriesSelector(
             @Composable
             fun SensorRow(sensor: Sensor) {
                 val lead = forecastHorizonLeadForSensorId(sensor.id)
+                val adaptiveLead = forecastAdaptiveLeadForSensorId(sensor.id)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         Modifier.size(12.dp)
@@ -1980,12 +2039,22 @@ private fun SeriesSelector(
                             FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision météo H+24 fixe"
                             FORECAST_FAB_SENSOR_ID -> "Prévision Fab H+24"
                             FORECAST_ACTIVE_SENSOR_ID -> "Prévision météo active · dernière disponible"
-                            THERMAL_INERTIA_SENSOR_ID -> "Température inertielle estimée · expérimental"
-                            else -> lead?.let { "Prévision météo H+$it" } ?: sensor.room
+                            THERMAL_INERTIA_SENSOR_ID -> "Sol inertiel estimé · expérimental"
+                            else -> adaptiveLead?.let { "Prévision Fab adaptative H+$it" }
+                                ?: lead?.let { "Prévision météo H+$it" }
+                                ?: sensor.room
                         }
                         Text(displayRoom, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         if (sensor.id == WEATHER_OFFICIAL_SENSOR_ID || sensor.id == LYON_RECONSTRUCTED_SENSOR_ID) {
                             Text(sensor.room, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else if (adaptiveLead != null) {
+                            Text(
+                                "Modèle adaptatif causal H+$adaptiveLead · tangente + régime",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         } else if (lead != null) {
                             Text(
                                 "Archive locale fixe H+$lead · conservée avant remplacement",
@@ -2013,7 +2082,8 @@ private fun SeriesSelector(
                     if (sensor.id != THERMAL_INERTIA_SENSOR_ID &&
                         sensor.id != FORECAST_RECONSTRUCTED_SENSOR_ID &&
                         sensor.id != FORECAST_FAB_SENSOR_ID &&
-                        !isForecastArchiveSensorId(sensor.id)
+                        !isForecastArchiveSensorId(sensor.id) &&
+                        !isAdaptiveForecastSensorId(sensor.id)
                     ) {
                         Text("%", style = MaterialTheme.typography.labelMedium)
                         Checkbox(
@@ -2340,7 +2410,8 @@ private fun HistoryOverviewCard(
                 }
                 val availableBandSensorIds = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
                     sensors.filter { sensor ->
-                        forecastHorizonLeadForSensorId(sensor.id) == null && (
+                        forecastHorizonLeadForSensorId(sensor.id) == null &&
+                            forecastAdaptiveLeadForSensorId(sensor.id) == null && (
                             gigaSampleMap[sensor.id].orEmpty().isNotEmpty() ||
                                 navigatorSampleMap[sensor.id].orEmpty().isNotEmpty() ||
                                 sampleMap[sensor.id].orEmpty().isNotEmpty()

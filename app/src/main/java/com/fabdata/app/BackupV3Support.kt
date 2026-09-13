@@ -36,6 +36,7 @@ class FabDataBackupV3Support(
         ForecastLocalSnapshotStore.ensure(db.writableDatabase)
         ForecastPastArchiveStore.ensure(db.writableDatabase)
         ForecastCurve10mStore.ensure(db.writableDatabase)
+        ForecastAdaptiveStore.ensure(db.writableDatabase)
 
         writeJson(writer, "WEATHER_META", weatherMetaJson())
         WeatherReferenceStore(db).allReferenceMetadata().forEach { meta ->
@@ -202,6 +203,37 @@ class FabDataBackupV3Support(
 
         db.readableDatabase.rawQuery(
             """
+            SELECT reference_key, horizon_hour, issued_at, target_ts, baseline_temperature,
+                   adaptive_temperature, tangent_temperature, history_bias, tangent_bias,
+                   regime_score, history_samples, humidity, confidence, provider, model_version, created_at
+            FROM ${ForecastAdaptiveStore.TABLE}
+            ORDER BY reference_key, horizon_hour, target_ts, issued_at
+            """.trimIndent(), null
+        ).use { c ->
+            while (c.moveToNext()) {
+                writeJson(writer, "FORECAST_ADAPTIVE_ARCHIVE", JSONObject().apply {
+                    put("referenceKey", c.getString(0))
+                    put("horizonHour", c.getInt(1))
+                    put("issuedAt", c.getLong(2))
+                    put("targetAt", c.getLong(3))
+                    put("baselineTemperature", c.getDouble(4))
+                    put("adaptiveTemperature", c.getDouble(5))
+                    put("tangentTemperature", c.getDouble(6))
+                    put("historyBias", c.getDouble(7))
+                    put("tangentBias", c.getDouble(8))
+                    put("regimeScore", c.getDouble(9))
+                    put("historySamples", c.getInt(10))
+                    put("humidity", c.getDouble(11))
+                    put("confidence", c.getDouble(12))
+                    put("provider", c.getString(13))
+                    put("modelVersion", c.getString(14))
+                    put("createdAt", c.getLong(15))
+                })
+            }
+        }
+
+        db.readableDatabase.rawQuery(
+            """
             SELECT reference_key, timestamp, temperature, humidity, source, confidence
             FROM weather_reference_samples
             ORDER BY reference_key, timestamp
@@ -239,6 +271,7 @@ class FabDataBackupV3Support(
                 "FORECAST_LOCAL_ARCHIVE" -> restoreForecastLocalArchive(json(values))
                 "FORECAST_PAST_API_ARCHIVE" -> restoreForecastPastApiArchive(json(values))
                 "FORECAST_CURVE_10M_ARCHIVE" -> restoreForecastCurve10mArchive(json(values))
+                "FORECAST_ADAPTIVE_ARCHIVE" -> restoreForecastAdaptiveArchive(json(values))
                 "WEATHER" -> restoreWeather(values)
                 else -> return false
             }
@@ -551,6 +584,38 @@ class FabDataBackupV3Support(
             origin = o.optString("origin", ForecastCurve10mStore.ORIGIN),
             modelVersion = o.optString("modelVersion", ForecastCurve10mStore.MODEL_VERSION),
             createdAt = o.optLong("createdAt", targetAt)
+        )
+    }
+
+    private fun restoreForecastAdaptiveArchive(o: JSONObject) {
+        val key = o.optString("referenceKey", "").trim()
+        val horizon = o.optInt("horizonHour", -1)
+        val issuedAt = o.optLong("issuedAt", -1L)
+        val targetAt = o.optLong("targetAt", -1L)
+        val baseline = o.optDouble("baselineTemperature", Double.NaN)
+        val adaptive = o.optDouble("adaptiveTemperature", Double.NaN)
+        val tangent = o.optDouble("tangentTemperature", Double.NaN)
+        if (key.isBlank() || horizon !in FORECAST_ADAPTIVE_HORIZONS || issuedAt < 0L || targetAt < 0L ||
+            !baseline.isFinite() || !adaptive.isFinite() || !tangent.isFinite()
+        ) return
+        ForecastAdaptiveStore.restore(
+            sql = db.writableDatabase,
+            referenceKey = key,
+            horizonHour = horizon,
+            issuedAt = issuedAt,
+            targetAt = targetAt,
+            baselineTemperature = baseline,
+            adaptiveTemperature = adaptive,
+            tangentTemperature = tangent,
+            historyBias = o.optDouble("historyBias", 0.0),
+            tangentBias = o.optDouble("tangentBias", 0.0),
+            regimeScore = o.optDouble("regimeScore", 0.0),
+            historySamples = o.optInt("historySamples", 0),
+            humidity = o.optDouble("humidity", 50.0),
+            confidence = o.optDouble("confidence", 0.5),
+            provider = o.optString("provider", "active_reference"),
+            modelVersion = o.optString("modelVersion", ForecastAdaptiveStore.MODEL_VERSION),
+            createdAt = o.optLong("createdAt", issuedAt)
         )
     }
 

@@ -2,11 +2,11 @@
 
 ## Affichage des références d’apprentissage
 
-- [ ] **Mieux afficher la référence météo liée aux modèles d’apprentissage.**
+- [x] **Mieux afficher la référence météo liée aux modèles d’apprentissage.**
   - Montrer clairement la référence météo utilisée par le modèle thermique / inertiel et les modèles solaires.
   - Employer partout les libellés UI suivants :
     - **Référence terrain** = réel mesuré prioritaire + reconstruction météo pour combler les trous.
-    - **Prévision météo H+24** = prévision Météo-France à échéance fixe H+24.
+    - **Prévision météo H+24** = courbe météo fixe H+24 archivée, distincte de la prévision active/glissante.
     - **Prévision Fab H+24** = correction locale Fab de la prévision H+24.
     - **Sol inertiel estimé** = courbe thermique / inertielle, totalement indépendante des prévisions météo.
   - Dans les écrans d’apprentissage, afficher explicitement :
@@ -22,7 +22,7 @@
 
 ## Cadrans météo — mode compact
 
-- [ ] **Permettre de réduire les cadrans en un petit paquet de points circulaires.**
+- [x] **Permettre de réduire les cadrans en un petit paquet de points circulaires.**
   - Un **double-clic / double-tap sur le cadre des cadrans** bascule entre le mode complet et le mode compact.
   - En mode compact, remplacer les cadrans par un **petit groupe de points circulaires**, suffisamment lisible pour se repérer sans masquer les courbes.
   - Le **cadre et le remplissage du paquet compact** doivent reprendre l’identité visuelle du **cadran PRÉSENT** (même couleur / état visuel principal).
@@ -31,7 +31,7 @@
 
 ## Prévision Fab adaptative — H+3 / H+6 / H+12 / H+24
 
-- [ ] **Construire une prévision Fab adaptative à quatre horizons fixes : H+3, H+6, H+12 et H+24.**
+- [x] **Construire une prévision Fab adaptative à quatre horizons fixes : H+3, H+6, H+12 et H+24.**
   - Chaque horizon doit disposer de sa propre évaluation et pouvoir être comparé à la **Référence terrain** lorsque l’échéance devient réelle.
   - Exploiter l’historique immuable des prévisions météo déjà archivé afin de mesurer l’erreur propre à chaque horizon.
   - En situation météo normale, utiliser l’apprentissage historique pertinent pour l’horizon concerné.
@@ -40,3 +40,10 @@
   - Rester strictement causal : une prévision faite à T ne doit utiliser que des informations disponibles à T, sans fuite de données futures.
   - Conserver séparément les résultats H+3, H+6, H+12 et H+24 pour mesurer à quel horizon l’adaptation Fab apporte réellement un gain sur la météo brute.
   - Ne pas modifier les cadrans H+24 actuels tant que cette prévision adaptative multi-horizon n’est pas validée.
+
+
+## Livraison v0.23.0
+
+- [x] Les trois blocs ci-dessus sont implémentés sans modifier la sémantique des cadrans H+24 existants.
+- [x] Les prévisions adaptatives restent une couche informative séparée : aucune écriture dans la Référence terrain ni dans les modèles thermiques.
+- [x] Les sorties adaptatives émises sont archivées et incluses dans la sauvegarde/restauration FabData.

@@ -7,8 +7,6 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sqrt
 
 /**
  * Causal Fab adaptive forecast at four fixed horizons.
@@ -486,7 +484,11 @@ class ForecastAdaptiveEngine(private val db: FabDataDb) {
         fun atOrBefore(target: Long, tolerance: Long): AdaptiveTerrainPoint? =
             terrain.asSequence()
                 .filter { it.timestamp <= target && target - it.timestamp <= tolerance }
-                .maxWithOrNull(compareBy<AdaptiveTerrainPoint> { it.timestamp }.thenBy { it.measured })
+                .sortedWith(
+                    compareBy<AdaptiveTerrainPoint> { it.timestamp }
+                        .thenBy { if (it.measured) 1 else 0 }
+                )
+                .lastOrNull()
 
         val p0 = atOrBefore(asOf, 90L * 60L * 1000L) ?: return null
         val p1 = atOrBefore(asOf - ADAPTIVE_HOUR_MS, 85L * 60L * 1000L) ?: return null

@@ -588,6 +588,9 @@ private class ForecastDialStripView(
         private const val KEY_Y = "y_fraction"
         private const val KEY_WIDTH_DP = "width_dp"
         private const val KEY_HEIGHT_DP = "height_dp"
+        private const val KEY_COMPACT = "compact"
+        private const val COMPACT_WIDTH_DP = 76f
+        private const val COMPACT_HEIGHT_DP = 46f
     }
 
     private val dataSource = ForecastDialDataSource(context, db)
@@ -603,6 +606,11 @@ private class ForecastDialStripView(
     private var resizing = false
     private var startWidth = 0
     private var startHeight = 0
+    private var compact = false
+    private var downRawX = 0f
+    private var downRawY = 0f
+    private var moved = false
+    private var lastTapUp = 0L
 
     private val refresh = object : Runnable {
         override fun run() {
@@ -635,13 +643,19 @@ private class ForecastDialStripView(
 
     fun restorePosition(root: ViewGroup) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val minWidth = dp(270f).toInt()
-        val minHeight = dp(130f).toInt()
-        val maxWidth = maxOf(minWidth, root.width - dp(8f).toInt())
-        val maxHeight = maxOf(minHeight, root.height - dp(8f).toInt())
+        compact = prefs.getBoolean(KEY_COMPACT, false)
+        val expandedMinWidth = dp(270f).toInt()
+        val expandedMinHeight = dp(130f).toInt()
+        val maxWidth = maxOf(expandedMinWidth, root.width - dp(8f).toInt())
+        val maxHeight = maxOf(expandedMinHeight, root.height - dp(8f).toInt())
         layoutParams = layoutParams.apply {
-            width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(minWidth, maxWidth)
-            height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(minHeight, maxHeight)
+            if (compact) {
+                width = dp(COMPACT_WIDTH_DP).toInt().coerceAtMost(root.width.coerceAtLeast(1))
+                height = dp(COMPACT_HEIGHT_DP).toInt().coerceAtMost(root.height.coerceAtLeast(1))
+            } else {
+                width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(expandedMinWidth, maxWidth)
+                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(expandedMinHeight, maxHeight)
+            }
         }
         requestLayout()
         post {
@@ -651,6 +665,7 @@ private class ForecastDialStripView(
             val yFraction = prefs.getFloat(KEY_Y, -1f)
             x = if (xFraction >= 0f) maxX * xFraction.coerceIn(0f, 1f) else dp(8f)
             y = if (yFraction >= 0f) maxY * yFraction.coerceIn(0f, 1f) else dp(96f)
+            state?.let(::updateAccessibility)
         }
     }
 
@@ -660,18 +675,22 @@ private class ForecastDialStripView(
             MotionEvent.ACTION_DOWN -> {
                 lastRawX = event.rawX
                 lastRawY = event.rawY
+                downRawX = event.rawX
+                downRawY = event.rawY
+                moved = false
                 startX = x
                 startY = y
                 startWidth = width
                 startHeight = height
                 val handle = dp(36f)
-                resizing = event.x >= width - handle && event.y >= height - handle
+                resizing = !compact && event.x >= width - handle && event.y >= height - handle
                 parentView.requestDisallowInterceptTouchEvent(true)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 val dx = event.rawX - lastRawX
                 val dy = event.rawY - lastRawY
+                if (abs(event.rawX - downRawX) > dp(5f) || abs(event.rawY - downRawY) > dp(5f)) moved = true
                 if (resizing) {
                     val minWidth = dp(270f).toInt()
                     val minHeight = dp(130f).toInt()
@@ -690,11 +709,30 @@ private class ForecastDialStripView(
                 }
                 return true
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP -> {
                 parentView.requestDisallowInterceptTouchEvent(false)
-                persistGeometry(parentView)
+                if (!moved && !resizing) {
+                    val now = event.eventTime
+                    if (lastTapUp > 0L && now - lastTapUp <= 340L) {
+                        lastTapUp = 0L
+                        toggleCompact(parentView)
+                    } else {
+                        lastTapUp = now
+                        persistGeometry(parentView)
+                    }
+                } else {
+                    lastTapUp = 0L
+                    persistGeometry(parentView)
+                }
                 resizing = false
                 performClick()
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                parentView.requestDisallowInterceptTouchEvent(false)
+                lastTapUp = 0L
+                persistGeometry(parentView)
+                resizing = false
                 return true
             }
         }
@@ -706,21 +744,57 @@ private class ForecastDialStripView(
         return true
     }
 
+    private fun toggleCompact(root: ViewGroup) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!compact) persistGeometry(root)
+        compact = !compact
+        prefs.edit().putBoolean(KEY_COMPACT, compact).apply()
+
+        val minWidth = dp(270f).toInt()
+        val minHeight = dp(130f).toInt()
+        val maxWidth = maxOf(minWidth, root.width - dp(8f).toInt())
+        val maxHeight = maxOf(minHeight, root.height - dp(8f).toInt())
+        layoutParams = layoutParams.apply {
+            if (compact) {
+                width = dp(COMPACT_WIDTH_DP).toInt().coerceAtMost(root.width.coerceAtLeast(1))
+                height = dp(COMPACT_HEIGHT_DP).toInt().coerceAtMost(root.height.coerceAtLeast(1))
+            } else {
+                width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(minWidth, maxWidth)
+                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(minHeight, maxHeight)
+            }
+        }
+        requestLayout()
+        post {
+            x = x.coerceIn(0f, (root.width - width).coerceAtLeast(0).toFloat())
+            y = y.coerceIn(0f, (root.height - height).coerceAtLeast(0).toFloat())
+            persistGeometry(root)
+            state?.let(::updateAccessibility)
+            invalidate()
+        }
+    }
+
     private fun persistGeometry(root: ViewGroup) {
         val maxX = (root.width - width).coerceAtLeast(1).toFloat()
         val maxY = (root.height - height).coerceAtLeast(1).toFloat()
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putFloat(KEY_X, (x / maxX).coerceIn(0f, 1f))
-            .putFloat(KEY_Y, (y / maxY).coerceIn(0f, 1f))
-            .putFloat(KEY_WIDTH_DP, width / resources.displayMetrics.density.coerceAtLeast(0.1f))
-            .putFloat(KEY_HEIGHT_DP, height / resources.displayMetrics.density.coerceAtLeast(0.1f))
-            .apply()
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().apply {
+            putFloat(KEY_X, (x / maxX).coerceIn(0f, 1f))
+            putFloat(KEY_Y, (y / maxY).coerceIn(0f, 1f))
+            putBoolean(KEY_COMPACT, compact)
+            if (!compact) {
+                putFloat(KEY_WIDTH_DP, width / resources.displayMetrics.density.coerceAtLeast(0.1f))
+                putFloat(KEY_HEIGHT_DP, height / resources.displayMetrics.density.coerceAtLeast(0.1f))
+            }
+        }.apply()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val current = state
         val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        if (compact) {
+            drawCompact(canvas, night, current)
+            return
+        }
         val panel = if (night) Color.rgb(28, 30, 34) else Color.rgb(250, 250, 250)
         paint.style = Paint.Style.FILL
         paint.color = withAlpha(panel, if (night) 215 else 232)
@@ -745,6 +819,38 @@ private class ForecastDialStripView(
             drawDial(canvas, sample, cx, cy, radius, index, night)
         }
         drawResizeHandle(canvas, night)
+    }
+
+    private fun drawCompact(canvas: Canvas, night: Boolean, current: DialState?) {
+        val dials = current?.samples ?: listOf(
+            emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
+        )
+        val present = dials.getOrNull(1) ?: emptyDial("PRÉSENT")
+        val fill = comparisonFill(present, night)
+        val border = officialBorder(present, night)
+        val corner = dp(18f)
+
+        paint.style = Paint.Style.FILL
+        paint.color = withAlpha(fill, 225)
+        canvas.drawRoundRect(0f, 0f, width.toFloat(), height.toFloat(), corner, corner, paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(2.2f)
+        paint.color = withAlpha(border, 245)
+        canvas.drawRoundRect(dp(1.1f), dp(1.1f), width - dp(1.1f), height - dp(1.1f), corner, corner, paint)
+
+        val centerY = height / 2f
+        val spacing = width / 4f
+        dials.take(3).forEachIndexed { index, sample ->
+            val cx = spacing * (index + 1)
+            val radius = dp(if (index == 1) 7.0f else 5.0f)
+            paint.style = Paint.Style.FILL
+            paint.color = withAlpha(comparisonFill(sample, night), if (index == 1) 255 else 205)
+            canvas.drawCircle(cx, centerY, radius, paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(if (index == 1) 2.0f else 1.4f)
+            paint.color = withAlpha(officialBorder(sample, night), if (index == 1) 255 else 220)
+            canvas.drawCircle(cx, centerY, radius, paint)
+        }
     }
 
     private fun drawResizeHandle(canvas: Canvas, night: Boolean) {
@@ -933,6 +1039,7 @@ private class ForecastDialStripView(
     private fun updateAccessibility(state: DialState) {
         contentDescription = buildString {
             append("Cadrans tangentiels ${state.referenceLabel}. ")
+            append(if (compact) "Mode compact. Double-tape pour ouvrir les cadrans. " else "Mode complet. Double-tape le cadre pour réduire les cadrans. ")
             state.samples.forEach { s ->
                 append("${s.label.lowercase()} ${timeFormatter.format(Instant.ofEpochMilli(s.targetTs))}. ")
                 if (s.actualTemp == null) {
