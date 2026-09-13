@@ -58,3 +58,11 @@ s=once(s,
     fun bandChooserOpen(): Boolean = prefs.getBoolean("band_chooser_open", false)
 ''','adaptive expanded pref')
 write(p,s)
+
+# v0.23.2 audit: H25-H48 must restore persisted visibility just like H1-H23.
+p='app/src/main/java/com/fabdata/app/MainActivity.kt'; s=read(p)
+s=s.replace(
+    'FORECAST_HORIZON_HOURS.filter { it < 24 }.forEach { lead ->',
+    'FORECAST_HORIZON_HOURS.filter { it != 24 }.forEach { lead ->'
+)
+write(p,s)
