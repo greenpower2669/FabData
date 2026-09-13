@@ -79,6 +79,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -97,6 +98,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -148,6 +150,13 @@ private enum class PreviewPreset(val label: String, val spanMs: Long) {
 private enum class TemporalPageDirection {
     PREVIOUS,
     NEXT
+}
+
+private enum class UiReloadPriority(val rank: Int) {
+    NAVIGATION(10),
+    BACKGROUND_DATA(40),
+    DATA(70),
+    CRITICAL(100)
 }
 
 private const val OVERVIEW_LOD_6H_MS = 6L * 60L * 60L * 1000L
@@ -310,6 +319,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val scope = rememberCoroutineScope()
     val reloadMutex = remember { Mutex() }
     val snackbar = remember { SnackbarHostState() }
+    var reloadRequestGeneration by remember { mutableIntStateOf(1) }
+    var reloadPendingPriority by remember { mutableIntStateOf(UiReloadPriority.DATA.rank) }
+    fun queueUiReload(priority: UiReloadPriority) {
+        reloadPendingPriority = maxOf(reloadPendingPriority, priority.rank)
+        reloadRequestGeneration++
+    }
 
     var sensors by remember { mutableStateOf<List<Sensor>>(emptyList()) }
     var sampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
@@ -380,7 +395,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         lyonLab = lyonLab,
         credentials = meteoCredentials,
         dataVersion = reloadToken,
-        onDataChanged = { reloadToken++ }
+        onDataChanged = {
+            reloadToken++
+            queueUiReload(UiReloadPriority.DATA)
+        }
     )
 
     val activeCurveStyles = remember(sensors, styleVersion) {
@@ -463,6 +481,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 val invalid = ok.sumOf { it.invalid }
                 busy = false
                 reloadToken++
+                queueUiReload(UiReloadPriority.CRITICAL)
                 snackbar.showSnackbar(
                     "Import : $measuresAdded mesure(s) ajoutée(s) · $measuresDuplicates déjà présente(s) · " +
                         "$eventsAdded événement(s) restauré(s) · $eventsDuplicates événement(s) déjà présent(s) · " +
@@ -483,6 +502,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 configs.forEach { config -> runCatching { remoteSensorSync.sync(config) } }
             }
             reloadToken++
+            queueUiReload(UiReloadPriority.BACKGROUND_DATA)
         }
     }
 
@@ -497,6 +517,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
             busy = false
             reloadToken++
+            queueUiReload(UiReloadPriority.CRITICAL)
             snackbar.showSnackbar(
                 result.fold(
                     onSuccess = {
@@ -509,16 +530,34 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
     }
 
-    LaunchedEffect(reloadToken, preset, windowCenterTimestamp, customViewSpanMs, wideOverviewRange, explorationOverviewRange) {
-        // Startup/preferences can settle through several Compose states in a few milliseconds.
-        // Debounce before registering work so Activity FabData shows one meaningful refresh,
-        // not a TERMINÉ/ANNULÉ/TERMINÉ burst.
-        delay(350L)
-        reloadMutex.withLock {
+    LaunchedEffect(preset, windowCenterTimestamp, customViewSpanMs, wideOverviewRange, explorationOverviewRange) {
+        // UI-only movement is low priority. It is buffered and merged; it never cancels
+        // a reload already in progress.
+        delay(180L)
+        queueUiReload(UiReloadPriority.NAVIGATION)
+    }
+
+    LaunchedEffect(Unit) {
+        // One serial consumer for all redraw work. Startup gets a short settle window, then
+        // conflate() keeps only the newest pending generation while work is running.
+        // Priority is max-merged by queueUiReload: CRITICAL > DATA > BACKGROUND > NAVIGATION.
+        delay(320L)
+        snapshotFlow { reloadRequestGeneration }
+            .conflate()
+            .collect {
+                val priorityRank = reloadPendingPriority
+                reloadPendingPriority = 0
+                reloadMutex.withLock {
         val reloadStarted = System.currentTimeMillis()
-        val reloadOperation = FabOperationRegistry.tryStart(
-            "ui-reload", "Actualisation affichage", "Lecture des courbes…", cancellable = true
-        )
+        val reloadOperation = if (priorityRank >= UiReloadPriority.DATA.rank) {
+            FabOperationRegistry.tryStart(
+                "ui-reload",
+                "Actualisation affichage",
+                if (priorityRank >= UiReloadPriority.CRITICAL.rank) "Priorité critique · lecture des courbes…"
+                else "Données mises à jour · lecture des courbes…",
+                cancellable = true
+            )
+        } else null
         var reloadSucceeded = false
         try {
         busy = true
@@ -835,11 +874,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         reloadSucceeded = true
         } catch (cancel: CancellationException) {
             if (FabOperationRegistry.cancelRequested(reloadOperation)) {
-                FabOperationRegistry.cancelled(reloadOperation, "Actualisation affichage annulée")
+                FabOperationRegistry.cancelled(reloadOperation, "Actualisation affichage annulée par l’utilisateur")
             } else {
                 FabOperationRegistry.discard(reloadOperation)
+                throw cancel
             }
-            throw cancel
         } catch (error: Throwable) {
             FabOperationRegistry.fail(
                 reloadOperation,
@@ -857,7 +896,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 }
             }
         }
-        }
+                }
+            }
     }
 
     val visualReference = WeatherReferencePrefs(context).selectedReference()
@@ -4584,14 +4624,19 @@ private fun SettingsDialog(
                     singleLine = true
                 )
                 HorizontalDivider()
-                Text("Aide · cadrans flottants", fontWeight = FontWeight.Bold)
+                Text("Aide · activité et cadrans", fontWeight = FontWeight.Bold)
+                Text(
+                    "Les actualisations d’affichage sont mises en file avec priorités : import/restauration, données, puis navigation. " +
+                        "Une tâche déjà lancée n’est plus annulée par un simple changement d’écran ; les demandes suivantes sont fusionnées dans le buffer.",
+                    style = MaterialTheme.typography.bodySmall
+                )
                 Text(
                     "Appui long sur le cadran pour choisir la prévision météo et la prévision Fab adaptative à surveiller. " +
                         "Double appui pour passer compact / déplié. Les choix, la position et la taille sont persistants et sauvegardés.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 HorizontalDivider()
-                Text("Politique de confidentialité · FabData v0.23.4", fontWeight = FontWeight.Bold)
+                Text("Politique de confidentialité · FabData v0.23.5", fontWeight = FontWeight.Bold)
                 Text(
                     "Les mesures intérieures, noms de pièces, événements, modèles et personnalisations restent traités localement sur cet appareil. " +
                         "FabData n'intègre ni publicité ni analytique et ne crée aucun compte utilisateur. " +
