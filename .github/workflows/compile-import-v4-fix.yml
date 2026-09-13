@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/workflows/compile-import-v4-fix.yml'
       - 'app/src/main/java/com/fabdata/app/BackupLayer.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastSelectableCurves.kt'
 
 permissions:
   contents: read
