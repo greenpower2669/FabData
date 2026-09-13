@@ -1,0 +1,119 @@
+name: Build v0.23.1 forecast persistence
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/forecast-fixed-lead-h24'
+    paths:
+      - 'app/build.gradle.kts'
+      - 'app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt'
+      - 'app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt'
+      - 'app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt'
+      - 'app/src/main/java/com/fabdata/app/UiPreferenceStore.kt'
+      - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
+      - 'tools/fix_v0231_forecast_persistence.py'
+      - '.github/workflows/build-v0231-forecast-persistence.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: feature/forecast-fixed-lead-h24
+          fetch-depth: 0
+
+      - name: Validate patch
+        run: python3 -m py_compile tools/fix_v0231_forecast_persistence.py
+
+      - name: Apply v0.23.1 fixes
+        run: python3 tools/fix_v0231_forecast_persistence.py
+
+      - name: Regression guard
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.23.1"' app/build.gradle.kts
+          grep -n 'work-runtime-ktx:2.10.1' app/build.gradle.kts
+          grep -n 'CREATE TRIGGER IF NOT EXISTS' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          if grep -n 'DROP TRIGGER IF EXISTS \$TRIGGER' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt; then
+            echo 'Forecast trigger must not be dropped during normal ensure()' >&2
+            exit 1
+          fi
+          grep -n 'forecast_days=3' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'now + 48L \* hourMs' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'ForecastArchiveWorker.schedule' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'PeriodicWorkRequestBuilder<ForecastArchiveWorker>(1, TimeUnit.HOURS)' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
+          grep -n 'FORECAST_DISPLAY_FUTURE_MS' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'selectedTimestamp()' app/src/main/java/com/fabdata/app/UiPreferenceStore.kt
+          grep -n 'wideOverviewRange()' app/src/main/java/com/fabdata/app/UiPreferenceStore.kt
+          grep -n 'explorationOverviewRange()' app/src/main/java/com/fabdata/app/UiPreferenceStore.kt
+          grep -n 'sensor_keys' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'Dernières valeurs connues · actualisation impossible' app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt
+          grep -n 'KEY_COMPACT' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'KEY_WIDTH_DP' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'curveTemperature(sensor.stableKey)' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'CurveStyleStore(context)' app/src/main/java/com/fabdata/app/MainActivity.kt
+          if grep -nE 'ForecastAdaptiveEngine|ThermalEngine|StationDiscovery' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt; then
+            echo 'Background forecast worker became too heavy' >&2
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Build debug APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Normalize release APK filename
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             app/build/outputs/apk/debug/FabData-v0.23.1-release-forecast-persistence.apk
+
+      - name: Commit validated source
+        run: |
+          if git diff --quiet; then
+            echo "v0.23.1 source already committed"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/build.gradle.kts \
+                    app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
+                    app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt \
+                    app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+                    app/src/main/java/com/fabdata/app/UiPreferenceStore.kt \
+                    app/src/main/java/com/fabdata/app/MainActivity.kt \
+                    app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
+            git commit -m "Fix H+48 forecast capture and durable UI state [skip ci]"
+            git push origin HEAD:feature/forecast-fixed-lead-h24
+          fi
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.23.1-release-forecast-persistence
+          path: app/build/outputs/apk/debug/FabData-v0.23.1-release-forecast-persistence.apk
+          if-no-files-found: error
