@@ -73,20 +73,15 @@ fun FabLiveUpdateCoordinator(
         onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
-    suspend fun lastForecastUpdatedAt(referenceKey: String): Long? = withContext(Dispatchers.IO) {
-        db.readableDatabase.rawQuery(
-            "SELECT MAX(updated_at) FROM weather_reference_samples WHERE reference_key=? AND source='forecast'",
-            arrayOf(referenceKey)
-        ).use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null }
-    }
+    suspend fun currentForecastSlotCaptured(referenceKey: String, now: Long = System.currentTimeMillis()): Boolean =
+        withContext(Dispatchers.IO) {
+            ForecastMemoryStore.hasCaptureSlot(db.writableDatabase, referenceKey, now)
+        }
 
     suspend fun updateLive(force: Boolean = false): Boolean {
         if (!foreground || working) return false
         val referenceForOperation = weatherPrefs.selectedReference()
-        if (!force) {
-            val last = lastForecastUpdatedAt(referenceForOperation.key)
-            if (last != null && System.currentTimeMillis() - last < LIVE_FORECAST_INTERVAL_MS) return false
-        }
+        if (!force && currentForecastSlotCaptured(referenceForOperation.key)) return false
         val operationId = FabOperationRegistry.tryStart(
             "weather:${referenceForOperation.key}",
             "Mise à jour automatique",
@@ -176,26 +171,25 @@ fun FabLiveUpdateCoordinator(
         }
     }
 
-    // La dernière écriture FORECAST cadence le réseau : retour au focus, bouton manuel
-    // et worker Android partagent ainsi la même horloge sans spammer l'affichage.
+    // Horloge canonique : :00 / :10 / :20 / :30 / :40 / :50.
+    // Si le créneau courant manque (ouverture tardive), on le rattrape immédiatement ;
+    // sinon on dort jusqu'à la prochaine frontière. Le vrai issued_at reste conservé.
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
         while (foreground) {
             val hadPending = pendingMeasuredRefresh
             if (!hadPending) {
                 val reference = weatherPrefs.selectedReference()
-                val last = lastForecastUpdatedAt(reference.key)
-                val waitMs = last?.let {
-                    (LIVE_FORECAST_INTERVAL_MS - (System.currentTimeMillis() - it)).coerceAtLeast(0L)
-                } ?: 0L
-                if (waitMs > 0L) {
-                    delay(waitMs)
+                val now = System.currentTimeMillis()
+                if (currentForecastSlotCaptured(reference.key, now)) {
+                    val nextSlot = ForecastMemoryStore.captureSlot10m(now) + LIVE_FORECAST_INTERVAL_MS
+                    delay((nextSlot - now).coerceAtLeast(1_000L))
                     if (!foreground) break
                 }
             }
             val ran = updateLive(force = hadPending)
             if (ran && hadPending) pendingMeasuredRefresh = false
-            if (!ran) delay(5_000L)
+            if (!ran) delay(30_000L)
         }
     }
 }

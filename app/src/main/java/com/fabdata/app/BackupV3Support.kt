@@ -3,6 +3,7 @@ package com.fabdata.app
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.Writer
 
 /**
@@ -38,6 +39,7 @@ class FabDataBackupV3Support(
         ForecastCurve10mStore.ensure(db.writableDatabase)
         ForecastAdaptiveStore.ensure(db.writableDatabase)
 
+        writePersonalizationRows(writer)
         writeJson(writer, "WEATHER_META", weatherMetaJson())
         WeatherReferenceStore(db).allReferenceMetadata().forEach { meta ->
             writeJson(writer, "WEATHER_REFERENCE_META", JSONObject().apply {
@@ -115,7 +117,8 @@ class FabDataBackupV3Support(
         // from ordinary sensor samples and therefore must be explicitly backed up.
         db.readableDatabase.rawQuery(
             """
-            SELECT reference_key, issued_at, target_ts, temperature, humidity, confidence, provider
+            SELECT reference_key, issued_at, target_ts, temperature, humidity, confidence, provider,
+                   COALESCE(capture_slot_10m, (issued_at / 600000) * 600000)
             FROM ${ForecastMemoryStore.TABLE}
             ORDER BY reference_key, target_ts, issued_at
             """.trimIndent(), null
@@ -129,6 +132,7 @@ class FabDataBackupV3Support(
                     putNullable("humidity", if (c.isNull(4)) null else c.getDouble(4))
                     putNullable("confidence", if (c.isNull(5)) null else c.getDouble(5))
                     put("provider", c.getString(6))
+                    put("captureSlot10m", c.getLong(7))
                 })
             }
         }
@@ -258,6 +262,7 @@ class FabDataBackupV3Support(
     fun importRecord(record: String, values: Map<String, String>): Boolean {
         return runCatching {
             when (record) {
+                "UI_PREFERENCES" -> restorePersonalization(json(values))
                 "WEATHER_META" -> restoreWeatherMeta(json(values))
                 "WEATHER_REFERENCE_META" -> restoreWeatherReferenceMeta(json(values))
                 "THERMAL_PROFILE" -> restoreProfile(json(values))
@@ -277,6 +282,87 @@ class FabDataBackupV3Support(
             }
             true
         }.getOrElse { false }
+    }
+
+    private fun isSafePersonalizationPreference(name: String): Boolean {
+        val lower = name.lowercase()
+        if (!lower.startsWith("fabdata_")) return false
+        if (listOf("credential", "token", "secret", "password", "auth").any { it in lower }) return false
+        return lower == "fabdata_prefs" || listOf(
+            "ui", "curve", "style", "dial", "overview", "context", "display", "appearance"
+        ).any { it in lower }
+    }
+
+    private fun personalizationPreferenceNames(): List<String> {
+        val known = linkedSetOf(
+            "fabdata_ui_preferences",
+            "fabdata_prefs",
+            "fabdata_forecast_dial_overlay",
+            "fabdata_overview_band_curves",
+            "fabdata_context_help",
+            "fabdata_curve_styles",
+            "fabdata_curve_style",
+            "fabdata_styles"
+        )
+        val dir = File(context.applicationInfo.dataDir, "shared_prefs")
+        dir.listFiles().orEmpty().forEach { file ->
+            val name = file.name.removeSuffix(".xml")
+            if (isSafePersonalizationPreference(name)) known += name
+        }
+        return known.filter(::isSafePersonalizationPreference).sorted()
+    }
+
+    private fun writePersonalizationRows(writer: Writer) {
+        personalizationPreferenceNames().forEach { name ->
+            val all = context.getSharedPreferences(name, Context.MODE_PRIVATE).all
+            if (all.isEmpty()) return@forEach
+            val entries = JSONArray()
+            all.toSortedMap().forEach { (key, raw) ->
+                val entry = JSONObject().put("key", key)
+                when (raw) {
+                    is Boolean -> entry.put("type", "boolean").put("value", raw)
+                    is Int -> entry.put("type", "int").put("value", raw)
+                    is Long -> entry.put("type", "long").put("value", raw)
+                    is Float -> entry.put("type", "float").put("value", raw.toDouble())
+                    is String -> entry.put("type", "string").put("value", raw)
+                    is Set<*> -> entry.put("type", "string_set").put(
+                        "value", JSONArray().apply { raw.filterIsInstance<String>().sorted().forEach { put(it) } }
+                    )
+                    else -> return@forEach
+                }
+                entries.put(entry)
+            }
+            writeJson(writer, "UI_PREFERENCES", JSONObject().apply {
+                put("name", name)
+                put("entries", entries)
+            })
+        }
+    }
+
+    private fun restorePersonalization(o: JSONObject) {
+        val name = o.optString("name", "").trim()
+        if (!isSafePersonalizationPreference(name)) return
+        val entries = o.optJSONArray("entries") ?: return
+        val editor = context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear()
+        for (i in 0 until entries.length()) {
+            val entry = entries.optJSONObject(i) ?: continue
+            val key = entry.optString("key", "").trim()
+            if (key.isBlank()) continue
+            when (entry.optString("type")) {
+                "boolean" -> editor.putBoolean(key, entry.optBoolean("value", false))
+                "int" -> editor.putInt(key, entry.optInt("value", 0))
+                "long" -> editor.putLong(key, entry.optLong("value", 0L))
+                "float" -> editor.putFloat(key, entry.optDouble("value", 0.0).toFloat())
+                "string" -> editor.putString(key, entry.optString("value", ""))
+                "string_set" -> {
+                    val a = entry.optJSONArray("value") ?: JSONArray()
+                    val set = linkedSetOf<String>()
+                    for (j in 0 until a.length()) set += a.optString(j)
+                    editor.putStringSet(key, set)
+                }
+            }
+        }
+        editor.apply()
     }
 
     private fun weatherMetaJson(): JSONObject {
@@ -518,19 +604,22 @@ class FabDataBackupV3Support(
         val humidity = nullableDouble(o, "humidity")
         val confidence = nullableDouble(o, "confidence")
         val provider = o.optString("provider", "active_reference").ifBlank { "active_reference" }
+        val slot = o.optLong("captureSlot10m", ForecastMemoryStore.captureSlot10m(issuedAt))
         db.writableDatabase.execSQL(
             """
-            INSERT INTO ${ForecastMemoryStore.TABLE}(reference_key, issued_at, target_ts, temperature, humidity, confidence, provider)
-            SELECT ?, ?, ?, ?, ?, ?, ?
+            INSERT INTO ${ForecastMemoryStore.TABLE}(
+                reference_key, issued_at, target_ts, temperature, humidity, confidence, provider, capture_slot_10m
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
             WHERE NOT EXISTS (
                 SELECT 1 FROM ${ForecastMemoryStore.TABLE}
-                WHERE reference_key=? AND issued_at=? AND target_ts=? AND provider=?
-                  AND ABS(temperature-?) < 0.001
+                WHERE reference_key=? AND target_ts=? AND provider=?
+                  AND COALESCE(capture_slot_10m, (issued_at / 600000) * 600000)=?
             )
             """.trimIndent(),
             arrayOf(
-                key, issuedAt, targetAt, temperature, humidity, confidence, provider,
-                key, issuedAt, targetAt, provider, temperature
+                key, issuedAt, targetAt, temperature, humidity, confidence, provider, slot,
+                key, targetAt, provider, slot
             )
         )
     }

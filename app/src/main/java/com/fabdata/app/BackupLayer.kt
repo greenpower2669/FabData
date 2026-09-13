@@ -52,7 +52,7 @@ fun ImportResult.toFabDataImportSummary() = FabDataImportSummary(
  */
 class FabDataBackup(private val context: Context, private val db: FabDataDb) {
     companion object {
-        const val FORMAT_VERSION = "4"
+        const val FORMAT_VERSION = "5"
         const val HEADER = "FabData_Record,Format_Version,Capteur_ID,Capteur,Piece,Couleur,Temps_Epoch_ms,Temps,Temperature_Celsius,Humidite_relative_Pourcentage,Titre,Note,Type,UpdatedAt_Epoch_ms,Source,Confiance,Reference_Station_ID,Reference_Ville,Calibration_Debut_ms,Calibration_Fin_ms,Model_Version"
     }
 
@@ -89,11 +89,11 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
             val metaLine = records.firstOrNull { recordType(it) == "META" }
             val metaFields = metaLine?.let { splitCsv(it, ',') }.orEmpty()
             val fileVersion = col(metaFields, "Format_Version").trim()
-            if (fileVersion == FORMAT_VERSION) {
+            if (fileVersion in setOf("4", FORMAT_VERSION)) {
                 val footerLine = records.lastOrNull { it.isNotBlank() }
-                    ?: error("Sauvegarde v4 vide ou incomplète")
+                    ?: error("Sauvegarde complète vide ou incomplète")
                 if (recordType(footerLine) != "BACKUP_END") {
-                    error("Sauvegarde v4 incomplète : marqueur de fin absent")
+                    error("Sauvegarde complète incomplète : marqueur de fin absent")
                 }
                 val footer = splitCsv(footerLine, ',')
                 val note = col(footer, "Note")
@@ -108,7 +108,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                     expected["measurements"] != actualSamples ||
                     expected["events"] != actualEvents
                 ) {
-                    error("Sauvegarde v4 incomplète : compteurs d’intégrité incohérents")
+                    error("Sauvegarde complète incomplète : compteurs d’intégrité incohérents")
                 }
             }
 
@@ -120,7 +120,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                         val fields = splitCsv(line, ',')
                         val record = col(fields, "FabData_Record").trim().uppercase(Locale.ROOT)
                         val formatVersion = col(fields, "Format_Version").trim()
-                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", "2", "3", FORMAT_VERSION)) {
+                        if (formatVersion.isNotBlank() && formatVersion !in setOf("1", "2", "3", "4", FORMAT_VERSION)) {
                             invalid++
                             return@forEach
                         }

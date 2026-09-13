@@ -1,6 +1,7 @@
 package com.fabdata.app
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Application
 import android.content.ContentProvider
 import android.content.ContentValues
@@ -19,7 +20,11 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.Spinner
+import android.widget.TextView
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -32,6 +37,11 @@ import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
+
+private const val DIAL_PREFS = "fabdata_forecast_dial_overlay"
+private const val DIAL_WEATHER_HORIZON_KEY = "monitor_weather_horizon"
+private const val DIAL_ADAPTIVE_HORIZON_KEY = "monitor_adaptive_horizon"
+private const val FORECAST_CAPTURE_SLOT_MS = 10L * 60L * 1000L
 
 /**
  * Forecast memory / tangent cockpit.
@@ -103,12 +113,18 @@ class ForecastMemoryBootstrapProvider : ContentProvider() {
 
 object ForecastMemoryStore {
     const val TABLE = "forecast_snapshot_archive"
-    private const val TRIGGER = "trg_fabdata_forecast_memory_insert"
+    private const val LEGACY_TRIGGER = "trg_fabdata_forecast_memory_insert"
+    private const val TRIGGER = "trg_fabdata_forecast_memory_insert_v2"
+
+    fun captureSlot10m(timestamp: Long): Long =
+        (timestamp / FORECAST_CAPTURE_SLOT_MS) * FORECAST_CAPTURE_SLOT_MS
 
     /**
-     * Additive schema only. weather_reference_samples remains the active cache and is not
-     * migrated or rewritten. Every newly inserted FORECAST row is copied here once.
+     * Additive schema only. issued_at always keeps the real retrieval time.
+     * capture_slot_10m is a canonical logical key used only to prevent a restore or
+     * a second refresh in the same :00/:10/:20/... slot from duplicating an emission.
      */
+    @Synchronized
     fun ensure(sql: SQLiteDatabase) {
         WeatherReferenceStore.ensure(sql)
         sql.execSQL(
@@ -121,22 +137,36 @@ object ForecastMemoryStore {
                 temperature REAL NOT NULL,
                 humidity REAL,
                 confidence REAL,
-                provider TEXT NOT NULL DEFAULT 'active_reference'
+                provider TEXT NOT NULL DEFAULT 'active_reference',
+                capture_slot_10m INTEGER
             )
             """.trimIndent()
         )
+        var hasSlot = false
+        sql.rawQuery("PRAGMA table_info($TABLE)", null).use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(c.getColumnIndexOrThrow("name")) == "capture_slot_10m") {
+                    hasSlot = true
+                    break
+                }
+            }
+        }
+        if (!hasSlot) {
+            sql.execSQL("ALTER TABLE $TABLE ADD COLUMN capture_slot_10m INTEGER")
+        }
         sql.execSQL(
             "CREATE INDEX IF NOT EXISTS idx_forecast_memory_ref_target ON $TABLE(reference_key, target_ts, issued_at)"
         )
         sql.execSQL(
             "CREATE INDEX IF NOT EXISTS idx_forecast_memory_ref_issue ON $TABLE(reference_key, issued_at)"
         )
+        sql.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_forecast_memory_ref_slot ON $TABLE(reference_key, capture_slot_10m, target_ts)"
+        )
 
-        // De-duplicate identical refreshes for thirty minutes while preserving genuine
-        // forecast revisions. No past snapshot is ever updated or replaced.
-        // Normal reads may call ensure() concurrently (UI, adaptive layer, WorkManager).
-        // Never DROP/CREATE here: CREATE IF NOT EXISTS is atomic/idempotent for this schema.
-        // A future trigger definition change must use an explicit versioned migration.
+        // v2 is a versioned migration. The old trigger is retired once; the active trigger
+        // is never DROP/CREATE'd during normal reads, avoiding the former concurrency crash.
+        sql.execSQL("DROP TRIGGER IF EXISTS $LEGACY_TRIGGER")
         sql.execSQL(
             """
             CREATE TRIGGER IF NOT EXISTS $TRIGGER
@@ -144,7 +174,7 @@ object ForecastMemoryStore {
             WHEN NEW.source='forecast'
             BEGIN
                 INSERT INTO $TABLE(
-                    reference_key, issued_at, target_ts, temperature, humidity, confidence, provider
+                    reference_key, issued_at, target_ts, temperature, humidity, confidence, provider, capture_slot_10m
                 )
                 SELECT
                     NEW.reference_key,
@@ -153,26 +183,32 @@ object ForecastMemoryStore {
                     NEW.temperature,
                     NEW.humidity,
                     NEW.confidence,
-                    'active_reference'
+                    'active_reference',
+                    (NEW.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
                 WHERE NOT EXISTS (
                     SELECT 1
                     FROM $TABLE a
                     WHERE a.reference_key=NEW.reference_key
                       AND a.target_ts=NEW.timestamp
                       AND a.provider='active_reference'
-                      AND ABS(a.temperature-NEW.temperature) < 0.001
-                      AND ABS(COALESCE(a.humidity, 0.0)-COALESCE(NEW.humidity, 0.0)) < 0.01
-                      AND a.issued_at >= NEW.updated_at - 1800000
+                      AND COALESCE(
+                          a.capture_slot_10m,
+                          (a.issued_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
+                      ) = (NEW.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
                 );
             END
             """.trimIndent()
         )
 
-        // Seed the currently active forecast so the right dial can work immediately.
+        // Seed only the current logical slot. Existing historical timestamps are never changed.
         sql.execSQL(
             """
-            INSERT INTO $TABLE(reference_key, issued_at, target_ts, temperature, humidity, confidence, provider)
-            SELECT w.reference_key, w.updated_at, w.timestamp, w.temperature, w.humidity, w.confidence, 'active_reference'
+            INSERT INTO $TABLE(
+                reference_key, issued_at, target_ts, temperature, humidity, confidence, provider, capture_slot_10m
+            )
+            SELECT
+                w.reference_key, w.updated_at, w.timestamp, w.temperature, w.humidity, w.confidence,
+                'active_reference', (w.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
             FROM weather_reference_samples w
             WHERE w.source='forecast'
               AND NOT EXISTS (
@@ -180,11 +216,29 @@ object ForecastMemoryStore {
                   WHERE a.reference_key=w.reference_key
                     AND a.target_ts=w.timestamp
                     AND a.provider='active_reference'
-                    AND ABS(a.temperature-w.temperature) < 0.001
-                    AND ABS(a.issued_at-w.updated_at) < 1800000
+                    AND COALESCE(
+                        a.capture_slot_10m,
+                        (a.issued_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
+                    ) = (w.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
               )
             """.trimIndent()
         )
+    }
+
+    fun hasCaptureSlot(sql: SQLiteDatabase, referenceKey: String, timestamp: Long): Boolean {
+        ensure(sql)
+        val slot = captureSlot10m(timestamp)
+        return sql.rawQuery(
+            """
+            SELECT 1 FROM $TABLE
+            WHERE reference_key=?
+              AND COALESCE(capture_slot_10m, (issued_at / ?) * ?) = ?
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(
+                referenceKey, FORECAST_CAPTURE_SLOT_MS.toString(), FORECAST_CAPTURE_SLOT_MS.toString(), slot.toString()
+            )
+        ).use { it.moveToFirst() }
     }
 }
 
@@ -245,6 +299,8 @@ private data class DialSample(
 
 private data class DialState(
     val referenceLabel: String,
+    val weatherHorizon: Int,
+    val adaptiveHorizon: Int,
     val samples: List<DialSample>
 )
 
@@ -253,41 +309,50 @@ private class ForecastDialDataSource(
     private val db: FabDataDb
 ) {
     private val appContext = context.applicationContext
+    private val dialPrefs = appContext.getSharedPreferences(DIAL_PREFS, Context.MODE_PRIVATE)
 
     fun load(now: Long = System.currentTimeMillis()): DialState {
         ForecastMemoryStore.ensure(db.writableDatabase)
+        ForecastHorizonArchiveStore.ensure(db.writableDatabase)
+        ForecastAdaptiveStore.ensure(db.writableDatabase)
         val reference = WeatherReferencePrefs(appContext).selectedReference()
+        val weatherHorizon = dialPrefs.getInt(DIAL_WEATHER_HORIZON_KEY, 24).coerceIn(1, 48)
+        val requestedAdaptive = dialPrefs.getInt(DIAL_ADAPTIVE_HORIZON_KEY, 24)
+        val adaptiveHorizon = requestedAdaptive.takeIf { it in FORECAST_ADAPTIVE_HORIZONS } ?: 24
+
+        // Materialise only a narrow target window from already archived raw snapshots.
+        // No terrain/training data is modified by the cockpit.
         runCatching {
-            ForecastPastArchiveBackfill(db).ensure(reference, now - 4L * HOUR_MS, now - HOUR_MS, now)
+            ForecastHorizonArchive(db).materialize(
+                reference.key, now - 3L * HOUR_MS, now + 3L * HOUR_MS, now
+            )
         }
-        val curves = runCatching {
-            ForecastSelectableCurveStore(db).query(reference.key, now - 4L * HOUR_MS, now + 3L * HOUR_MS, now)
-        }.getOrDefault(ForecastSelectableCurves.EMPTY)
+
         val nowHour = hourBucket(now)
         val targets = listOf(
             "PASSÉ" to (nowHour - HOUR_MS),
             "PRÉSENT" to nowHour,
             "FUTUR" to (nowHour + HOUR_MS)
         )
-        // Passé = H+24 fixe; futur = prévision active. Terrain = réel prioritaire, reconstruction sinon.
-        val result = targets.map { (label, target) -> buildDial(reference.key, label, target, curves) }
-        return DialState(reference.label, result)
+        val result = targets.map { (label, target) ->
+            buildDial(reference.key, label, target, weatherHorizon, adaptiveHorizon)
+        }
+        return DialState(reference.label, weatherHorizon, adaptiveHorizon, result)
     }
 
     private fun buildDial(
         referenceKey: String,
         label: String,
         target: Long,
-        curves: ForecastSelectableCurves
+        weatherHorizon: Int,
+        adaptiveHorizon: Int
     ): DialSample {
-        val official = curveKinematics(curves.reconstructed, target)
-        val local = curveKinematics(curves.fab, target)
+        val official = fixedWeatherKinematics(referenceKey, weatherHorizon, target)
+        val local = adaptiveKinematics(referenceKey, adaptiveHorizon, target)
         val terrain = terrainAt(referenceKey, target)
         val actual = terrain?.temperature
         val actualSlope = if (terrain != null) terrainSlope(referenceKey, target) else null
         val actualAcceleration = if (terrain != null) terrainAcceleration(referenceKey, target) else null
-        val officialError = if (official != null && actual != null) abs(official.temperature - actual) else null
-        val localError = if (local != null && actual != null) abs(local.temperature - actual) else null
 
         return DialSample(
             label = label,
@@ -302,46 +367,109 @@ private class ForecastDialDataSource(
             officialAcceleration = official?.acceleration,
             localAcceleration = local?.acceleration,
             actualAcceleration = actualAcceleration,
-            officialError = officialError,
-            localError = localError,
-            trainingSamples = 0
+            officialError = if (official != null && actual != null) abs(official.temperature - actual) else null,
+            localError = if (local != null && actual != null) abs(local.temperature - actual) else null,
+            trainingSamples = adaptiveHistorySamples(referenceKey, adaptiveHorizon, target)
         )
     }
 
-    private fun curveKinematics(points: List<SamplePoint>, target: Long): CurveKinematics? {
-        fun nearest(at: Long): SamplePoint? = points.minByOrNull { abs(it.timestamp - at) }
-            ?.takeIf { abs(it.timestamp - at) <= 22L * 60L * 1000L }
-        val center = nearest(target) ?: return null
-        val previous = nearest(target - HOUR_MS)
-        val next = nearest(target + HOUR_MS)
+    private fun fixedWeatherAt(referenceKey: String, horizon: Int, target: Long): Double? {
+        val tolerance = 36L * 60L * 1000L
+        return db.readableDatabase.rawQuery(
+            """
+            SELECT weather_temperature
+            FROM ${ForecastHorizonArchiveStore.TABLE}
+            WHERE reference_key=? AND lead_hour=? AND target_ts BETWEEN ? AND ?
+              AND policy_version=?
+            ORDER BY ABS(target_ts-?) ASC, issued_at DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(
+                referenceKey, horizon.toString(),
+                (target - tolerance).toString(), (target + tolerance).toString(),
+                ForecastHorizonArchiveStore.POLICY_VERSION, target.toString()
+            )
+        ).use { c -> if (c.moveToFirst()) c.getDouble(0) else null }
+    }
+
+    private fun adaptiveAt(referenceKey: String, horizon: Int, target: Long): Double? {
+        val tolerance = 36L * 60L * 1000L
+        return db.readableDatabase.rawQuery(
+            """
+            SELECT adaptive_temperature
+            FROM ${ForecastAdaptiveStore.TABLE}
+            WHERE reference_key=? AND horizon_hour=? AND target_ts BETWEEN ? AND ?
+              AND model_version=?
+            ORDER BY ABS(target_ts-?) ASC, issued_at DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(
+                referenceKey, horizon.toString(),
+                (target - tolerance).toString(), (target + tolerance).toString(),
+                ForecastAdaptiveStore.MODEL_VERSION, target.toString()
+            )
+        ).use { c -> if (c.moveToFirst()) c.getDouble(0) else null }
+    }
+
+    private fun adaptiveHistorySamples(referenceKey: String, horizon: Int, target: Long): Int {
+        val tolerance = 36L * 60L * 1000L
+        return db.readableDatabase.rawQuery(
+            """
+            SELECT history_samples
+            FROM ${ForecastAdaptiveStore.TABLE}
+            WHERE reference_key=? AND horizon_hour=? AND target_ts BETWEEN ? AND ?
+              AND model_version=?
+            ORDER BY ABS(target_ts-?) ASC, issued_at DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(
+                referenceKey, horizon.toString(),
+                (target - tolerance).toString(), (target + tolerance).toString(),
+                ForecastAdaptiveStore.MODEL_VERSION, target.toString()
+            )
+        ).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+    }
+
+    private fun kinematics(center: Double?, previous: Double?, next: Double?): CurveKinematics? {
+        center ?: return null
         val slope = when {
-            previous != null && next != null -> (next.temperature - previous.temperature) / 2.0
-            next != null -> next.temperature - center.temperature
-            previous != null -> center.temperature - previous.temperature
+            previous != null && next != null -> (next - previous) / 2.0
+            next != null -> next - center
+            previous != null -> center - previous
             else -> null
         }?.coerceIn(-3.0, 3.0)
         val acceleration = if (previous != null && next != null)
-            (next.temperature - 2.0 * center.temperature + previous.temperature).coerceIn(-1.5, 1.5)
-        else null
-        return CurveKinematics(center.temperature, slope, acceleration)
+            (next - 2.0 * center + previous).coerceIn(-1.5, 1.5) else null
+        return CurveKinematics(center, slope, acceleration)
     }
+
+    private fun fixedWeatherKinematics(referenceKey: String, horizon: Int, target: Long): CurveKinematics? =
+        kinematics(
+            fixedWeatherAt(referenceKey, horizon, target),
+            fixedWeatherAt(referenceKey, horizon, target - HOUR_MS),
+            fixedWeatherAt(referenceKey, horizon, target + HOUR_MS)
+        )
+
+    private fun adaptiveKinematics(referenceKey: String, horizon: Int, target: Long): CurveKinematics? =
+        kinematics(
+            adaptiveAt(referenceKey, horizon, target),
+            adaptiveAt(referenceKey, horizon, target - HOUR_MS),
+            adaptiveAt(referenceKey, horizon, target + HOUR_MS)
+        )
 
     private fun terrainAt(referenceKey: String, target: Long): TerrainDialPoint? {
         fun query(source: String, tolerance: Long, measured: Boolean): TerrainDialPoint? =
             db.readableDatabase.rawQuery(
                 """
-                SELECT temperature
-                FROM weather_reference_samples
+                SELECT temperature FROM weather_reference_samples
                 WHERE reference_key=? AND source=? AND timestamp BETWEEN ? AND ?
-                ORDER BY ABS(timestamp-?) ASC
-                LIMIT 1
+                ORDER BY ABS(timestamp-?) ASC LIMIT 1
                 """.trimIndent(),
                 arrayOf(
                     referenceKey, source,
                     (target - tolerance).toString(), (target + tolerance).toString(), target.toString()
                 )
             ).use { c -> if (c.moveToFirst()) TerrainDialPoint(c.getDouble(0), measured) else null }
-
         return query("measured", 36L * 60L * 1000L, true)
             ?: query("reconstructed", 75L * 60L * 1000L, false)
     }
@@ -364,219 +492,6 @@ private class ForecastDialDataSource(
         val next = terrainAt(referenceKey, target + HOUR_MS)?.temperature ?: return null
         return (next - 2.0 * center + previous).coerceIn(-1.5, 1.5)
     }
-
-    /** Pick the snapshot that was closest to a genuine H+1 prediction for this target. */
-    private fun bestOneHourForecast(referenceKey: String, target: Long, now: Long): ArchivedForecast? {
-        val maxIssue = min(now, target - 5L * 60L * 1000L)
-        val minIssue = target - 3L * HOUR_MS
-        if (maxIssue <= minIssue) return null
-        return db.readableDatabase.rawQuery(
-            """
-            SELECT issued_at, target_ts, temperature, humidity, confidence
-            FROM ${ForecastMemoryStore.TABLE}
-            WHERE reference_key=?
-              AND target_ts BETWEEN ? AND ?
-              AND issued_at BETWEEN ? AND ?
-            ORDER BY ABS((target_ts-issued_at)-?) ASC, issued_at DESC
-            LIMIT 1
-            """.trimIndent(),
-            arrayOf(
-                referenceKey,
-                (target - 12L * 60L * 1000L).toString(),
-                (target + 12L * 60L * 1000L).toString(),
-                minIssue.toString(),
-                maxIssue.toString(),
-                HOUR_MS.toString()
-            )
-        ).use { c ->
-            if (!c.moveToFirst()) null
-            else ArchivedForecast(
-                issuedAt = c.getLong(0),
-                targetTs = c.getLong(1),
-                temperature = c.getDouble(2),
-                humidity = if (c.isNull(3)) 50.0 else c.getDouble(3),
-                confidence = if (c.isNull(4)) 0.65 else c.getDouble(4)
-            )
-        }
-    }
-
-    private fun forecastAtSameIssue(referenceKey: String, target: Long, issue: Long): ArchivedForecast? {
-        val issueWindow = 3L * 60L * 1000L
-        return db.readableDatabase.rawQuery(
-            """
-            SELECT issued_at, target_ts, temperature, humidity, confidence
-            FROM ${ForecastMemoryStore.TABLE}
-            WHERE reference_key=?
-              AND target_ts BETWEEN ? AND ?
-              AND issued_at BETWEEN ? AND ?
-            ORDER BY ABS(target_ts-?) ASC, ABS(issued_at-?) ASC
-            LIMIT 1
-            """.trimIndent(),
-            arrayOf(
-                referenceKey,
-                (target - 12L * 60L * 1000L).toString(),
-                (target + 12L * 60L * 1000L).toString(),
-                (issue - issueWindow).toString(),
-                (issue + issueWindow).toString(),
-                target.toString(),
-                issue.toString()
-            )
-        ).use { c ->
-            if (!c.moveToFirst()) null
-            else ArchivedForecast(
-                c.getLong(0), c.getLong(1), c.getDouble(2),
-                if (c.isNull(3)) 50.0 else c.getDouble(3),
-                if (c.isNull(4)) 0.65 else c.getDouble(4)
-            )
-        }
-    }
-
-    private fun forecastSlope(referenceKey: String, center: ArchivedForecast): Double? {
-        val previous = forecastAtSameIssue(referenceKey, center.targetTs - HOUR_MS, center.issuedAt)
-        val next = forecastAtSameIssue(referenceKey, center.targetTs + HOUR_MS, center.issuedAt)
-        return when {
-            previous != null && next != null -> (next.temperature - previous.temperature) / 2.0
-            next != null -> next.temperature - center.temperature
-            previous != null -> center.temperature - previous.temperature
-            else -> null
-        }?.coerceIn(-3.0, 3.0)
-    }
-
-    private fun forecastAcceleration(referenceKey: String, center: ArchivedForecast): Double? {
-        val previous = forecastAtSameIssue(referenceKey, center.targetTs - HOUR_MS, center.issuedAt) ?: return null
-        val next = forecastAtSameIssue(referenceKey, center.targetTs + HOUR_MS, center.issuedAt) ?: return null
-        return (next.temperature - 2.0 * center.temperature + previous.temperature).coerceIn(-1.5, 1.5)
-    }
-
-    /** Green is real only: reconstructed weather is deliberately not accepted here. */
-    private fun measuredAt(referenceKey: String, target: Long): Double? {
-        val tolerance = 36L * 60L * 1000L
-        return db.readableDatabase.rawQuery(
-            """
-            SELECT temperature
-            FROM weather_reference_samples
-            WHERE reference_key=?
-              AND source='measured'
-              AND timestamp BETWEEN ? AND ?
-            ORDER BY ABS(timestamp-?) ASC
-            LIMIT 1
-            """.trimIndent(),
-            arrayOf(
-                referenceKey,
-                (target - tolerance).toString(),
-                (target + tolerance).toString(),
-                target.toString()
-            )
-        ).use { c -> if (c.moveToFirst()) c.getDouble(0) else null }
-    }
-
-    private fun measuredSlope(referenceKey: String, target: Long): Double? {
-        val center = measuredAt(referenceKey, target) ?: return null
-        val previous = measuredAt(referenceKey, target - HOUR_MS)
-        val next = measuredAt(referenceKey, target + HOUR_MS)
-        return when {
-            previous != null && next != null -> (next - previous) / 2.0
-            next != null -> next - center
-            previous != null -> center - previous
-            else -> null
-        }?.coerceIn(-3.0, 3.0)
-    }
-
-    private fun measuredAcceleration(referenceKey: String, target: Long): Double? {
-        val center = measuredAt(referenceKey, target) ?: return null
-        val previous = measuredAt(referenceKey, target - HOUR_MS) ?: return null
-        val next = measuredAt(referenceKey, target + HOUR_MS) ?: return null
-        return (next - 2.0 * center + previous).coerceIn(-1.5, 1.5)
-    }
-
-    /**
-     * 24 h short-memory residual learner. For a historical dial the cutoff is the original
-     * forecast issue time, so observations that were still in the future cannot leak into
-     * its yellow estimate.
-     */
-    private fun residualModel(referenceKey: String, asOf: Long): ResidualModel {
-        val from = asOf - 24L * HOUR_MS
-        val candidates = mutableListOf<ArchivedForecast>()
-        db.readableDatabase.rawQuery(
-            """
-            SELECT issued_at, target_ts, temperature, humidity, confidence
-            FROM ${ForecastMemoryStore.TABLE}
-            WHERE reference_key=?
-              AND target_ts BETWEEN ? AND ?
-              AND issued_at < target_ts - 300000
-              AND target_ts-issued_at BETWEEN 1200000 AND 10800000
-            ORDER BY target_ts, issued_at
-            """.trimIndent(),
-            arrayOf(referenceKey, from.toString(), asOf.toString())
-        ).use { c ->
-            while (c.moveToNext()) {
-                candidates += ArchivedForecast(
-                    c.getLong(0), c.getLong(1), c.getDouble(2),
-                    if (c.isNull(3)) 50.0 else c.getDouble(3),
-                    if (c.isNull(4)) 0.65 else c.getDouble(4)
-                )
-            }
-        }
-        if (candidates.isEmpty()) return ResidualModel()
-
-        // One fair sample per target hour: keep the prediction closest to H+1.
-        val selected = candidates.groupBy { hourBucket(it.targetTs) }
-            .values
-            .mapNotNull { group -> group.minByOrNull { abs((it.targetTs - it.issuedAt) - HOUR_MS) } }
-            .sortedBy { it.targetTs }
-
-        val residuals = selected.mapNotNull { f ->
-            measuredAt(referenceKey, f.targetTs)?.let { actual -> ResidualPoint(f.targetTs, actual - f.temperature) }
-        }
-        if (residuals.isEmpty()) return ResidualModel()
-        if (residuals.size == 1) {
-            return ResidualModel(biasNow = residuals.first().residual.coerceIn(-4.0, 4.0), samples = 1)
-        }
-
-        // Exponentially favour recent errors while still allowing the full 24 h window to help.
-        var sw = 0.0
-        var sx = 0.0
-        var sy = 0.0
-        var sxx = 0.0
-        var sxy = 0.0
-        residuals.forEach { p ->
-            val x = (p.targetTs - asOf).toDouble() / HOUR_MS.toDouble()
-            val w = exp(x / 6.0).coerceAtLeast(0.01)
-            sw += w
-            sx += w * x
-            sy += w * p.residual
-            sxx += w * x * x
-            sxy += w * x * p.residual
-        }
-        val denom = sw * sxx - sx * sx
-        val slope = if (abs(denom) > 1e-9) ((sw * sxy - sx * sy) / denom).coerceIn(-1.2, 1.2) else 0.0
-        val bias = if (sw > 0.0) ((sy - slope * sx) / sw).coerceIn(-4.0, 4.0) else 0.0
-
-        val accelerations = residuals.zipWithNext().zipWithNext().mapNotNull { (leftPair, rightPair) ->
-            val (a, b) = leftPair
-            val (_, c) = rightPair
-            val dt1 = (b.targetTs - a.targetTs).toDouble() / HOUR_MS.toDouble()
-            val dt2 = (c.targetTs - b.targetTs).toDouble() / HOUR_MS.toDouble()
-            if (dt1 !in 0.5..2.0 || dt2 !in 0.5..2.0) return@mapNotNull null
-            val s1 = (b.residual - a.residual) / dt1
-            val s2 = (c.residual - b.residual) / dt2
-            val dt = (dt1 + dt2) / 2.0
-            ((s2 - s1) / dt).coerceIn(-1.5, 1.5) to c.targetTs
-        }
-        var accel = 0.0
-        if (accelerations.isNotEmpty()) {
-            var aw = 0.0
-            var av = 0.0
-            accelerations.forEach { (value, ts) ->
-                val x = (ts - asOf).toDouble() / HOUR_MS.toDouble()
-                val w = exp(x / 4.0).coerceAtLeast(0.01)
-                aw += w
-                av += w * value
-            }
-            if (aw > 0.0) accel = (av / aw).coerceIn(-0.8, 0.8)
-        }
-        return ResidualModel(bias, slope, accel, residuals.size)
-    }
 }
 
 private class ForecastDialStripView(
@@ -585,7 +500,7 @@ private class ForecastDialStripView(
 ) : View(context) {
     companion object {
         const val TAG = "fabdata_forecast_tangent_dials"
-        private const val PREFS = "fabdata_forecast_dial_overlay"
+        private const val PREFS = DIAL_PREFS
         private const val KEY_X = "x_fraction"
         private const val KEY_Y = "y_fraction"
         private const val KEY_WIDTH_DP = "width_dp"
@@ -613,6 +528,7 @@ private class ForecastDialStripView(
     private var downRawY = 0f
     private var moved = false
     private var lastTapUp = 0L
+    private var downEventTime = 0L
 
     private val refresh = object : Runnable {
         override fun run() {
@@ -680,6 +596,7 @@ private class ForecastDialStripView(
                 downRawX = event.rawX
                 downRawY = event.rawY
                 moved = false
+                downEventTime = event.eventTime
                 startX = x
                 startY = y
                 startWidth = width
@@ -715,7 +632,11 @@ private class ForecastDialStripView(
                 parentView.requestDisallowInterceptTouchEvent(false)
                 if (!moved && !resizing) {
                     val now = event.eventTime
-                    if (lastTapUp > 0L && now - lastTapUp <= 340L) {
+                    val heldMs = now - downEventTime
+                    if (heldMs >= 650L) {
+                        lastTapUp = 0L
+                        showMonitoringDialog()
+                    } else if (lastTapUp > 0L && now - lastTapUp <= 340L) {
                         lastTapUp = 0L
                         toggleCompact(parentView)
                     } else {
@@ -744,6 +665,56 @@ private class ForecastDialStripView(
     override fun performClick(): Boolean {
         super.performClick()
         return true
+    }
+
+    private fun showMonitoringDialog() {
+        val prefs = context.getSharedPreferences(DIAL_PREFS, Context.MODE_PRIVATE)
+        val weatherHorizons = (1..48).toList()
+        val adaptiveHorizons = FORECAST_ADAPTIVE_HORIZONS.toList()
+
+        fun label(text: String) = TextView(context).apply {
+            this.text = text
+            textSize = 14f
+            setPadding(dp(4f).toInt(), dp(8f).toInt(), dp(4f).toInt(), dp(4f).toInt())
+        }
+        val weatherSpinner = Spinner(context).apply {
+            adapter = ArrayAdapter(
+                context, android.R.layout.simple_spinner_dropdown_item,
+                weatherHorizons.map { "Météo fixe H+$it" }
+            )
+            val selected = prefs.getInt(DIAL_WEATHER_HORIZON_KEY, 24).coerceIn(1, 48)
+            setSelection(weatherHorizons.indexOf(selected).coerceAtLeast(0))
+        }
+        val adaptiveSpinner = Spinner(context).apply {
+            adapter = ArrayAdapter(
+                context, android.R.layout.simple_spinner_dropdown_item,
+                adaptiveHorizons.map { "Fab adaptative H+$it" }
+            )
+            val selected = prefs.getInt(DIAL_ADAPTIVE_HORIZON_KEY, 24)
+            setSelection(adaptiveHorizons.indexOf(selected).takeIf { it >= 0 } ?: adaptiveHorizons.indexOf(24))
+        }
+        val panel = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = dp(18f).toInt()
+            setPadding(pad, dp(4f).toInt(), pad, dp(4f).toInt())
+            addView(label("Prévision météo monitorée"))
+            addView(weatherSpinner)
+            addView(label("Prévision Fab adaptative monitorée"))
+            addView(adaptiveSpinner)
+        }
+        AlertDialog.Builder(context)
+            .setTitle("Monitoring des cadrans")
+            .setView(panel)
+            .setPositiveButton("Enregistrer") { _, _ ->
+                prefs.edit()
+                    .putInt(DIAL_WEATHER_HORIZON_KEY, weatherHorizons[weatherSpinner.selectedItemPosition])
+                    .putInt(DIAL_ADAPTIVE_HORIZON_KEY, adaptiveHorizons[adaptiveSpinner.selectedItemPosition])
+                    .apply()
+                removeCallbacks(refresh)
+                post(refresh)
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
     }
 
     private fun toggleCompact(root: ViewGroup) {
@@ -807,7 +778,7 @@ private class ForecastDialStripView(
         paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, 55)
         canvas.drawRoundRect(dp(0.5f), dp(0.5f), width - dp(0.5f), height - dp(0.5f), dp(16f), dp(16f), paint)
 
-        drawLegend(canvas, night, current?.referenceLabel ?: "Prévision locale")
+        drawLegend(canvas, night, current)
         val dials = current?.samples ?: listOf(
             emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
         )
@@ -868,13 +839,14 @@ private class ForecastDialStripView(
         paint.strokeCap = Paint.Cap.BUTT
     }
 
-    private fun drawLegend(canvas: Canvas, night: Boolean, reference: String) {
+    private fun drawLegend(canvas: Canvas, night: Boolean, current: DialState?) {
         val textColor = if (night) Color.WHITE else Color.rgb(40, 40, 40)
         paint.style = Paint.Style.FILL
         paint.color = textColor
         paint.textSize = sp(10f)
         paint.isFakeBoldText = true
-        canvas.drawText("Tangentes · $reference", dp(10f), dp(14f), paint)
+        val monitor = current?.let { "M H+${it.weatherHorizon} / Fab H+${it.adaptiveHorizon}" } ?: "M H+24 / Fab H+24"
+        canvas.drawText("Tangentes · $monitor", dp(10f), dp(14f), paint)
         paint.isFakeBoldText = false
         paint.textSize = sp(8.5f)
         val y = dp(25f)

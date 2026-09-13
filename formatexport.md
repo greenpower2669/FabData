@@ -121,3 +121,7 @@ Procédure recommandée :
 4. utiliser **Importer CSV** ;
 5. sélectionner le fichier de sauvegarde ;
 6. FabData restaure les mesures, pièces, couleurs et événements en évitant les doublons.
+
+## Format v5 — personnalisation et créneaux météo 10 min
+
+Le format v5 ajoute des lignes `UI_PREFERENCES` pour les personnalisations visuelles non sensibles (courbes, effets/animations, visibilité, navigation et cadrans) ainsi qu’un `captureSlot10m` logique pour les archives de prévision. Le timestamp `issuedAt` réel n’est jamais réécrit. Les imports v1, v2, v3 et v4 restent acceptés.
