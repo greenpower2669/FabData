@@ -1,4 +1,4 @@
-name: Build v0.23.5 priority reload buffer
+name: Build v0.23.6 import priority arbitration
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     branches:
       - 'feature/forecast-fixed-lead-h24'
     paths:
-      - 'tools/patch_v0235_priority_reload_buffer.py'
+      - 'tools/patch_v0236_import_priority.py'
       - '.github/workflows/build-v0234-startup-help-dials.yml'
 
 permissions:
@@ -24,28 +24,22 @@ jobs:
           fetch-depth: 0
 
       - name: Validate patch
-        run: python3 -m py_compile tools/patch_v0235_priority_reload_buffer.py
+        run: python3 -m py_compile tools/patch_v0236_import_priority.py
 
-      - name: Repair patch target
-        run: sed -i 's/fun requestTemporalPage/val visualReference/g' tools/patch_v0235_priority_reload_buffer.py
-
-      - name: Apply v0.23.5 patch
-        run: python3 tools/patch_v0235_priority_reload_buffer.py
+      - name: Apply v0.23.6 patch
+        run: python3 tools/patch_v0236_import_priority.py
 
       - name: Regression guards
         run: |
           git diff --check
-          grep -n 'versionName = "0.23.5"' app/build.gradle.kts
-          grep -n 'enum class UiReloadPriority' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'snapshotFlow { reloadRequestGeneration }' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n '\.conflate()' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'queueUiReload(UiReloadPriority.CRITICAL)' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'queueUiReload(UiReloadPriority.DATA)' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'queueUiReload(UiReloadPriority.NAVIGATION)' app/src/main/java/com/fabdata/app/MainActivity.kt
-          if grep -n 'LaunchedEffect(reloadToken, preset, windowCenterTimestamp' app/src/main/java/com/fabdata/app/MainActivity.kt; then
-            echo 'Old cancellation-prone keyed reload effect still present' >&2
-            exit 1
-          fi
+          grep -n 'versionName = "0.23.6"' app/build.gradle.kts
+          grep -n 'object FabDataWorkArbiter' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
+          grep -n 'fun requestYieldForImport' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
+          grep -n 'title = "Importation prioritaire"' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'FabDataWorkArbiter.withCriticalImport' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'FabDataWorkArbiter.criticalImportPending' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'FabDataWorkArbiter.withDataProducer producer@' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'Import prioritaire en cours · actualisation météo reportée' app/src/main/java/com/fabdata/app/ThermalUi.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -71,23 +65,27 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Normalize APK filename
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.5-release-priority-buffer.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.6-release-import-priority.apk
 
       - name: Commit validated source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/MainActivity.kt
+          git add app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/MainActivity.kt \
+            app/src/main/java/com/fabdata/app/FabOperationRegistry.kt \
+            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
+            app/src/main/java/com/fabdata/app/ThermalUi.kt
           if git diff --cached --quiet; then
-            echo "v0.23.5 source already committed"
+            echo "v0.23.6 source already committed"
           else
-            git commit -m "Serialize UI refreshes with priority buffer [skip ci]"
+            git commit -m "Prioritize imports over weather and display work [skip ci]"
             git push origin HEAD:feature/forecast-fixed-lead-h24
           fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.23.5-release-priority-buffer
-          path: app/build/outputs/apk/debug/FabData-v0.23.5-release-priority-buffer.apk
+          name: FabData-v0.23.6-release-import-priority
+          path: app/build/outputs/apk/debug/FabData-v0.23.6-release-import-priority.apk
           if-no-files-found: error
