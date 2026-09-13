@@ -14,6 +14,7 @@ on:
       - 'app/src/main/java/com/fabdata/app/UiPreferenceStore.kt'
       - 'app/src/main/java/com/fabdata/app/MainActivity.kt'
       - 'tools/fix_v0231_forecast_persistence.py'
+      - 'tools/fix_v0231_compile_hotfix.py'
       - '.github/workflows/build-v0231-forecast-persistence.yml'
 
 permissions:
@@ -30,11 +31,15 @@ jobs:
           ref: feature/forecast-fixed-lead-h24
           fetch-depth: 0
 
-      - name: Validate patch
-        run: python3 -m py_compile tools/fix_v0231_forecast_persistence.py
+      - name: Validate patches
+        run: |
+          python3 -m py_compile tools/fix_v0231_forecast_persistence.py
+          python3 -m py_compile tools/fix_v0231_compile_hotfix.py
 
       - name: Apply v0.23.1 fixes
-        run: python3 tools/fix_v0231_forecast_persistence.py
+        run: |
+          python3 tools/fix_v0231_forecast_persistence.py
+          python3 tools/fix_v0231_compile_hotfix.py
 
       - name: Regression guard
         run: |
@@ -56,6 +61,7 @@ jobs:
           grep -n 'explorationOverviewRange()' app/src/main/java/com/fabdata/app/UiPreferenceStore.kt
           grep -n 'sensor_keys' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'Dernières valeurs connues · actualisation impossible' app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt
+          grep -n 'lineSequence().firstOrNull().orEmpty().trim().take(220)' app/src/main/java/com/fabdata/app/ForecastAdaptiveUi.kt
           grep -n 'KEY_COMPACT' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           grep -n 'KEY_WIDTH_DP' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           grep -n 'curveTemperature(sensor.stableKey)' app/src/main/java/com/fabdata/app/MainActivity.kt
