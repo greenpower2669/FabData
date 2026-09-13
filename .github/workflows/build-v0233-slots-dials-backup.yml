@@ -1,0 +1,104 @@
+name: Build v0.23.3 slots dials backup
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feature/forecast-fixed-lead-h24'
+    paths:
+      - 'tools/patch_v0233_slots_dials_backup.py'
+      - '.github/workflows/build-v0233-slots-dials-backup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: feature/forecast-fixed-lead-h24
+          fetch-depth: 0
+
+      - name: Validate patch
+        run: python3 -m py_compile tools/patch_v0233_slots_dials_backup.py
+
+      - name: Apply v0.23.3 patch
+        run: python3 tools/patch_v0233_slots_dials_backup.py
+
+      - name: Regression guards
+        run: |
+          git diff --check
+          grep -n 'versionName = "0.23.3"' app/build.gradle.kts
+          grep -n 'const val FORMAT_VERSION = "5"' app/src/main/java/com/fabdata/app/BackupLayer.kt
+          grep -n 'setOf("1", "2", "3", "4", FORMAT_VERSION)' app/src/main/java/com/fabdata/app/BackupLayer.kt
+          grep -n 'fileVersion in setOf("4", FORMAT_VERSION)' app/src/main/java/com/fabdata/app/BackupLayer.kt
+          grep -n 'capture_slot_10m' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'trg_fabdata_forecast_memory_insert_v2' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'currentForecastSlotCaptured' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'captureSlot10m(now) + LIVE_FORECAST_INTERVAL_MS' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'DIAL_WEATHER_HORIZON_KEY' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'DIAL_ADAPTIVE_HORIZON_KEY' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'Monitoring des cadrans' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'UI_PREFERENCES' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -n 'captureSlot10m' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -n 'fabdata_forecast_dial_overlay' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          if grep -n 'MeteoFranceCredentialStore' app/src/main/java/com/fabdata/app/BackupV3Support.kt | grep -E 'writePersonalization|UI_PREFERENCES'; then
+            echo 'Credentials must never enter UI personalization backup' >&2
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Compile Kotlin
+        run: gradle --no-daemon :app:compileDebugKotlin
+
+      - name: Build APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Normalize APK filename
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk \
+             app/build/outputs/apk/debug/FabData-v0.23.3-release-slots-dials-backup.apk
+
+      - name: Commit validated source
+        run: |
+          if git diff --quiet; then
+            echo "v0.23.3 source already committed"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add app/build.gradle.kts \
+                    app/src/main/java/com/fabdata/app/BackupLayer.kt \
+                    app/src/main/java/com/fabdata/app/BackupV3Support.kt \
+                    app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
+                    app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
+                    formatexport.md
+            git commit -m "Add fixed forecast slots, persistent dial monitoring and UI backup [skip ci]"
+            git push origin HEAD:feature/forecast-fixed-lead-h24
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.23.3-release-slots-dials-backup
+          path: app/build/outputs/apk/debug/FabData-v0.23.3-release-slots-dials-backup.apk
+          if-no-files-found: error
