@@ -48,6 +48,9 @@ class UiPreferenceStore(context: Context) {
     fun forecastArchiveExpanded(): Boolean = prefs.getBoolean("forecast_archive_expanded", false)
     fun saveForecastArchiveExpanded(value: Boolean) { prefs.edit().putBoolean("forecast_archive_expanded", value).apply() }
 
+    fun adaptiveForecastExpanded(): Boolean = prefs.getBoolean("adaptive_forecast_expanded", false)
+    fun saveAdaptiveForecastExpanded(value: Boolean) { prefs.edit().putBoolean("adaptive_forecast_expanded", value).apply() }
+
     fun bandChooserOpen(): Boolean = prefs.getBoolean("band_chooser_open", false)
     fun saveBandChooserOpen(value: Boolean) { prefs.edit().putBoolean("band_chooser_open", value).apply() }
 

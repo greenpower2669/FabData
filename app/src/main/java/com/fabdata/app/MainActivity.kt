@@ -391,7 +391,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             put(FORECAST_RECONSTRUCTED_SENSOR_ID, curveStyleStore.load("forecast:reconstructed"))
             put(FORECAST_FAB_SENSOR_ID, curveStyleStore.load("forecast:fab"))
             put(FORECAST_ACTIVE_SENSOR_ID, curveStyleStore.load("forecast:active"))
-            FORECAST_HORIZON_HOURS.filter { it < 24 }.forEach { lead ->
+            FORECAST_HORIZON_HOURS.filter { it != 24 }.forEach { lead ->
                 put(forecastHorizonSensorId(lead), curveStyleStore.load("forecast:weather:h$lead"))
             }
             FORECAST_ADAPTIVE_HORIZONS.forEach { lead ->
@@ -806,8 +806,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         // v0.19.7: on montre la surface/sol inertiel sur la période MEASURED uniquement.
         // La masse énergétique profonde reste cachée et n'est jamais branchée au graphe.
         if (!showTemp.containsKey(FORECAST_RECONSTRUCTED_SENSOR_ID)) showTemp[FORECAST_RECONSTRUCTED_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_RECONSTRUCTED_STABLE_KEY) ?: true
-        if (!showTemp.containsKey(FORECAST_FAB_SENSOR_ID)) showTemp[FORECAST_FAB_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_FAB_STABLE_KEY) ?: true
-        if (!showTemp.containsKey(FORECAST_ACTIVE_SENSOR_ID)) showTemp[FORECAST_ACTIVE_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_ACTIVE_STABLE_KEY) ?: true
+        if (!showTemp.containsKey(FORECAST_FAB_SENSOR_ID)) showTemp[FORECAST_FAB_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_FAB_STABLE_KEY) ?: false
+        if (!showTemp.containsKey(FORECAST_ACTIVE_SENSOR_ID)) showTemp[FORECAST_ACTIVE_SENSOR_ID] = uiPrefs.curveTemperature(FORECAST_ACTIVE_STABLE_KEY) ?: false
         FORECAST_HORIZON_HOURS.filter { it < 24 }.forEach { lead ->
             val id = forecastHorizonSensorId(lead)
             val stableKey = "forecast-weather-h$lead"
@@ -816,7 +816,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
         FORECAST_ADAPTIVE_HORIZONS.forEach { lead ->
             val id = forecastAdaptiveSensorId(lead)
-            if (!showTemp.containsKey(id)) showTemp[id] = uiPrefs.curveTemperature(forecastAdaptiveStableKey(lead)) ?: false
+            val defaultVisible = lead == 24
+            if (!showTemp.containsKey(id)) {
+                showTemp[id] = uiPrefs.curveTemperature(forecastAdaptiveStableKey(lead)) ?: defaultVisible
+            }
             showHumidity[id] = false
         }
         showHumidity[FORECAST_RECONSTRUCTED_SENSOR_ID] = false
@@ -857,7 +860,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             forecastHorizonCurves = ForecastHorizonCurveSet.EMPTY
         } else {
             val now = System.currentTimeMillis()
-            val queryTo = maxOf(history.last, now + 24L * 60L * 60L * 1000L)
+            val queryTo = maxOf(history.last, now + FORECAST_DISPLAY_FUTURE_MS + 60L * 60L * 1000L)
             val curves = withContext(Dispatchers.IO) {
                 // API H+24 stays a best-effort historical backfill. Local snapshots are the
                 // durable source for H+1..H+24 and for the Météo-France-like gliding curve.
@@ -879,7 +882,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val forecastReconstructedSamples = selectableForecastCurves.reconstructed
     val forecastFabSamples = selectableForecastCurves.fab
     val forecastActiveSamples = forecastHorizonCurves.activeWeather
-    val forecastHorizonSamples = forecastHorizonCurves.weatherByLead.filterKeys { it < 24 }
+    val forecastHorizonSamples = forecastHorizonCurves.weatherByLead.filterKeys { it != 24 }
     var adaptiveForecastCurves by remember(visualReference.key) { mutableStateOf(ForecastAdaptiveCurveSet.EMPTY) }
     LaunchedEffect(reloadToken, visualReference.key, globalBounds?.first, globalBounds?.last) {
         val history = globalBounds
@@ -891,7 +894,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 ForecastAdaptiveEngine(db).queryCurves(
                     visualReference.key,
                     history.first,
-                    maxOf(history.last, now + 25L * 60L * 60L * 1000L),
+                    maxOf(history.last, now + FORECAST_DISPLAY_FUTURE_MS + 60L * 60L * 1000L),
                     now
                 )
             }
@@ -935,7 +938,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         "Dernière prévision disponible par échéance · archive glissante",
         12, forecastActiveSamples.lastOrNull()?.timestamp
     )
-    val forecastHorizonSensors = FORECAST_HORIZON_HOURS.filter { it < 24 }.map { lead ->
+    val forecastHorizonSensors = FORECAST_HORIZON_HOURS.filter { it != 24 }.map { lead ->
         val points = forecastHorizonSamples[lead].orEmpty()
         Sensor(
             forecastHorizonSensorId(lead), "forecast-weather-h$lead",
@@ -952,7 +955,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             forecastAdaptiveSensorId(lead), forecastAdaptiveStableKey(lead),
             "Prévision Fab adaptative H+$lead",
             "Tangente + changement de régime · archive causale H+$lead",
-            listOf(10, 5, 13, 8)[index], points.lastOrNull()?.timestamp
+            listOf(10, 5, 13, 8, 6)[index], points.lastOrNull()?.timestamp
         )
     }
     val forecastHorizonSampleMap = forecastHorizonSamples.mapKeys { (lead, _) -> forecastHorizonSensorId(lead) }
@@ -2021,27 +2024,38 @@ private fun SeriesSelector(
 ) {
     val context = LocalContext.current
     val uiPrefs = remember(context) { UiPreferenceStore(context) }
-    var archiveExpanded by rememberSaveable { mutableStateOf(uiPrefs.forecastArchiveExpanded()) }
-    val archiveSensors = sensors
-        .filter { sensor -> forecastHorizonLeadForSensorId(sensor.id)?.let { it in 1..23 } == true }
-        .sortedBy { forecastHorizonLeadForSensorId(it.id) ?: Int.MAX_VALUE }
-    val archiveIds = archiveSensors.map { it.id }.toSet()
-    val mainSensors = sensors.filterNot { it.id in archiveIds }
+    var weatherExpanded by rememberSaveable { mutableStateOf(uiPrefs.forecastArchiveExpanded()) }
+    var adaptiveExpanded by rememberSaveable { mutableStateOf(uiPrefs.adaptiveForecastExpanded()) }
 
-    LaunchedEffect(archiveExpanded) { uiPrefs.saveForecastArchiveExpanded(archiveExpanded) }
+    fun fixedWeatherLead(sensor: Sensor): Int? = when (sensor.id) {
+        FORECAST_RECONSTRUCTED_SENSOR_ID -> 24
+        else -> forecastHorizonLeadForSensorId(sensor.id)
+    }
+
+    val weatherForecastSensors = sensors
+        .filter { sensor -> sensor.id == FORECAST_ACTIVE_SENSOR_ID || fixedWeatherLead(sensor) != null }
+        .sortedWith(compareBy<Sensor> { if (it.id == FORECAST_ACTIVE_SENSOR_ID) -1 else fixedWeatherLead(it) ?: Int.MAX_VALUE })
+    val adaptiveForecastSensors = sensors
+        .filter { sensor -> sensor.id == FORECAST_FAB_SENSOR_ID || isAdaptiveForecastSensorId(sensor.id) }
+        .sortedWith(compareBy<Sensor> { if (it.id == FORECAST_FAB_SENSOR_ID) -1 else forecastAdaptiveLeadForSensorId(it.id) ?: Int.MAX_VALUE })
+    val groupedIds = (weatherForecastSensors + adaptiveForecastSensors).map { it.id }.toSet()
+    val mainSensors = sensors.filterNot { it.id in groupedIds }
+
+    LaunchedEffect(weatherExpanded) { uiPrefs.saveForecastArchiveExpanded(weatherExpanded) }
+    LaunchedEffect(adaptiveExpanded) { uiPrefs.saveAdaptiveForecastExpanded(adaptiveExpanded) }
 
     Card(shape = RoundedCornerShape(20.dp)) {
         Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Superposition", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "Chaque courbe est indépendante. Les horizons H+1 à H+23 restent rangés dans Archives météo.",
+                "Les prévisions météo et Fab sont rangées en groupes repliables. Par défaut, seules H+24 météo et H+24 adaptative sont affichées.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             @Composable
             fun SensorRow(sensor: Sensor) {
-                val lead = forecastHorizonLeadForSensorId(sensor.id)
+                val lead = fixedWeatherLead(sensor)
                 val adaptiveLead = forecastAdaptiveLeadForSensorId(sensor.id)
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Box(
@@ -2055,7 +2069,7 @@ private fun SeriesSelector(
                             LYON_RECONSTRUCTED_SENSOR_ID -> "Référence terrain · réel > reconstruit"
                             FORECAST_RECONSTRUCTED_SENSOR_ID -> "Prévision météo H+24 fixe"
                             FORECAST_FAB_SENSOR_ID -> "Prévision Fab H+24"
-                            FORECAST_ACTIVE_SENSOR_ID -> "Prévision météo active · dernière disponible"
+                            FORECAST_ACTIVE_SENSOR_ID -> "Prévision météo active · jusqu’à H+48"
                             THERMAL_INERTIA_SENSOR_ID -> "Sol inertiel estimé · expérimental"
                             else -> adaptiveLead?.let { "Prévision Fab adaptative H+$it" }
                                 ?: lead?.let { "Prévision météo H+$it" }
@@ -2126,37 +2140,46 @@ private fun SeriesSelector(
 
             mainSensors.forEach { sensor -> SensorRow(sensor) }
 
-            if (archiveSensors.isNotEmpty()) {
+            fun setGroupVisible(group: List<Sensor>, visible: Boolean) {
+                group.forEach { sensor ->
+                    showTemp[sensor.id] = visible
+                    uiPrefs.saveCurveTemperature(sensor.stableKey, visible)
+                }
+            }
+
+            if (weatherForecastSensors.isNotEmpty()) {
                 HorizontalDivider()
-                val visibleCount = archiveSensors.count { showTemp[it.id] == true }
-                OutlinedButton(
-                    onClick = { archiveExpanded = !archiveExpanded },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
+                val visibleCount = weatherForecastSensors.count { showTemp[it.id] == true }
+                OutlinedButton(onClick = { weatherExpanded = !weatherExpanded }, modifier = Modifier.fillMaxWidth()) {
                     Text(
-                        "Archives météo H+1 → H+23 · $visibleCount/${archiveSensors.size} " +
-                            if (archiveExpanded) "▴" else "▾"
+                        "Prévisions météo · active + H+1 → H+48 · $visibleCount/${weatherForecastSensors.size} " +
+                            if (weatherExpanded) "▴" else "▾"
                     )
                 }
-                if (archiveExpanded) {
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        TextButton(onClick = {
-                            archiveSensors.forEach { sensor ->
-                                showTemp[sensor.id] = true
-                                uiPrefs.saveCurveTemperature(sensor.stableKey, true)
-                            }
-                        }) { Text("Tout afficher") }
-                        TextButton(onClick = {
-                            archiveSensors.forEach { sensor ->
-                                showTemp[sensor.id] = false
-                                uiPrefs.saveCurveTemperature(sensor.stableKey, false)
-                            }
-                        }) { Text("Tout masquer") }
+                if (weatherExpanded) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { setGroupVisible(weatherForecastSensors, true) }) { Text("Tout afficher") }
+                        TextButton(onClick = { setGroupVisible(weatherForecastSensors, false) }) { Text("Tout masquer") }
                     }
-                    archiveSensors.forEach { sensor -> SensorRow(sensor) }
+                    weatherForecastSensors.forEach { sensor -> SensorRow(sensor) }
+                }
+            }
+
+            if (adaptiveForecastSensors.isNotEmpty()) {
+                HorizontalDivider()
+                val visibleCount = adaptiveForecastSensors.count { showTemp[it.id] == true }
+                OutlinedButton(onClick = { adaptiveExpanded = !adaptiveExpanded }, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "Prévisions Fab · adaptatives jusqu’à H+48 · $visibleCount/${adaptiveForecastSensors.size} " +
+                            if (adaptiveExpanded) "▴" else "▾"
+                    )
+                }
+                if (adaptiveExpanded) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        TextButton(onClick = { setGroupVisible(adaptiveForecastSensors, true) }) { Text("Tout afficher") }
+                        TextButton(onClick = { setGroupVisible(adaptiveForecastSensors, false) }) { Text("Tout masquer") }
+                    }
+                    adaptiveForecastSensors.forEach { sensor -> SensorRow(sensor) }
                 }
             }
         }
@@ -2431,7 +2454,10 @@ private fun HistoryOverviewCard(
                 }
                 val availableBandSensors = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
                     sensors.filter { sensor ->
-                        forecastHorizonLeadForSensorId(sensor.id) == null &&
+                        sensor.id != FORECAST_ACTIVE_SENSOR_ID &&
+                            sensor.id != FORECAST_RECONSTRUCTED_SENSOR_ID &&
+                            sensor.id != FORECAST_FAB_SENSOR_ID &&
+                            forecastHorizonLeadForSensorId(sensor.id) == null &&
                             forecastAdaptiveLeadForSensorId(sensor.id) == null && (
                             gigaSampleMap[sensor.id].orEmpty().isNotEmpty() ||
                                 navigatorSampleMap[sensor.id].orEmpty().isNotEmpty() ||

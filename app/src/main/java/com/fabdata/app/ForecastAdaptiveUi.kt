@@ -51,7 +51,7 @@ fun ForecastAdaptiveCard(
         ) {
             Text("Prévision Fab adaptative", fontWeight = FontWeight.Bold)
             Text(
-                "H+3 · H+6 · H+12 · H+24 · apprentissage causal + tangente + détection de changement de régime. Les cadrans restent sur le H+24 historique actuel.",
+                "H+3 · H+6 · H+12 · H+24 · H+48 · apprentissage causal + tangente + détection de changement de régime. Les cadrans restent sur le H+24 historique actuel.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

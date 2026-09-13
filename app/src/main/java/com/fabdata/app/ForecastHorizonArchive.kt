@@ -11,7 +11,7 @@ import kotlin.math.roundToInt
  *
  * Météo applications naturally replace an older H+24 value with fresher H+23...H+1 values.
  * FabData keeps that live/gliding view, but also freezes one representative snapshot for every
- * fixed lead H+1..H+24 so the old forecast is never lost and can later be compared with terrain.
+ * fixed lead H+1..H+48 so the old forecast is never lost and can later be compared with terrain.
  *
  * This layer is additive only: it never writes to weather_reference_samples and it never changes
  * the H+24 cockpit/dials. ForecastMemoryStore remains the raw source of truth.
@@ -20,7 +20,7 @@ const val FORECAST_ACTIVE_SENSOR_ID = -6902900110L
 const val FORECAST_ACTIVE_STABLE_KEY = "forecast-weather-active"
 private const val FORECAST_HORIZON_SENSOR_ID_BASE = -6902900200L
 private const val FORECAST_FAB_HORIZON_SENSOR_ID_BASE = -6902900300L
-val FORECAST_HORIZON_HOURS: IntRange = 1..24
+val FORECAST_HORIZON_HOURS: IntRange = 1..48
 
 fun forecastHorizonSensorId(leadHour: Int): Long {
     require(leadHour in FORECAST_HORIZON_HOURS)
@@ -148,7 +148,7 @@ class ForecastHorizonArchive(private val db: FabDataDb) {
         // Ensure a Fab-local value exists for every raw snapshot before we freeze its horizon.
         ForecastSelectableCurveStore(db).materializeLocalSnapshots(
             referenceKey = referenceKey,
-            from = from - 25L * HORIZON_HOUR_MS,
+            from = from - 49L * HORIZON_HOUR_MS,
             to = to,
             now = now
         )

@@ -57,7 +57,7 @@ class ForecastArchiveWorker(
         private const val UNIQUE_WORK = "fabdata-forecast-archive-hourly"
 
         fun schedule(context: Context) {
-            val request = PeriodicWorkRequestBuilder<ForecastArchiveWorker>(1, TimeUnit.HOURS)
+            val request = PeriodicWorkRequestBuilder<ForecastArchiveWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(
                     Constraints.Builder()
                         .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -67,7 +67,7 @@ class ForecastArchiveWorker(
 
             WorkManager.getInstance(context.applicationContext).enqueueUniquePeriodicWork(
                 UNIQUE_WORK,
-                ExistingPeriodicWorkPolicy.KEEP,
+                ExistingPeriodicWorkPolicy.UPDATE,
                 request
             )
         }

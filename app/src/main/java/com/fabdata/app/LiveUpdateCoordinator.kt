@@ -24,7 +24,7 @@ import kotlinx.coroutines.withContext
  * - uniquement quand l'app est réellement au premier plan ;
  * - ouverture / retour au focus : météo fraîche de la référence déjà sélectionnée, jamais de rescan ;
  * - le scan des stations proches vit uniquement dans l'écran Sondes proches / Auto protection ;
- * - ensuite toutes les 5 minutes tant que l'utilisateur regarde l'app ;
+ * - ensuite toutes les 10 minutes tant que l'utilisateur regarde l'app ;
  * - lorsqu'une vraie mesure intérieure change : météo fraîche puis futur avec le modèle figé ;
  * - un changement reçu en arrière-plan est seulement mémorisé, aucun calcul n'y est lancé ;
  * - ne réentraîne jamais le modèle et ne recalcule jamais le passé ;
@@ -174,7 +174,7 @@ fun FabLiveUpdateCoordinator(
         }
 
         while (true) {
-            delay(300_000L)
+            delay(600_000L)
             if (!foreground) break
             val hadPending = pendingMeasuredRefresh
             if (updateLive() && hadPending) {
