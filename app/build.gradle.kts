@@ -39,6 +39,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // APK de test parallèle : n'écrase pas l'installation FabData 0.22.0 actuelle.
+            applicationIdSuffix = ".importfix"
+            versionNameSuffix = "-importfix-test"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
