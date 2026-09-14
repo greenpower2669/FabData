@@ -370,11 +370,28 @@ private data class DialSample(
     val trainingSamples: Int
 )
 
+private data class DashboardCurvePoint(
+    val timestamp: Long,
+    val temperature: Double
+)
+
+private data class DashboardAdaptivePoint(
+    val horizonHour: Int,
+    val temperature: Double
+)
+
 private data class DialState(
     val referenceLabel: String,
     val weatherHorizon: Int,
     val adaptiveHorizon: Int,
-    val samples: List<DialSample>
+    val samples: List<DialSample>,
+    val weatherCurve: List<DashboardCurvePoint> = emptyList(),
+    val weatherNow: Double? = null,
+    val weatherPlus1: Double? = null,
+    val inertiaNow: Double? = null,
+    val inertiaPlus1: Double? = null,
+    val inertiaPlus2: Double? = null,
+    val adaptiveCurve: List<DashboardAdaptivePoint> = emptyList()
 )
 
 private class ForecastDialDataSource(
@@ -410,7 +427,85 @@ private class ForecastDialDataSource(
         val result = targets.map { (label, target) ->
             buildDial(reference.key, label, target, weatherHorizon, adaptiveHorizon)
         }
-        return DialState(reference.label, weatherHorizon, adaptiveHorizon, result)
+
+        // Dashboard is a pure reader. It reuses rows already present in SQLite and never
+        // invokes weatherReferenceManager, refreshRecent, a provider, or a capture slot.
+        val weatherCurve = dashboardWeatherCurve(reference.key, now)
+        val weatherNow = nearestDashboardTemperature(weatherCurve, now, 40L * 60L * 1000L)
+        val weatherPlus1 = nearestDashboardTemperature(weatherCurve, now + HOUR_MS, 40L * 60L * 1000L)
+        val inertia = dashboardInertia(reference, now)
+        val adaptiveCurve = FORECAST_ADAPTIVE_HORIZONS.mapNotNull { horizon ->
+            val target = hourBucket(now) + horizon.toLong() * HOUR_MS
+            adaptiveAt(reference.key, horizon, target)?.let {
+                DashboardAdaptivePoint(horizon, it)
+            }
+        }
+        return DialState(
+            reference.label, weatherHorizon, adaptiveHorizon, result,
+            weatherCurve = weatherCurve,
+            weatherNow = weatherNow,
+            weatherPlus1 = weatherPlus1,
+            inertiaNow = inertia.getOrNull(0),
+            inertiaPlus1 = inertia.getOrNull(1),
+            inertiaPlus2 = inertia.getOrNull(2),
+            adaptiveCurve = adaptiveCurve
+        )
+    }
+
+    private fun dashboardWeatherCurve(referenceKey: String, now: Long): List<DashboardCurvePoint> {
+        val from = now - HOUR_MS
+        val to = now + 2L * HOUR_MS
+        val byTimestamp = linkedMapOf<Long, Double>()
+        // Ordering intentionally makes MEASURED win over reconstructed, which wins over forecast
+        // if two sources share a timestamp. Future timestamps naturally keep the forecast row.
+        db.readableDatabase.rawQuery(
+            """
+            SELECT timestamp, temperature, source
+            FROM weather_reference_samples
+            WHERE reference_key=? AND timestamp BETWEEN ? AND ?
+            ORDER BY timestamp,
+                     CASE source WHEN 'forecast' THEN 0 WHEN 'reconstructed' THEN 1 WHEN 'measured' THEN 2 ELSE 0 END
+            """.trimIndent(),
+            arrayOf(referenceKey, from.toString(), to.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                val ts = c.getLong(0)
+                val temperature = c.getDouble(1)
+                if (temperature.isFinite()) byTimestamp[ts] = temperature
+            }
+        }
+        return byTimestamp.map { DashboardCurvePoint(it.key, it.value) }.sortedBy { it.timestamp }
+    }
+
+    private fun nearestDashboardTemperature(
+        points: List<DashboardCurvePoint>,
+        target: Long,
+        tolerance: Long
+    ): Double? = points.minByOrNull { abs(it.timestamp - target) }
+        ?.takeIf { abs(it.timestamp - target) <= tolerance }
+        ?.temperature
+
+    private fun dashboardInertia(reference: WeatherReference, now: Long): List<Double?> {
+        val model = ThermalTrainedModelStore(appContext).loadUsable(reference.key) ?: return listOf(null, null, null)
+        val estimate = runCatching {
+            ThermalInertiaEstimator(db, WeatherReferenceStore(db)).projectTrained(reference, model)
+        }.getOrNull() ?: return listOf(null, null, null)
+        val surface = estimate.surfacePoints.takeLast(4)
+        val last = surface.lastOrNull() ?: return listOf(null, null, null)
+        val previous = surface.dropLast(1).lastOrNull()
+        val slopePerHour = if (previous != null && last.timestamp > previous.timestamp) {
+            ((last.temperature - previous.temperature) /
+                ((last.timestamp - previous.timestamp).toDouble() / HOUR_MS.toDouble()))
+                .coerceIn(-0.60, 0.60)
+        } else 0.0
+        val ageHours = ((now - last.timestamp).coerceAtLeast(0L)).toDouble() / HOUR_MS.toDouble()
+        if (ageHours > 6.0) return listOf(null, null, null)
+        val present = last.temperature + slopePerHour * ageHours
+        return listOf(
+            present,
+            present + slopePerHour,
+            present + 2.0 * slopePerHour
+        ).map { it.takeIf(Double::isFinite) }
     }
 
     private fun buildDial(
@@ -638,8 +733,8 @@ private class ForecastDialStripView(
         // The expanded size/position remain persisted for the next manual unfold.
         compact = true
         prefs.edit().putBoolean(KEY_COMPACT, true).apply()
-        val expandedMinWidth = dp(270f).toInt()
-        val expandedMinHeight = dp(130f).toInt()
+        val expandedMinWidth = dp(300f).toInt()
+        val expandedMinHeight = dp(220f).toInt()
         val maxWidth = maxOf(expandedMinWidth, root.width - dp(8f).toInt())
         val maxHeight = maxOf(expandedMinHeight, root.height - dp(8f).toInt())
         layoutParams = layoutParams.apply {
@@ -648,7 +743,7 @@ private class ForecastDialStripView(
                 height = dp(COMPACT_HEIGHT_DP).toInt().coerceAtMost(root.height.coerceAtLeast(1))
             } else {
                 width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(expandedMinWidth, maxWidth)
-                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(expandedMinHeight, maxHeight)
+                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 248f)).toInt().coerceIn(expandedMinHeight, maxHeight)
             }
         }
         requestLayout()
@@ -687,8 +782,8 @@ private class ForecastDialStripView(
                 val dy = event.rawY - lastRawY
                 if (abs(event.rawX - downRawX) > dp(5f) || abs(event.rawY - downRawY) > dp(5f)) moved = true
                 if (resizing) {
-                    val minWidth = dp(270f).toInt()
-                    val minHeight = dp(130f).toInt()
+                    val minWidth = dp(300f).toInt()
+                    val minHeight = dp(220f).toInt()
                     val maxWidth = maxOf(minWidth, (parentView.width - x).toInt())
                     val maxHeight = maxOf(minHeight, (parentView.height - y).toInt())
                     layoutParams = layoutParams.apply {
@@ -799,8 +894,8 @@ private class ForecastDialStripView(
         compact = !compact
         prefs.edit().putBoolean(KEY_COMPACT, compact).apply()
 
-        val minWidth = dp(270f).toInt()
-        val minHeight = dp(130f).toInt()
+        val minWidth = dp(300f).toInt()
+        val minHeight = dp(220f).toInt()
         val maxWidth = maxOf(minWidth, root.width - dp(8f).toInt())
         val maxHeight = maxOf(minHeight, root.height - dp(8f).toInt())
         layoutParams = layoutParams.apply {
@@ -809,7 +904,7 @@ private class ForecastDialStripView(
                 height = dp(COMPACT_HEIGHT_DP).toInt().coerceAtMost(root.height.coerceAtLeast(1))
             } else {
                 width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(minWidth, maxWidth)
-                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(minHeight, maxHeight)
+                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 248f)).toInt().coerceIn(minHeight, maxHeight)
             }
         }
         requestLayout()
@@ -854,20 +949,151 @@ private class ForecastDialStripView(
         paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, 55)
         canvas.drawRoundRect(dp(0.5f), dp(0.5f), width - dp(0.5f), height - dp(0.5f), dp(16f), dp(16f), paint)
 
-        drawLegend(canvas, night, current)
-        val dials = current?.samples ?: listOf(
-            emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
-        )
-        val top = dp(30f)
-        val availableH = height - top - dp(4f)
-        val slotWidth = width / 3f
-        dials.take(3).forEachIndexed { index, sample ->
-            val cx = slotWidth * (index + 0.5f)
-            val cy = top + availableH * 0.48f
-            val radius = min(slotWidth * 0.41f, availableH * 0.35f)
-            drawDial(canvas, sample, cx, cy, radius, index, night)
-        }
+        drawForecastDashboard(canvas, night, current)
         drawResizeHandle(canvas, night)
+    }
+
+    private fun drawForecastDashboard(canvas: Canvas, night: Boolean, current: DialState?) {
+        val margin = dp(8f)
+        val gap = dp(7f)
+        val usableH = height - 2f * margin - gap
+        val topH = usableH * 0.47f
+        val topRect = RectF(margin, margin, width - margin, margin + topH)
+        val bottomRect = RectF(margin, topRect.bottom + gap, width - margin, height - margin)
+        drawDashboardCard(canvas, topRect, night)
+        drawDashboardCard(canvas, bottomRect, night)
+        drawWeatherDashboard(canvas, topRect, night, current)
+        drawInertiaDashboard(canvas, bottomRect, night, current)
+    }
+
+    private fun drawDashboardCard(canvas: Canvas, rect: RectF, night: Boolean) {
+        paint.style = Paint.Style.FILL
+        paint.color = if (night) Color.rgb(38, 41, 47) else Color.rgb(255, 255, 255)
+        canvas.drawRoundRect(rect, dp(13f), dp(13f), paint)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = dp(1f)
+        paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, 38)
+        canvas.drawRoundRect(rect, dp(13f), dp(13f), paint)
+    }
+
+    private fun drawWeatherDashboard(canvas: Canvas, rect: RectF, night: Boolean, current: DialState?) {
+        val textColor = if (night) Color.WHITE else Color.rgb(35, 38, 42)
+        paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
+        paint.isFakeBoldText = true
+        paint.textSize = sp(9.4f)
+        paint.color = textColor
+        canvas.drawText("MÉTÉO · maintenant → +1 h", rect.left + dp(9f), rect.top + dp(15f), paint)
+        paint.isFakeBoldText = false
+
+        val curve = current?.weatherCurve.orEmpty()
+        val chartLeft = rect.left + dp(8f)
+        val chartRight = rect.right - dp(8f)
+        val chartTop = rect.top + dp(27f)
+        val chartBottom = rect.bottom - dp(9f)
+        if (curve.size >= 2) {
+            val minTs = curve.first().timestamp
+            val maxTs = curve.last().timestamp.coerceAtLeast(minTs + 1L)
+            val minT = curve.minOf { it.temperature }
+            val maxT = curve.maxOf { it.temperature }
+            val rangeT = (maxT - minT).takeIf { it > 0.05 } ?: 1.0
+            fun x(ts: Long): Float = chartLeft + ((ts - minTs).toDouble() / (maxTs - minTs).toDouble()).toFloat() * (chartRight - chartLeft)
+            fun y(t: Double): Float = chartBottom - ((t - minT) / rangeT).toFloat() * (chartBottom - chartTop)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(2.3f)
+            paint.strokeCap = Paint.Cap.ROUND
+            curve.zipWithNext().forEach { (a, b) ->
+                paint.color = withAlpha(temperatureColor((a.temperature + b.temperature) / 2.0), 235)
+                canvas.drawLine(x(a.timestamp), y(a.temperature), x(b.timestamp), y(b.temperature), paint)
+            }
+            paint.strokeCap = Paint.Cap.BUTT
+        }
+
+        val nowText = current?.weatherNow?.let { "${oneDec(it)}°" } ?: "—"
+        val plusText = current?.weatherPlus1?.let { "${oneDec(it)}°" } ?: "—"
+        val pillW = min(dp(178f), rect.width() - dp(24f))
+        val pillH = dp(31f)
+        val pill = RectF(
+            rect.centerX() - pillW / 2f,
+            rect.centerY() - pillH / 2f + dp(5f),
+            rect.centerX() + pillW / 2f,
+            rect.centerY() + pillH / 2f + dp(5f)
+        )
+        paint.style = Paint.Style.FILL
+        paint.color = withAlpha(if (night) Color.rgb(22, 24, 28) else Color.WHITE, 218)
+        canvas.drawRoundRect(pill, dp(13f), dp(13f), paint)
+        paint.textAlign = Paint.Align.CENTER
+        paint.isFakeBoldText = true
+        paint.textSize = sp(11.5f)
+        paint.color = textColor
+        canvas.drawText("$nowText     +1 h $plusText", pill.centerX(), pill.centerY() + dp(4f), paint)
+        paint.isFakeBoldText = false
+        paint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun drawInertiaDashboard(canvas: Canvas, rect: RectF, night: Boolean, current: DialState?) {
+        val textColor = if (night) Color.WHITE else Color.rgb(35, 38, 42)
+        val secondary = if (night) Color.rgb(205, 210, 218) else Color.rgb(82, 87, 96)
+        paint.textAlign = Paint.Align.LEFT
+        paint.style = Paint.Style.FILL
+        paint.isFakeBoldText = true
+        paint.textSize = sp(9.2f)
+        paint.color = textColor
+        canvas.drawText("INERTIE SOL · FAB ADAPTATIVE H+1 → H+48", rect.left + dp(9f), rect.top + dp(15f), paint)
+        paint.isFakeBoldText = false
+
+        val inertiaText = listOf(
+            "maint." to current?.inertiaNow,
+            "+1 h" to current?.inertiaPlus1,
+            "+2 h" to current?.inertiaPlus2
+        ).joinToString("   ") { (label, value) -> "$label ${value?.let { oneDec(it) + "°" } ?: "—"}" }
+        paint.textAlign = Paint.Align.CENTER
+        paint.textSize = sp(9.1f)
+        paint.color = secondary
+        canvas.drawText(inertiaText, rect.centerX(), rect.top + dp(31f), paint)
+
+        val adaptive = current?.adaptiveCurve.orEmpty().sortedBy { it.horizonHour }
+        val chartLeft = rect.left + dp(12f)
+        val chartRight = rect.right - dp(12f)
+        val chartTop = rect.top + dp(43f)
+        val chartBottom = rect.bottom - dp(21f)
+        if (adaptive.size >= 2) {
+            val minT = adaptive.minOf { it.temperature }
+            val maxT = adaptive.maxOf { it.temperature }
+            val rangeT = (maxT - minT).takeIf { it > 0.05 } ?: 1.0
+            fun x(h: Int): Float = chartLeft + ((h - 1).toFloat() / 47f) * (chartRight - chartLeft)
+            fun y(t: Double): Float = chartBottom - ((t - minT) / rangeT).toFloat() * (chartBottom - chartTop)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(2.0f)
+            paint.strokeCap = Paint.Cap.ROUND
+            adaptive.zipWithNext().forEach { (a, b) ->
+                paint.color = withAlpha(LOCAL_YELLOW, 230)
+                canvas.drawLine(x(a.horizonHour), y(a.temperature), x(b.horizonHour), y(b.temperature), paint)
+            }
+            paint.strokeCap = Paint.Cap.BUTT
+            adaptive.forEach { point ->
+                paint.style = Paint.Style.FILL
+                paint.color = temperatureColor(point.temperature)
+                canvas.drawCircle(x(point.horizonHour), y(point.temperature), dp(2.7f), paint)
+                paint.textAlign = Paint.Align.CENTER
+                paint.textSize = sp(6.8f)
+                paint.color = secondary
+                canvas.drawText("H${point.horizonHour}", x(point.horizonHour), rect.bottom - dp(7f), paint)
+            }
+        } else {
+            paint.textAlign = Paint.Align.CENTER
+            paint.textSize = sp(8f)
+            paint.color = secondary
+            canvas.drawText("Adaptative en attente de données", rect.centerX(), rect.centerY() + dp(12f), paint)
+        }
+        paint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun temperatureColor(temperature: Double): Int {
+        if (!temperature.isFinite()) return Color.rgb(115, 119, 127)
+        val normalized = ((temperature + 10.0) / 45.0).coerceIn(0.0, 1.0).toFloat()
+        val hue = 220f * (1f - normalized)
+        return Color.HSVToColor(floatArrayOf(hue, 0.72f, 0.88f))
     }
 
     private fun drawCompact(canvas: Canvas, night: Boolean, current: DialState?) {
@@ -1089,7 +1315,14 @@ private class ForecastDialStripView(
     private fun updateAccessibility(state: DialState) {
         contentDescription = buildString {
             append("Cadrans tangentiels ${state.referenceLabel}. ")
-            append(if (compact) "Mode compact. Double-tape pour ouvrir les cadrans. " else "Mode complet. Double-tape le cadre pour réduire les cadrans. ")
+            append(if (compact) "Mode compact. Double-tape pour ouvrir le tableau météo et inertie. " else "Tableau météo et inertie ouvert. Double-tape le cadre pour réduire. ")
+            if (!compact) {
+                state.weatherNow?.let { append("Météo présente ${oneDec(it)} degrés. ") }
+                state.weatherPlus1?.let { append("Dans une heure ${oneDec(it)} degrés. ") }
+                state.inertiaNow?.let { append("Inertie sol présente ${oneDec(it)} degrés. ") }
+                state.inertiaPlus1?.let { append("Inertie sol dans une heure ${oneDec(it)} degrés. ") }
+                state.inertiaPlus2?.let { append("Inertie sol dans deux heures ${oneDec(it)} degrés. ") }
+            }
             state.samples.forEach { s ->
                 append("${s.label.lowercase()} ${timeFormatter.format(Instant.ofEpochMilli(s.targetTs))}. ")
                 if (s.actualTemp == null) {
