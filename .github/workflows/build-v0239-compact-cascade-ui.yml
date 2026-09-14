@@ -8,6 +8,7 @@ on:
       - 'app/**'
       - 'tools/patch_v0239_compact_cascade_ui.py'
       - 'tools/patch_v0239_right_edge_future_month.py'
+      - 'tools/patch_v0239_band3_independent_paging.py'
       - 'vigilance.md'
       - '.github/workflows/build-v0239-compact-cascade-ui.yml'
   workflow_dispatch:
@@ -46,6 +47,15 @@ jobs:
             python tools/patch_v0239_right_edge_future_month.py
           fi
 
+      - name: Keep band 3 paging independent
+        shell: bash
+        run: |
+          if grep -q 'fun requestExplorationPage' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo 'Independent band-3 paging already present'
+          else
+            python tools/patch_v0239_band3_independent_paging.py
+          fi
+
       - name: Commit patched source
         shell: bash
         run: |
@@ -53,7 +63,7 @@ jobs:
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add app/src/main/java/com/fabdata/app/MainActivity.kt app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-            git commit -m 'Refine right-edge cascade and month-ahead context [skip ci]'
+            git commit -m 'Keep exploration paging independent from detail [skip ci]'
             git push origin HEAD:feature/v0239-compact-cascade-ui
           else
             echo 'No source changes to commit'
