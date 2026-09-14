@@ -7,6 +7,7 @@ on:
     paths:
       - 'app/**'
       - 'tools/patch_v0239_import_performance.py'
+      - 'tools/patch_v0239_restore_stage2.py'
       - 'vigilance.md'
       - '.github/workflows/build-v0239-import-performance-safe.yml'
   workflow_dispatch:
@@ -33,6 +34,15 @@ jobs:
             python tools/patch_v0239_import_performance.py
           fi
 
+      - name: Apply stage-2 extended restore optimization once
+        shell: bash
+        run: |
+          if grep -q 'fun prepareRestore()' app/src/main/java/com/fabdata/app/BackupV3Support.kt; then
+            echo 'Stage-2 restore optimization already present'
+          else
+            python tools/patch_v0239_restore_stage2.py
+          fi
+
       - name: Commit optimized source
         shell: bash
         run: |
@@ -40,7 +50,7 @@ jobs:
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add app/src/main/java/com/fabdata/app/BackupLayer.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt
-            git commit -m 'Optimize v0.23.9 full backup restore with real progress'
+            git commit -m 'Optimize v0.23.9 extended backup restore stages'
             git push origin HEAD:fix/v0239-import-performance-safe
           else
             echo 'No source changes to commit'
