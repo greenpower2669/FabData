@@ -289,7 +289,8 @@ class FabDataBackupV3Support(
         if (!lower.startsWith("fabdata_")) return false
         if (listOf("credential", "token", "secret", "password", "auth").any { it in lower }) return false
         return lower == "fabdata_prefs" || listOf(
-            "ui", "curve", "style", "dial", "overview", "context", "display", "appearance"
+            "ui", "curve", "style", "dial", "overview", "context", "display", "appearance",
+            "animation", "motion", "transition"
         ).any { it in lower }
     }
 
