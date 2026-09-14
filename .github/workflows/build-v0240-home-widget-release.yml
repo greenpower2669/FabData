@@ -1,0 +1,85 @@
+name: Build FabData v0.24.0 home widget release
+
+on:
+  push:
+    branches:
+      - release/v0240-home-widget
+    paths:
+      - 'app/**'
+      - '.github/workflows/build-v0240-home-widget-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: release/v0240-home-widget
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Use preinstalled Android SDK
+        shell: bash
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo 'sdkmanager not found on hosted runner' >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Verify production identity and real widget
+        shell: bash
+        run: |
+          grep -q 'applicationId = "com.fabdata.app"' app/build.gradle.kts
+          grep -q 'versionCode = 67' app/build.gradle.kts
+          grep -q 'versionName = "0.24.0"' app/build.gradle.kts
+          grep -q 'FabDataWeatherWidget' app/src/main/AndroidManifest.xml
+          test -f app/src/main/res/xml/fabdata_weather_widget_info.xml
+          test -f app/src/main/res/layout/fabdata_weather_widget.xml
+          if grep -q 'applicationIdSuffix' app/build.gradle.kts; then
+            echo 'Unexpected applicationIdSuffix in production release' >&2
+            exit 1
+          fi
+
+      - name: Build production release APK
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Stage release APK
+        shell: bash
+        run: |
+          rm -rf ci-artifacts
+          mkdir -p ci-artifacts
+          cp app/build/outputs/apk/release/app-release.apk ci-artifacts/FabData-v0.24.0-home-widget-release.apk
+          sha256sum ci-artifacts/FabData-v0.24.0-home-widget-release.apk > ci-artifacts/FabData-v0.24.0-home-widget-release-sha256.txt
+          ls -lh ci-artifacts/
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.24.0-home-widget-release
+          path: |
+            ci-artifacts/FabData-v0.24.0-home-widget-release.apk
+            ci-artifacts/FabData-v0.24.0-home-widget-release-sha256.txt
+          if-no-files-found: error
+          retention-days: 90
