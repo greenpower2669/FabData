@@ -15,13 +15,10 @@ import java.util.concurrent.TimeUnit
 /**
  * Lightweight scientific forecast capture.
  *
- * The user may display only a few hours, but the raw provider snapshot must still be
- * captured before it is replaced by a newer forecast. This worker therefore refreshes
- * only the selected weather reference forecast. It does NOT scan stations, retrain any
- * model, rebuild terrain history, run the adaptive model, or recalculate the thermal past.
- *
- * WorkManager is intentionally best-effort: Android may delay a run for battery reasons.
- * Foreground refresh remains the fast path whenever FabData is open.
+ * WorkManager is best-effort (Android minimum 15 min), but it shares the exact same
+ * SQLite canonical-slot claim as the foreground scheduler. It can therefore fill a
+ * missing :00/:10/:20... slot when Android wakes it, but can never duplicate a slot
+ * already claimed by the foreground app.
  */
 class ForecastArchiveWorker(
     appContext: Context,
@@ -41,20 +38,34 @@ class ForecastArchiveWorker(
                 credentials
             )
 
-            // Ensures the immutable raw snapshot table/trigger exists, then performs one
-            // forecast-only refresh. The trigger archives every newly inserted forecast row.
             ForecastMemoryStore.ensure(db.writableDatabase)
-            manager.refreshForecast(reference)
+            val now = System.currentTimeMillis()
+            val slot = ForecastMemoryStore.tryClaimCaptureSlot(
+                db.writableDatabase,
+                reference.key,
+                now,
+                "worker arrière-plan"
+            ) ?: return@runCatching
+
+            val count = manager.refreshForecast(reference)
+            val captured = ForecastMemoryStore.hasCaptureSlot(db.writableDatabase, reference.key, slot)
+            ForecastMemoryStore.finishCaptureSlot(
+                db.writableDatabase,
+                reference.key,
+                slot,
+                captured,
+                "worker · $count point(s) fournisseur"
+            )
         }.fold(
             onSuccess = { Result.success() },
-            onFailure = {
-                if (runAttemptCount < 3) Result.retry() else Result.success()
-            }
+            // The slot claim is intentionally once-only. Retrying inside the same slot
+            // would violate the scientific capture cadence and can create provider spam.
+            onFailure = { Result.success() }
         )
     }
 
     companion object {
-        private const val UNIQUE_WORK = "fabdata-forecast-archive-hourly"
+        private const val UNIQUE_WORK = "fabdata-forecast-archive-canonical"
 
         fun schedule(context: Context) {
             val request = PeriodicWorkRequestBuilder<ForecastArchiveWorker>(15, TimeUnit.MINUTES)
