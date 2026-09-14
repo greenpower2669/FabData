@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">FabData</string>
+    <string name="fabdata_widget_description">Météo, inertie sol et prévision Fab adaptative sur l’écran d’accueil</string>
 </resources>
