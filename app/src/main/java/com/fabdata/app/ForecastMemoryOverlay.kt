@@ -92,7 +92,8 @@ class ForecastMemoryBootstrapProvider : ContentProvider() {
             tag = ForecastDialStripView.TAG
             elevation = dp(12f).toFloat()
         }
-        val params = FrameLayout.LayoutParams(dp(348f), dp(154f), Gravity.TOP or Gravity.START)
+        // Startup policy: the floating tangent cockpit begins compact, then the user may unfold it.
+        val params = FrameLayout.LayoutParams(dp(76f), dp(46f), Gravity.TOP or Gravity.START)
         root.addView(view, params)
         view.post { view.restorePosition(root) }
     }
@@ -633,7 +634,10 @@ private class ForecastDialStripView(
 
     fun restorePosition(root: ViewGroup) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        compact = prefs.getBoolean(KEY_COMPACT, false)
+        // Explicit startup policy: each newly attached Activity starts with reduced dials.
+        // The expanded size/position remain persisted for the next manual unfold.
+        compact = true
+        prefs.edit().putBoolean(KEY_COMPACT, true).apply()
         val expandedMinWidth = dp(270f).toInt()
         val expandedMinHeight = dp(130f).toInt()
         val maxWidth = maxOf(expandedMinWidth, root.width - dp(8f).toInt())

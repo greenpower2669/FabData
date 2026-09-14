@@ -1156,6 +1156,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val chartNavigatorOverviewSampleMap = chartLodMap(navigatorOverviewSampleMap, OVERVIEW_LOD_DAY_MS)
     val chartExplorationOverviewSampleMap = chartLodMap(explorationOverviewSampleMap, OVERVIEW_LOD_6H_MS)
 
+    // Navigation is allowed to continue beyond the last terrain point up to NOW + 48 h.
+    // The terrain curve simply stops at its last real/reconstructed point while forecast curves continue.
+    val overviewDisplayBounds = globalBounds?.let { historical ->
+        val now = System.currentTimeMillis()
+        historical.first..maxOf(historical.last, now + FORECAST_DISPLAY_FUTURE_MS)
+    }
+
     fun centeredTemporalRange(center: Long, requestedSpan: Long, outer: LongRange): LongRange {
         val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
         val span = minOf(requestedSpan.coerceAtLeast(1L), outerSpan)
@@ -1176,7 +1183,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
     fun requestTemporalPage(direction: TemporalPageDirection, currentPage: LongRange) {
         if (lowerCascadeVeil) return
-        val history = globalBounds ?: return
+        val history = overviewDisplayBounds ?: return
         val historySpan = (history.last - history.first).coerceAtLeast(1L)
         val pageSpan = (currentPage.last - currentPage.first).coerceAtLeast(1L)
             .coerceAtMost(historySpan)
@@ -1228,7 +1235,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
     val temporalPageRange = explorationOverviewRange
     val temporalDetailRange = viewBounds
-    val temporalHistoryRange = globalBounds
+    val temporalHistoryRange = overviewDisplayBounds
     val temporalEdgeTolerance = temporalDetailRange?.let {
         maxOf(
             60L * 60L * 1000L,
@@ -1365,7 +1372,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         sampleMap = chartExplorationOverviewSampleMap,
                         preferredIndoorSensorId = trainingTargetPrefs.indoorSensorId()
                             ?: inertiaEstimate?.diagnostics?.sourceSensorId,
-                        historyBounds = globalBounds,
+                        historyBounds = overviewDisplayBounds,
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
                         lowerZonesPending = lowerCascadeVeil,
@@ -1509,6 +1516,64 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             windowCenterTimestamp = center
                             selectedTimestamp = center
                             selectedAnnotation = null
+                        },
+                        detailContent = {
+                            Box(Modifier.fillMaxWidth()) {
+                                ChartCard(
+                                    sensors = chartSensors,
+                                    sampleMap = chartSampleMap,
+                                    showTemp = showTemp,
+                                    showHumidity = showHumidity,
+                                    annotations = annotations,
+                                    bounds = viewBounds,
+                                    prefs = prefs,
+                                    curveStyles = activeCurveStyles,
+                                    styleTick = styleTick,
+                                    selectedTimestamp = selectedTimestamp,
+                                    canPageBackward = detailCanPageBackward,
+                                    canPageForward = detailCanPageForward,
+                                    onPageBackward = {
+                                        temporalPageRange?.let { requestTemporalPage(TemporalPageDirection.PREVIOUS, it) }
+                                    },
+                                    onPageForward = {
+                                        temporalPageRange?.let { requestTemporalPage(TemporalPageDirection.NEXT, it) }
+                                    },
+                                    onSelectTimestamp = {
+                                        selectedTimestamp = it
+                                        selectedAnnotation = null
+                                    },
+                                    onAnnotationClick = {
+                                        selectedAnnotation = it
+                                        selectedTimestamp = it.timestamp
+                                    },
+                                    onAnnotationDoubleClick = {
+                                        detailAnnotation = it
+                                        selectedAnnotation = it
+                                    },
+                                    onRequestAnnotation = { ts ->
+                                        editingAnnotation = null
+                                        annotationTimestamp = ts
+                                        selectedTimestamp = ts
+                                    },
+                                    onRequestZoom = { _ ->
+                                        // Reserved gesture hook. Long press currently performs no action.
+                                    }
+                                )
+                                PendingCascadeOverlay(
+                                    pending = lowerCascadeVeil,
+                                    flashToken = lowerCascadeFlashToken,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                        },
+                        detailPeriodContent = {
+                            TimeTabs(preset = preset, onSelect = {
+                                customViewSpanMs = null
+                                preset = it
+                                windowCenterTimestamp = selectedTimestamp
+                                    ?: viewBounds?.let { b -> b.first + (b.last - b.first) / 2L }
+                                selectedAnnotation = null
+                            })
                         }
                     )
                 }
@@ -1527,70 +1592,6 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         reference = visualReference,
                         refreshToken = reloadToken
                     )
-                }
-
-                item {
-                    TimeTabs(preset = preset, onSelect = {
-                        customViewSpanMs = null
-                        preset = it
-                        windowCenterTimestamp = selectedTimestamp
-                            ?: viewBounds?.let { b -> b.first + (b.last - b.first) / 2L }
-                        selectedAnnotation = null
-                    })
-                }
-
-                item {
-                    Box(Modifier.fillMaxWidth()) {
-                    ChartCard(
-                        sensors = chartSensors,
-                        sampleMap = chartSampleMap,
-                        showTemp = showTemp,
-                        showHumidity = showHumidity,
-                        annotations = annotations,
-                        bounds = viewBounds,
-                        prefs = prefs,
-                        curveStyles = activeCurveStyles,
-                        styleTick = styleTick,
-                        selectedTimestamp = selectedTimestamp,
-                        canPageBackward = detailCanPageBackward,
-                        canPageForward = detailCanPageForward,
-                        onPageBackward = {
-                            temporalPageRange?.let { requestTemporalPage(TemporalPageDirection.PREVIOUS, it) }
-                        },
-                        onPageForward = {
-                            temporalPageRange?.let { requestTemporalPage(TemporalPageDirection.NEXT, it) }
-                        },
-                        onSelectTimestamp = {
-                            selectedTimestamp = it
-                            selectedAnnotation = null
-                        },
-                        onAnnotationClick = {
-                            selectedAnnotation = it
-                            selectedTimestamp = it.timestamp
-                        },
-                        onAnnotationDoubleClick = {
-                            detailAnnotation = it
-                            selectedAnnotation = it
-                        },
-                        onRequestAnnotation = { ts ->
-                            editingAnnotation = null
-                            annotationTimestamp = ts
-                            selectedTimestamp = ts
-                        },
-                        onRequestZoom = { ts ->
-                            customViewSpanMs = null
-                            preset = TimePreset.TWO_DAYS
-                            windowCenterTimestamp = ts
-                            selectedTimestamp = ts
-                            selectedAnnotation = null
-                        }
-                    )
-                    PendingCascadeOverlay(
-                        pending = lowerCascadeVeil,
-                        flashToken = lowerCascadeFlashToken,
-                        modifier = Modifier.fillMaxSize()
-                    )
-                    }
                 }
 
                 item {
@@ -2133,7 +2134,7 @@ private fun TimeTabs(preset: TimePreset, onSelect: (TimePreset) -> Unit) {
             }
         }
         Text(
-            "Tap = curseur · double tap = événement · appui long = zoom 48 h · pince/glisse = ajuster",
+            "Tap = curseur · double tap = événement · pince/glisse = ajuster",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -2530,7 +2531,9 @@ private fun HistoryOverviewCard(
     onUseForInertia: (LongRange) -> Unit,
     onExcludeFromInertia: (LongRange) -> Unit,
     onTrainingPolicy: (LongRange, ThermalTrainingTarget, ThermalTrainingRangeMode) -> Unit,
-    onZoomRange: (LongRange) -> Unit
+    onZoomRange: (LongRange) -> Unit,
+    detailContent: @Composable () -> Unit,
+    detailPeriodContent: @Composable () -> Unit
 ) {
     Card(shape = RoundedCornerShape(18.dp)) {
         Column(
@@ -2539,7 +2542,7 @@ private fun HistoryOverviewCard(
         ) {
             Text("Vue globale", fontWeight = FontWeight.Bold)
             Text(
-                "1. totalité · 2. sélection du haut · 3. sélection du milieu · 4. détail RAW",
+                "1. totalité · 2. sélection du haut · 3. exploration · 4. détail RAW / prévisions",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -2590,6 +2593,9 @@ private fun HistoryOverviewCard(
                     historyUiPrefs.saveWideCenter(wideCenter)
                 }
                 var rangeSelectionMode by rememberSaveable { mutableStateOf(false) }
+                var explorationEdgePushDistancePx by remember { mutableFloatStateOf(0f) }
+                var explorationEdgePushDirection by remember { mutableIntStateOf(0) }
+                var explorationEdgePushTriggered by remember { mutableStateOf(false) }
                 var rangeStart by remember { mutableStateOf<Long?>(null) }
                 var rangeEnd by remember { mutableStateOf<Long?>(null) }
                 var rangeMenuOpen by remember { mutableStateOf(false) }
@@ -3112,221 +3118,6 @@ private fun HistoryOverviewCard(
 
                 HorizontalDivider()
                 Text(
-                    "Outils d’analyse de la période",
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                    "À partir d’ici : périodes, courbes, sélections, aide et alertes.",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    PreviewPreset.entries.forEach { item ->
-                        Surface(
-                            onClick = {
-                                previewPreset = item
-                                previewZoom = 1f
-                                val targetCenter = (selectedTimestamp
-                                    ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
-                                    ?: previewCenter).coerceIn(bounds.first, bounds.last)
-                                previewCenter = targetCenter
-                                wideCenter = targetCenter
-                            },
-                            color = if (item == previewPreset) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Text(
-                                item.label,
-                                Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                                fontWeight = if (item == previewPreset) FontWeight.Bold else FontWeight.Normal
-                            )
-                        }
-                    }
-                }
-
-                OutlinedButton(
-                    onClick = { bandChooserOpen = !bandChooserOpen },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Courbes du bandeau d’analyse · ${bandSensorIds.size} sélectionnée(s)")
-                }
-                if (bandChooserOpen) {
-                    Card(
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.34f)
-                        )
-                    ) {
-                        Column(
-                            Modifier.fillMaxWidth().padding(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            Text(
-                                "Même sélection, résolutions différentes. Les segments RECONSTRUCTED gardent leur style reconstruit.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            sensors.filter { it.id in availableBandSensorIds }.forEach { sensor ->
-                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                    Checkbox(
-                                        checked = sensor.id in bandSensorIds,
-                                        onCheckedChange = { checked ->
-                                            val next = bandSensorIds.toMutableSet()
-                                            if (checked) next += sensor.id else next -= sensor.id
-                                            saveBandSensors(next)
-                                        }
-                                    )
-                                    Text(
-                                        when (sensor.id) {
-                                            THERMAL_INERTIA_SENSOR_ID -> "Sol inertiel"
-                                            WEATHER_OFFICIAL_SENSOR_ID -> "Météo officielle"
-                                            LYON_RECONSTRUCTED_SENSOR_ID -> "Météo reconstruite"
-                                            else -> sensor.room
-                                        },
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    AssistChip(
-                        onClick = {
-                            rangeSelectionMode = !rangeSelectionMode
-                            rangeMenuOpen = false
-                            rangeStart = null
-                            rangeEnd = null
-                            if (rangeSelectionMode) {
-                                helpOpen = false
-                                demoOpen = false
-                            }
-                        },
-                        label = {
-                            Text(if (rangeSelectionMode) "✓ Sélection active" else "Sélectionner une période")
-                        }
-                    )
-                    OutlinedButton(
-                        onClick = {
-                            helpOpen = !helpOpen
-                            tipOpen = false
-                            if (!helpOpen) demoOpen = false
-                        }
-                    ) { Text("? Aide") }
-                    OutlinedButton(
-                        onClick = {
-                            tipOpen = !tipOpen
-                            helpOpen = false
-                            demoOpen = false
-                        }
-                    ) { Text("! Alertes / astuce") }
-                }
-                if (rangeSelectionMode) {
-                    Text(
-                        "↔ Une seule zone à la fois : glisse, valide l'action, puis refais une sélection pour en ajouter une autre.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                if (helpOpen) {
-                    Text(
-                        "Cadrans flottants : appui long sur le cadran pour choisir séparément l’horizon météo et l’horizon Fab adaptatif. Double appui pour le mode compact/déplié.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Card(
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.38f)
-                        )
-                    ) {
-                        Column(
-                            Modifier.fillMaxWidth().padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(7.dp)
-                        ) {
-                            Text("? Sélection des périodes", fontWeight = FontWeight.Bold)
-                            Text(
-                                "Active Sélectionner une période, puis glisse directement dans le bandeau du haut. " +
-                                    "La zone reste visible et une petite liste d'actions s'ouvre à droite.",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text(
-                                "Le graphe principal ne change pas : son appui long reste réservé au zoom 48 h.",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Row(
-                                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                TextButton(onClick = {
-                                    demoOpen = true
-                                    demoReplayToken++
-                                }) { Text("▶ Voir la démonstration") }
-                                TextButton(onClick = {
-                                    helpOpen = false
-                                    demoOpen = false
-                                }) { Text("Fermer") }
-                            }
-                            if (demoOpen) {
-                                RangeSelectionHelpDemo(
-                                    step = demoStep,
-                                    onReplay = { demoReplayToken++ },
-                                    onNext = { demoStep = (demoStep + 1).coerceAtMost(3) }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                if (tipOpen) {
-                    Card(
-                        shape = RoundedCornerShape(14.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.34f)
-                        )
-                    ) {
-                        Column(
-                            Modifier.fillMaxWidth().padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(7.dp)
-                        ) {
-                            Text("! Astuce du jour", fontWeight = FontWeight.Bold)
-                            Text(
-                                "Si tu connais une période avec climatisation, fenêtre ouverte, chauffage inhabituel ou autre événement extérieur, " +
-                                    "sélectionne-la ici puis choisis Exclure du modèle d'inertie. Les RAW restent intactes.",
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Row(
-                                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                TextButton(onClick = {
-                                    rangeSelectionMode = true
-                                    tipOpen = false
-                                    helpOpen = false
-                                }) { Text("Essayer maintenant") }
-                                TextButton(onClick = {
-                                    tipOpen = false
-                                    helpPrefs.edit().putBoolean("range_tip_dismissed", true).apply()
-                                }) { Text("Ne plus afficher") }
-                            }
-                        }
-                    }
-                }
-
-                HorizontalDivider()
-                Text(
                     "Sélection / exploration · LOD 6 h · limitée par le bandeau du milieu",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -3389,9 +3180,39 @@ private fun HistoryOverviewCard(
                                     .coerceIn(oldMinSpan, oldMaxSpan)
                                 val zoomAnchoredCenter = anchorTs - (newSpan * fraction).toLong() + newSpan / 2L
                                 val panShift = (-(pan.x / width) * newSpan.toDouble()).toLong()
+                                val requestedCenter = zoomAnchoredCenter + panShift
+                                val clampedCenter = clampCenterToRange(requestedCenter, newSpan, wideWindow)
+
+                                // Keep dragging beyond the exploration edge to page the cascade.
+                                // Arrow buttons remain available and call exactly the same page action.
+                                val deliberatePan = zoomChange in 0.985f..1.015f
+                                val pushDirection = when {
+                                    deliberatePan && requestedCenter < clampedCenter && pan.x > 0f && thirdLevelCanPagePrevious -> -1
+                                    deliberatePan && requestedCenter > clampedCenter && pan.x < 0f && thirdLevelCanPageNext -> 1
+                                    else -> 0
+                                }
+                                if (pushDirection != 0) {
+                                    if (explorationEdgePushDirection != pushDirection) {
+                                        explorationEdgePushDirection = pushDirection
+                                        explorationEdgePushDistancePx = 0f
+                                        explorationEdgePushTriggered = false
+                                    }
+                                    explorationEdgePushDistancePx += kotlin.math.abs(pan.x)
+                                    if (!explorationEdgePushTriggered && explorationEdgePushDistancePx >= 42.dp.toPx()) {
+                                        explorationEdgePushTriggered = true
+                                        onTemporalPageRequest(
+                                            if (pushDirection < 0) TemporalPageDirection.PREVIOUS else TemporalPageDirection.NEXT,
+                                            previewWindow
+                                        )
+                                    }
+                                } else if (kotlin.math.abs(pan.x) > 0.5f) {
+                                    explorationEdgePushDirection = 0
+                                    explorationEdgePushDistancePx = 0f
+                                    explorationEdgePushTriggered = false
+                                }
 
                                 previewZoom = newZoom
-                                previewCenter = clampCenterToRange(zoomAnchoredCenter + panShift, newSpan, wideWindow)
+                                previewCenter = clampedCenter
                             }
                         }
                         .pointerInput(previewFrom, previewTo, rangeSelectionMode) {
@@ -3662,6 +3483,229 @@ private fun HistoryOverviewCard(
                     )
                     Text(formatDateTime(previewTo), style = MaterialTheme.typography.labelSmall)
                 }
+
+                // Fourth level: detailed RAW/forecast graph immediately below exploration.
+                detailContent()
+
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AssistChip(
+                        onClick = {
+                            rangeSelectionMode = !rangeSelectionMode
+                            rangeMenuOpen = false
+                            rangeStart = null
+                            rangeEnd = null
+                            if (rangeSelectionMode) {
+                                helpOpen = false
+                                demoOpen = false
+                            }
+                        },
+                        label = {
+                            Text(if (rangeSelectionMode) "✓ Sélection active" else "Sélectionner une période")
+                        }
+                    )
+                    OutlinedButton(
+                        onClick = {
+                            helpOpen = !helpOpen
+                            tipOpen = false
+                            if (!helpOpen) demoOpen = false
+                        }
+                    ) { Text("? Aide") }
+                    OutlinedButton(
+                        onClick = {
+                            tipOpen = !tipOpen
+                            helpOpen = false
+                            demoOpen = false
+                        }
+                    ) { Text("! Alertes / astuce") }
+                }
+                if (rangeSelectionMode) {
+                    Text(
+                        "↔ Une seule zone à la fois : glisse, valide l'action, puis refais une sélection pour en ajouter une autre.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                if (helpOpen) {
+                    Text(
+                        "Cadrans flottants : appui long sur le cadran pour choisir séparément l’horizon météo et l’horizon Fab adaptatif. Double appui pour le mode compact/déplié.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.38f)
+                        )
+                    ) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(7.dp)
+                        ) {
+                            Text("? Sélection des périodes", fontWeight = FontWeight.Bold)
+                            Text(
+                                "Active Sélectionner une période, puis glisse directement dans le bandeau du haut. " +
+                                    "La zone reste visible et une petite liste d'actions s'ouvre à droite.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                "Le graphe principal conserve l’appui long comme événement réservé, sans action pour l’instant.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Row(
+                                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                TextButton(onClick = {
+                                    demoOpen = true
+                                    demoReplayToken++
+                                }) { Text("▶ Voir la démonstration") }
+                                TextButton(onClick = {
+                                    helpOpen = false
+                                    demoOpen = false
+                                }) { Text("Fermer") }
+                            }
+                            if (demoOpen) {
+                                RangeSelectionHelpDemo(
+                                    step = demoStep,
+                                    onReplay = { demoReplayToken++ },
+                                    onNext = { demoStep = (demoStep + 1).coerceAtMost(3) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (tipOpen) {
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.34f)
+                        )
+                    ) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(7.dp)
+                        ) {
+                            Text("! Astuce du jour", fontWeight = FontWeight.Bold)
+                            Text(
+                                "Si tu connais une période avec climatisation, fenêtre ouverte, chauffage inhabituel ou autre événement extérieur, " +
+                                    "sélectionne-la ici puis choisis Exclure du modèle d'inertie. Les RAW restent intactes.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Row(
+                                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                TextButton(onClick = {
+                                    rangeSelectionMode = true
+                                    tipOpen = false
+                                    helpOpen = false
+                                }) { Text("Essayer maintenant") }
+                                TextButton(onClick = {
+                                    tipOpen = false
+                                    helpPrefs.edit().putBoolean("range_tip_dismissed", true).apply()
+                                }) { Text("Ne plus afficher") }
+                            }
+                        }
+                    }
+                }
+
+
+                // Detail time presets are outside the detail card and below the range controls.
+                detailPeriodContent()
+
+                HorizontalDivider()
+                Text(
+                    "Outils d’analyse de la période",
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    "À partir d’ici : périodes, courbes, sélections, aide et alertes.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    PreviewPreset.entries.forEach { item ->
+                        Surface(
+                            onClick = {
+                                previewPreset = item
+                                previewZoom = 1f
+                                val targetCenter = (selectedTimestamp
+                                    ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
+                                    ?: previewCenter).coerceIn(bounds.first, bounds.last)
+                                previewCenter = targetCenter
+                                wideCenter = targetCenter
+                            },
+                            color = if (item == previewPreset) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Text(
+                                item.label,
+                                Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                fontWeight = if (item == previewPreset) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = { bandChooserOpen = !bandChooserOpen },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Courbes du bandeau d’analyse · ${bandSensorIds.size} sélectionnée(s)")
+                }
+                if (bandChooserOpen) {
+                    Card(
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.34f)
+                        )
+                    ) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                "Même sélection, résolutions différentes. Les segments RECONSTRUCTED gardent leur style reconstruit.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            sensors.filter { it.id in availableBandSensorIds }.forEach { sensor ->
+                                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                    Checkbox(
+                                        checked = sensor.id in bandSensorIds,
+                                        onCheckedChange = { checked ->
+                                            val next = bandSensorIds.toMutableSet()
+                                            if (checked) next += sensor.id else next -= sensor.id
+                                            saveBandSensors(next)
+                                        }
+                                    )
+                                    Text(
+                                        when (sensor.id) {
+                                            THERMAL_INERTIA_SENSOR_ID -> "Sol inertiel"
+                                            WEATHER_OFFICIAL_SENSOR_ID -> "Météo officielle"
+                                            LYON_RECONSTRUCTED_SENSOR_ID -> "Météo reconstruite"
+                                            else -> sensor.room
+                                        },
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
             }
         }
     }
@@ -3964,15 +4008,8 @@ private fun InteractiveChart(
             }
             .pointerInput(from, to, resetKey, zoom, center, annotations) {
                 detectTapGestures(
-                    onLongPress = { p ->
-                        val left = 52.dp.toPx()
-                        val right = size.width - 44.dp.toPx()
-                        if (p.x in left..right) {
-                            val window = visibleWindow()
-                            val span = (window.last - window.first).coerceAtLeast(1L)
-                            val frac = ((p.x - left) / (right - left)).coerceIn(0f, 1f)
-                            onRequestZoom(window.first + (span * frac).toLong())
-                        }
+                    onLongPress = { _ ->
+                        // Reserved for a future action: event detected, no visible effect today.
                     },
                     onDoubleTap = { p ->
                         val left = 52.dp.toPx()
