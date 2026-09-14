@@ -16,6 +16,18 @@
             android:authorities="${applicationId}.forecast-memory-bootstrap"
             android:exported="false"
             android:initOrder="110" />
+
+        <receiver
+            android:name=".FabDataWeatherWidget"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/fabdata_weather_widget_info" />
+        </receiver>
+
         <activity
             android:name=".MainActivity"
             android:exported="true">
