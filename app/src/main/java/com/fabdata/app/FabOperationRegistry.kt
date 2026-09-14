@@ -53,19 +53,18 @@ data class FabOperation(
     val total: Int = 0,
     val state: FabOperationState = FabOperationState.RUNNING,
     val cancellable: Boolean = true,
-    val finishedAt: Long? = null
+    val finishedAt: Long? = null,
+    val trigger: String = "interne",
+    val priority: String = "NORMAL",
+    val network: Boolean = false,
+    val generation: Int? = null,
+    val captureSlot: Long? = null,
+    val mergedRequests: Int = 0
 ) {
     val active: Boolean
         get() = state == FabOperationState.RUNNING || state == FabOperationState.CANCEL_REQUESTED
 }
 
-/**
- * Petit registre de diagnostic partagé par l'UI.
- *
- * - un même `key` ne peut avoir qu'une opération active : garde-fou anti double-tap ;
- * - l'annulation est coopérative : le calcul s'arrête au prochain point de contrôle sûr ;
- * - les quelques dernières opérations terminées restent visibles pour diagnostiquer un faux blocage.
- */
 /**
  * Arbitration des producteurs de données. Un import annonce sa priorité AVANT
  * d'attendre le verrou : les routines automatiques cessent d'en démarrer de nouvelles,
@@ -105,7 +104,13 @@ object FabOperationRegistry {
         key: String,
         title: String,
         detail: String = "Démarrage…",
-        cancellable: Boolean = true
+        cancellable: Boolean = true,
+        trigger: String = "interne",
+        priority: String = "NORMAL",
+        network: Boolean = false,
+        generation: Int? = null,
+        captureSlot: Long? = null,
+        mergedRequests: Int = 0
     ): Long? {
         if (operations.any { it.key == key && it.active }) return null
         val id = nextId.incrementAndGet()
@@ -117,7 +122,13 @@ object FabOperationRegistry {
                 title = title,
                 startedAt = System.currentTimeMillis(),
                 detail = detail,
-                cancellable = cancellable
+                cancellable = cancellable,
+                trigger = trigger,
+                priority = priority,
+                network = network,
+                generation = generation,
+                captureSlot = captureSlot,
+                mergedRequests = mergedRequests
             )
         )
         trim()
@@ -154,11 +165,6 @@ object FabOperationRegistry {
         return operations.firstOrNull { it.id == id }?.state == FabOperationState.CANCEL_REQUESTED
     }
 
-    /**
-     * Point de contrôle coopératif. Une pression sur Annuler ne reste plus un simple
-     * état visuel : les traitements bornés appellent cette méthode entre deux blocs
-     * SQLite/réseau et quittent réellement leur coroutine.
-     */
     @Synchronized
     fun ensureNotCancelled(id: Long?) {
         if (id == null) return
@@ -207,9 +213,6 @@ object FabOperationRegistry {
     @Synchronized
     fun activeId(key: String): Long? = operations.firstOrNull { it.key == key && it.active }?.id
 
-    /** Import utilisateur = priorité maximale. Les lectures d'affichage et la météo
-     * automatique rendent la main au prochain checkpoint ; les sauvegardes et autres
-     * opérations explicites ne sont jamais brutalement interrompues. */
     @Synchronized
     fun requestYieldForImport() {
         operations.indices.forEach { index ->
@@ -276,6 +279,17 @@ fun FabProcessActivityDialog(onDismiss: () -> Unit) {
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            Text("Déclenché par : ${op.trigger}", style = MaterialTheme.typography.labelSmall)
+                            Text(
+                                "Priorité ${op.priority} · Réseau : ${if (op.network) "OUI" else "NON"}" +
+                                    (op.generation?.let { " · génération #$it" } ?: "") +
+                                    (if (op.mergedRequests > 0) " · fusionnées ${op.mergedRequests}" else ""),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            op.captureSlot?.let {
+                                Text("Créneau : ${formatOperationTime(it)}", style = MaterialTheme.typography.labelSmall)
+                            }
                             Text(op.detail, style = MaterialTheme.typography.bodySmall)
                             if (op.total > 0) {
                                 val percent = (100 * op.processed / op.total.coerceAtLeast(1)).coerceIn(0, 100)
