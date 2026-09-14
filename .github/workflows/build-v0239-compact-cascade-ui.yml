@@ -9,6 +9,7 @@ on:
       - 'tools/patch_v0239_compact_cascade_ui.py'
       - 'tools/patch_v0239_right_edge_future_month.py'
       - 'tools/patch_v0239_band3_independent_paging.py'
+      - 'tools/patch_v0239_band3_weather_half_latest_anchor.py'
       - 'vigilance.md'
       - '.github/workflows/build-v0239-compact-cascade-ui.yml'
   workflow_dispatch:
@@ -56,6 +57,16 @@ jobs:
             python tools/patch_v0239_band3_independent_paging.py
           fi
 
+      - name: Add band 3 weather, half-width cascade and latest-data midpoint
+        shell: bash
+        run: |
+          if grep -q 'latestUserDataTimestamp' app/src/main/java/com/fabdata/app/MainActivity.kt && \
+             grep -q 'météo colorée + sondes · 1/2 du bandeau 2' app/src/main/java/com/fabdata/app/MainActivity.kt; then
+            echo 'Band-3 weather/half-width/latest-data patch already present'
+          else
+            python tools/patch_v0239_band3_weather_half_latest_anchor.py
+          fi
+
       - name: Commit patched source
         shell: bash
         run: |
@@ -63,7 +74,7 @@ jobs:
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add app/src/main/java/com/fabdata/app/MainActivity.kt app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-            git commit -m 'Keep exploration paging independent from detail [skip ci]'
+            git commit -m 'Add band3 weather and latest-data midpoint [skip ci]'
             git push origin HEAD:feature/v0239-compact-cascade-ui
           else
             echo 'No source changes to commit'
