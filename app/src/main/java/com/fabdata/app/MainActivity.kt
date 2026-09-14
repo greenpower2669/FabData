@@ -1019,7 +1019,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             forecastHorizonCurves = curves.second
         }
     }
-    val forecastReconstructedSamples = selectableForecastCurves.reconstructed
+    val forecastReconstructedSamples = forecastHorizonCurves.weatherByLead[24].orEmpty()
+        .map { it.copy(sensorId = FORECAST_RECONSTRUCTED_SENSOR_ID) }
+        .ifEmpty { selectableForecastCurves.reconstructed }
     val forecastFabSamples = selectableForecastCurves.fab
     val forecastActiveSamples = forecastHorizonCurves.activeWeather
     val forecastHorizonSamples = forecastHorizonCurves.weatherByLead.filterKeys { it != 24 }
@@ -1083,18 +1085,18 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         Sensor(
             forecastHorizonSensorId(lead), "forecast-weather-h$lead",
             "Prévision météo H+$lead",
-            "Archive locale fixe H+$lead · valeur conservée avant remplacement",
+            "Fenêtre canonique H+$lead · six points de 10 min par jet",
             (12 + lead) % palette.size, points.lastOrNull()?.timestamp
         )
     }
-    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo H+24", "H+24 fixe · archive locale, backfill si disponible · rendu 10 min", 12, forecastReconstructedSamples.lastOrNull()?.timestamp)
+    val forecastReconstructedSensor = Sensor(FORECAST_RECONSTRUCTED_SENSOR_ID, FORECAST_RECONSTRUCTED_STABLE_KEY, "Prévision météo H+24", "Fenêtre canonique H+24 · six points de 10 min par jet · archive RAW inchangée", 12, forecastReconstructedSamples.lastOrNull()?.timestamp)
     val forecastFabSensor = Sensor(FORECAST_FAB_SENSOR_ID, FORECAST_FAB_STABLE_KEY, "Prévision Fab H+24", "Correction locale H+24 · rendu 10 min", 11, forecastFabSamples.lastOrNull()?.timestamp)
     val adaptiveForecastSensors = FORECAST_ADAPTIVE_HORIZONS.mapIndexed { index, lead ->
         val points = adaptiveForecastSamples[lead].orEmpty()
         Sensor(
             forecastAdaptiveSensorId(lead), forecastAdaptiveStableKey(lead),
             "Prévision Fab adaptative H+$lead",
-            "Tangente + changement de régime · archive causale H+$lead",
+            "Tangente + changement de régime · bande canonique 10 min H+$lead",
             (6 + index * 3) % palette.size, points.lastOrNull()?.timestamp
         )
     }

@@ -270,6 +270,25 @@ class ForecastAdaptiveEngine(private val db: FabDataDb) {
                 if (previous == null || issuedAt > previous.first) targetMap[targetAt] = issuedAt to point
             }
         }
+        val liveWeather = ForecastHorizonArchive(db).latestSnapshotWeatherByLead(referenceKey, from, to, now)
+        FORECAST_ADAPTIVE_HORIZONS.forEach { horizon ->
+            val current = latestCurrent(referenceKey, horizon, now) ?: return@forEach
+            val correction = (current.adaptiveTemperature - current.baselineTemperature).coerceIn(-12.0, 12.0)
+            val targetMap = grouped.getOrPut(horizon) { linkedMapOf() }
+            liveWeather[horizon].orEmpty().forEach { baseline ->
+                val point = SamplePoint(
+                    sensorId = forecastAdaptiveSensorId(horizon),
+                    timestamp = baseline.timestamp,
+                    temperature = (baseline.temperature + correction).coerceIn(-70.0, 70.0),
+                    humidity = baseline.humidity,
+                    source = PointSource.FORECAST,
+                    confidence = minOf(baseline.confidence ?: current.confidence, current.confidence)
+                )
+                // Current canonical band wins only in memory. The causal archive remains untouched.
+                targetMap[baseline.timestamp] = now to point
+            }
+        }
+
         return ForecastAdaptiveCurveSet(
             grouped.mapValues { (_, targetMap) ->
                 interpolate10Minutes(targetMap.values.map { it.second }.sortedBy { it.timestamp })

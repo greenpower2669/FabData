@@ -291,7 +291,13 @@ class ForecastHorizonArchive(private val db: FabDataDb) {
      * The latest single provider jet is expanded locally to a 10-minute grid for display.
      * Interpolated points are not persisted, avoiding a x6 archive size increase.
      */
-    private fun latestSnapshotWeatherByLead(
+    /**
+     * Expands the latest single provider jet to the canonical 10-minute display grid.
+     * H1 = +10..+60 min, H2 = +70..+120 min, ... H48. Every complete provider jet
+     * therefore yields six points per horizon immediately, without waiting for later captures.
+     * These interpolated points stay in memory only; raw provider snapshots remain the archive.
+     */
+    fun latestSnapshotWeatherByLead(
         referenceKey: String,
         from: Long,
         to: Long,
@@ -327,21 +333,48 @@ class ForecastHorizonArchive(private val db: FabDataDb) {
                 )
             }
         }
-        if (raw.size < 2) return emptyMap()
-        val start = maxOf(from, slot + HORIZON_STEP_10M_MS)
-        val end = minOf(to, slot + 48L * HORIZON_HOUR_MS)
-        if (end < start) return emptyMap()
+        val anchors = raw.distinctBy { it.timestamp }.sortedBy { it.timestamp }
+        if (anchors.size < 2) return emptyMap()
+
+        fun sampleAt(target: Long): SamplePoint? {
+            anchors.firstOrNull { it.timestamp == target }?.let { return it }
+            val rightIndex = anchors.indexOfFirst { it.timestamp > target }
+            if (rightIndex <= 0) return null
+            val left = anchors[rightIndex - 1]
+            val right = anchors[rightIndex]
+            val gap = right.timestamp - left.timestamp
+            if (gap <= 0L || gap > 95L * HORIZON_MINUTE_MS) return null
+            val linear = ((target - left.timestamp).toDouble() / gap.toDouble()).coerceIn(0.0, 1.0)
+            val smooth = 0.5 - 0.5 * cos(PI * linear)
+            val leftConfidence = left.confidence ?: 0.65
+            val rightConfidence = right.confidence ?: 0.65
+            return SamplePoint(
+                sensorId = FORECAST_ACTIVE_SENSOR_ID,
+                timestamp = target,
+                temperature = left.temperature + (right.temperature - left.temperature) * smooth,
+                humidity = left.humidity + (right.humidity - left.humidity) * smooth,
+                source = PointSource.FORECAST,
+                confidence = (leftConfidence + (rightConfidence - leftConfidence) * linear).coerceIn(0.0, 1.0)
+            )
+        }
 
         val grouped = mutableMapOf<Int, MutableList<SamplePoint>>()
-        interpolate10Minutes(raw).forEach { point ->
-            if (point.timestamp !in start..end) return@forEach
-            val delta = point.timestamp - slot
-            if (delta < HORIZON_STEP_10M_MS || delta > 48L * HORIZON_HOUR_MS) return@forEach
-            val lead = ((delta + HORIZON_HOUR_MS - 1L) / HORIZON_HOUR_MS).toInt()
-            if (lead !in FORECAST_HORIZON_HOURS) return@forEach
-            grouped.getOrPut(lead) { mutableListOf() } += point.copy(sensorId = forecastHorizonSensorId(lead))
+        var target = slot + HORIZON_STEP_10M_MS
+        val lastTarget = slot + 48L * HORIZON_HOUR_MS
+        while (target <= lastTarget) {
+            if (target in from..to) {
+                val delta = target - slot
+                val lead = ((delta + HORIZON_HOUR_MS - 1L) / HORIZON_HOUR_MS).toInt()
+                if (lead in FORECAST_HORIZON_HOURS) {
+                    sampleAt(target)?.let { point ->
+                        grouped.getOrPut(lead) { mutableListOf() } +=
+                            point.copy(sensorId = forecastHorizonSensorId(lead))
+                    }
+                }
+            }
+            target += HORIZON_STEP_10M_MS
         }
-        return grouped
+        return grouped.mapValues { (_, points) -> points.sortedBy { it.timestamp } }
     }
 
     private fun rawRows(referenceKey: String, from: Long, to: Long, now: Long): List<RawHorizonForecast> {

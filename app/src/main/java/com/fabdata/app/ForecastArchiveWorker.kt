@@ -47,7 +47,7 @@ class ForecastArchiveWorker(
                 "worker arrière-plan"
             ) ?: return@runCatching
 
-            val count = manager.refreshForecast(reference)
+            val count = manager.refreshForecast(reference, canonicalSlotClaimed = true)
             val captured = ForecastMemoryStore.hasCaptureSlot(db.writableDatabase, reference.key, slot)
             ForecastMemoryStore.finishCaptureSlot(
                 db.writableDatabase,

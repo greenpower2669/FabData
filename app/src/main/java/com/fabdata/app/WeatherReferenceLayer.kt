@@ -478,7 +478,12 @@ class WeatherReferenceManager(
      * Les observations officielles gardent la priorité ; Open-Meteo historique sert
      * seulement de reconstruction de secours pour obtenir une entrée longue/continue.
      */
-    fun refreshSelected(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
+    fun refreshSelected(
+        reference: WeatherReference,
+        from: Long,
+        to: Long,
+        includeForecastAfterCanonicalClaim: Boolean = false
+    ): WeatherReferenceSyncResult {
         store.rememberReference(reference)
         store.keepOnly(reference.key)
 
@@ -525,7 +530,9 @@ class WeatherReferenceManager(
         }
 
         store.reconcileMeasuredDominance(reference.key, from, minOf(to, System.currentTimeMillis()))
-        val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
+        val forecast = if (includeForecastAfterCanonicalClaim) {
+            runCatching { refreshForecast(reference, canonicalSlotClaimed = true) }.getOrDefault(0)
+        } else 0
         val actual = store.query(reference.key, from, minOf(to, System.currentTimeMillis()))
         return WeatherReferenceSyncResult(
             measured = actual.count { it.source == PointSource.MEASURED },
@@ -624,9 +631,16 @@ class WeatherReferenceManager(
      * même si l'utilisateur regarde seulement H+3/H+6. Ainsi H+24 existe réellement
      * avant d'être remplacé par une émission plus récente.
      */
-    fun refreshForecast(reference: WeatherReference): Int {
+    /**
+     * Provider forecast access is intentionally gated. Only callers that already own the
+     * canonical :00/:10/:20/... capture slot may set [canonicalSlotClaimed] to true.
+     * History refreshes, manual station refreshes and UI changes therefore cannot create
+     * a second H+1..H+48 provider request inside the same slot.
+     */
+    fun refreshForecast(reference: WeatherReference, canonicalSlotClaimed: Boolean = false): Int {
+        if (!canonicalSlotClaimed) return 0
         val now = System.currentTimeMillis()
-        val oldForecasts = store.query(reference.key, now - hourMs, now + 50L * hourMs)
+        val oldForecasts = store.query(reference.key, now - 2L * hourMs, now + 50L * hourMs)
             .filter { it.source == PointSource.FORECAST }
         if (oldForecasts.isNotEmpty()) {
             db.inTransaction {
@@ -648,7 +662,10 @@ class WeatherReferenceManager(
      * Rafraîchissement live léger : jamais d'archive longue. Il est conçu pour être
      * appelé au focus puis selon la cadence premier-plan sans relancer une reconstruction historique.
      */
-    fun refreshRecent(reference: WeatherReference): WeatherReferenceSyncResult {
+    fun refreshRecent(
+        reference: WeatherReference,
+        includeForecastAfterCanonicalClaim: Boolean = false
+    ): WeatherReferenceSyncResult {
         store.rememberReference(reference)
         store.keepOnly(reference.key)
         val now = System.currentTimeMillis()
@@ -674,7 +691,7 @@ class WeatherReferenceManager(
         } else if (credentials.hasCredential() && now - lastOfficialRecentAt >= 15L * 60L * 1000L) {
             // Les observations horaires officielles ne changent pas toutes les minutes :
             // on vérifie l'archive récente au plus toutes les 15 min, tandis que le
-            // fallback coordonné + forecast peut être rafraîchi chaque minute.
+            // fallback coordonné reste indépendant ; le forecast futur est réservé au créneau canonique.
             runCatching { fetchOfficialHourly(reference, from, now) }
                 .getOrDefault(emptyList())
                 .forEach { store.upsert(reference.key, it) }
@@ -683,7 +700,9 @@ class WeatherReferenceManager(
 
         reconstructShortGaps(reference.key, from, now)
         store.reconcileMeasuredDominance(reference.key, from, now)
-        val forecast = runCatching { refreshForecast(reference) }.getOrDefault(0)
+        val forecast = if (includeForecastAfterCanonicalClaim) {
+            runCatching { refreshForecast(reference, canonicalSlotClaimed = true) }.getOrDefault(0)
+        } else 0
         val actual = store.query(reference.key, from, now)
         return WeatherReferenceSyncResult(
             measured = actual.count { it.source == PointSource.MEASURED },
@@ -925,7 +944,10 @@ class WeatherReferenceManager(
         for (i in 0 until times.length()) {
             val local = runCatching { LocalDateTime.parse(times.getString(i), DateTimeFormatter.ISO_LOCAL_DATE_TIME) }.getOrNull() ?: continue
             val ts = local.atZone(zone).toInstant().toEpochMilli()
-            if (ts < now - 30L * 60L * 1000L || ts > end) continue
+            // Keep the previous hourly anchor in the SAME provider jet. It is needed to
+            // interpolate the canonical H1 points (+10, +20, ... +60 min) even when the
+            // network call happens late in the current hour. No extra provider request is made.
+            if (ts < now - 70L * 60L * 1000L || ts > end) continue
             val t = temps.optDouble(i, Double.NaN)
             val h = hums.optDouble(i, Double.NaN)
             if (!t.isFinite() || !h.isFinite()) continue

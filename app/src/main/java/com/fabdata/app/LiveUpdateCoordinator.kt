@@ -170,7 +170,7 @@ fun FabLiveUpdateCoordinator(
                     )
 
                     FabOperationRegistry.update(operationId, "${reference.label} · snapshot complet H+1 → H+48…")
-                    manager.refreshRecent(reference)
+                    manager.refreshRecent(reference, includeForecastAfterCanonicalClaim = true)
                     captured = ForecastMemoryStore.hasCaptureSlot(db.writableDatabase, reference.key, slot)
 
                     val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
