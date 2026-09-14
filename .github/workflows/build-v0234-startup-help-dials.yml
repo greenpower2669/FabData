@@ -1,4 +1,4 @@
-name: Build v0.23.8 complete canonical horizon grid
+name: Build v0.23.9 deterministic claimed slot identity
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     branches:
       - 'feature/forecast-fixed-lead-h24'
     paths:
-      - 'tools/patch_v0238_canonical_horizon_grid.py'
+      - 'tools/patch_v0239_claimed_slot_identity.py'
       - '.github/workflows/build-v0234-startup-help-dials.yml'
 
 permissions:
@@ -24,30 +24,29 @@ jobs:
           fetch-depth: 0
 
       - name: Validate patch
-        run: python3 -m py_compile tools/patch_v0238_canonical_horizon_grid.py
+        run: python3 -m py_compile tools/patch_v0239_claimed_slot_identity.py
 
-      - name: Apply v0.23.8 patch
-        run: python3 tools/patch_v0238_canonical_horizon_grid.py
+      - name: Apply v0.23.9 patch
+        run: python3 tools/patch_v0239_claimed_slot_identity.py
 
       - name: Regression guards
         run: |
           git diff --check
-          grep -n 'versionName = "0.23.8"' app/build.gradle.kts
-          grep -n 'includeForecastAfterCanonicalClaim' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'versionName = "0.23.9"' app/build.gradle.kts
+          grep -n 'trg_fabdata_forecast_memory_insert_v3' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'ca.finished_at IS NULL' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'ca.started_at<=NEW.updated_at' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'No recurring cache seeding here' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          ! grep -n 'Seed only the current logical slot' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'fun tryClaimCaptureSlot' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           grep -n 'canonicalSlotClaimed: Boolean = false' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
-          grep -n 'now - 70L \* 60L \* 1000L' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
           grep -n 'includeForecastAfterCanonicalClaim = true' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
           grep -n 'canonicalSlotClaimed = true' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
-          ! grep -R -n 'refreshForecast(reference)' app/src/main/java/com/fabdata/app
           grep -n 'H1 = +10..+60 min' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
           grep -n 'var target = slot + HORIZON_STEP_10M_MS' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
-          grep -n 'fun latestSnapshotWeatherByLead' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
-          grep -n 'val liveWeather = ForecastHorizonArchive(db).latestSnapshotWeatherByLead' app/src/main/java/com/fabdata/app/ForecastAdaptive.kt
-          grep -n 'forecastHorizonCurves.weatherByLead\[24\]' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'Déclenché par :' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
           grep -n 'interaction utilisateur plus récente' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'if (selectedTimestamp == null)' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'tryClaimCaptureSlot' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -73,29 +72,23 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Normalize APK filename
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.8-release-canonical-horizon-grid.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.9-release-deterministic-slots.apk
 
       - name: Commit validated generated source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/build.gradle.kts \
-            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
-            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
-            app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt \
-            app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt \
-            app/src/main/java/com/fabdata/app/ForecastAdaptive.kt \
-            app/src/main/java/com/fabdata/app/MainActivity.kt
+          git add app/build.gradle.kts app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
           if git diff --cached --quiet; then
-            echo "v0.23.8 generated source already committed"
+            echo "v0.23.9 generated source already committed"
           else
-            git commit -m "Enforce one forecast jet per slot and complete H1-H48 grid [skip ci]"
+            git commit -m "Bind forecast rows to the claimed canonical slot [skip ci]"
             git push origin HEAD:feature/forecast-fixed-lead-h24
           fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.23.8-release-canonical-horizon-grid
-          path: app/build/outputs/apk/debug/FabData-v0.23.8-release-canonical-horizon-grid.apk
+          name: FabData-v0.23.9-release-deterministic-slots
+          path: app/build/outputs/apk/debug/FabData-v0.23.9-release-deterministic-slots.apk
           if-no-files-found: error
