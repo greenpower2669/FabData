@@ -1,4 +1,4 @@
-name: Build v0.23.6 import priority arbitration
+name: Build v0.23.7 canonical scheduler
 
 on:
   workflow_dispatch:
@@ -6,7 +6,9 @@ on:
     branches:
       - 'feature/forecast-fixed-lead-h24'
     paths:
-      - 'tools/patch_v0236_import_priority.py'
+      - 'tools/patch_v0237_slot_store.py'
+      - 'tools/patch_v0237_horizon_windows.py'
+      - 'tools/patch_v0237_ui_queue.py'
       - '.github/workflows/build-v0234-startup-help-dials.yml'
 
 permissions:
@@ -23,23 +25,36 @@ jobs:
           ref: feature/forecast-fixed-lead-h24
           fetch-depth: 0
 
-      - name: Validate patch
-        run: python3 -m py_compile tools/patch_v0236_import_priority.py
+      - name: Validate patches
+        run: |
+          python3 -m py_compile tools/patch_v0237_slot_store.py
+          python3 -m py_compile tools/patch_v0237_horizon_windows.py
+          python3 -m py_compile tools/patch_v0237_ui_queue.py
 
-      - name: Apply v0.23.6 patch
-        run: python3 tools/patch_v0236_import_priority.py
+      - name: Apply v0.23.7 patches
+        run: |
+          python3 tools/patch_v0237_slot_store.py
+          python3 tools/patch_v0237_horizon_windows.py
+          python3 tools/patch_v0237_ui_queue.py
 
       - name: Regression guards
         run: |
           git diff --check
-          grep -n 'versionName = "0.23.6"' app/build.gradle.kts
-          grep -n 'object FabDataWorkArbiter' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
-          grep -n 'fun requestYieldForImport' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
-          grep -n 'title = "Importation prioritaire"' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'FabDataWorkArbiter.withCriticalImport' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'FabDataWorkArbiter.criticalImportPending' app/src/main/java/com/fabdata/app/MainActivity.kt
-          grep -n 'FabDataWorkArbiter.withDataProducer producer@' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
-          grep -n 'Import prioritaire en cours · actualisation météo reportée' app/src/main/java/com/fabdata/app/ThermalUi.kt
+          grep -n 'versionName = "0.23.7"' app/build.gradle.kts
+          grep -n 'forecast_capture_attempt' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'fun tryClaimCaptureSlot' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'fun captureSlotClosed' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
+          grep -n 'fixed-window-10m-v2' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
+          grep -n 'H1 = +10..+60 min' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
+          grep -n 'latestSnapshotWeatherByLead' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
+          grep -n 'jet unique H+1 → H+48' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'recalcul Fab uniquement' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          ! grep -n 'updateLive(force = true)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'Déclenché par :' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
+          grep -n 'reloadPendingTrigger' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'interaction utilisateur plus récente' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'if (selectedTimestamp == null)' app/src/main/java/com/fabdata/app/MainActivity.kt
+          grep -n 'tryClaimCaptureSlot' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -65,27 +80,25 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Normalize APK filename
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.6-release-import-priority.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.7-release-canonical-scheduler.apk
 
-      - name: Commit validated source
+      - name: Commit validated generated source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/build.gradle.kts \
-            app/src/main/java/com/fabdata/app/MainActivity.kt \
-            app/src/main/java/com/fabdata/app/FabOperationRegistry.kt \
-            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
-            app/src/main/java/com/fabdata/app/ThermalUi.kt
+          git add app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
+            app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt \
+            app/src/main/java/com/fabdata/app/MainActivity.kt
           if git diff --cached --quiet; then
-            echo "v0.23.6 source already committed"
+            echo "v0.23.7 generated source already committed"
           else
-            git commit -m "Prioritize imports over weather and display work [skip ci]"
+            git commit -m "Finalize canonical 10-minute scheduler and traced UI queue [skip ci]"
             git push origin HEAD:feature/forecast-fixed-lead-h24
           fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.23.6-release-import-priority
-          path: app/build/outputs/apk/debug/FabData-v0.23.6-release-import-priority.apk
+          name: FabData-v0.23.7-release-canonical-scheduler
+          path: app/build/outputs/apk/debug/FabData-v0.23.7-release-canonical-scheduler.apk
           if-no-files-found: error
