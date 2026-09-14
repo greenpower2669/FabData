@@ -1236,6 +1236,44 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         selectedAnnotation = null
     }
 
+    fun requestExplorationPage(direction: TemporalPageDirection, currentPage: LongRange) {
+        if (lowerCascadeVeil) return
+        val history = overviewDisplayBounds ?: return
+        val historySpan = (history.last - history.first).coerceAtLeast(1L)
+        val pageSpan = (currentPage.last - currentPage.first).coerceAtLeast(1L)
+            .coerceAtMost(historySpan)
+        if (pageSpan >= historySpan) return
+
+        val desiredCenter = when (direction) {
+            TemporalPageDirection.NEXT -> {
+                if (currentPage.last >= history.last) return
+                currentPage.last + pageSpan / 2L
+            }
+            TemporalPageDirection.PREVIOUS -> {
+                if (currentPage.first <= history.first) return
+                currentPage.first - pageSpan / 2L
+            }
+        }
+        val nextPage = centeredTemporalRange(desiredCenter, pageSpan, history)
+        if (nextPage.first == currentPage.first && nextPage.last == currentPage.last) return
+
+        val nextPageSpan = (nextPage.last - nextPage.first).coerceAtLeast(1L)
+        val nextCenter = nextPage.first + nextPageSpan / 2L
+        val currentWideSpan = wideOverviewRange
+            ?.let { (it.last - it.first).coerceAtLeast(nextPageSpan) }
+            ?: minOf(historySpan, maxOf(nextPageSpan * 2L, PreviewPreset.M1.spanMs))
+        val nextWide = centeredTemporalRange(nextCenter, currentWideSpan, history)
+
+        // Band 3 owns training-range selection, so page only its navigation parents.
+        // Do NOT move windowCenterTimestamp / selectedTimestamp / detailed graph here.
+        lowerCascadeAwaitingReload = true
+        lowerCascadeVeil = true
+        wideOverviewRange = nextWide
+        explorationOverviewRange = nextPage
+        temporalPageSyncCenter = nextCenter
+        temporalPageSyncToken++
+    }
+
     val temporalPageRange = explorationOverviewRange
     val temporalDetailRange = viewBounds
     val temporalHistoryRange = overviewDisplayBounds
@@ -1399,7 +1437,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             lowerCascadeVeil = true
                         },
                         onTemporalPageRequest = { direction, page ->
-                            requestTemporalPage(direction, page)
+                            requestExplorationPage(direction, page)
                         },
                         onCascadeRangesChanged = { wide, exploration ->
                             if (wideOverviewRange != wide) wideOverviewRange = wide
