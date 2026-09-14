@@ -25,6 +25,11 @@ android {
         targetSdk = 36
         versionCode = 51
         versionName = "0.21.5"
+        // APK de test destiné au téléphone Android actuel de Fab : évite d'embarquer
+        // les bibliothèques natives x86/x86_64/armeabi-v7a inutiles sur un appareil arm64.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {
@@ -40,6 +45,9 @@ android {
 
     buildTypes {
         release {
+            // APK de test parallèle : n'écrase pas l'installation FabData 0.22.0 actuelle.
+            applicationIdSuffix = ".importfix"
+            versionNameSuffix = "-importfix-test"
             isMinifyEnabled = true
             isShrinkResources = true
             signingConfig = if (hasUploadSigning) {
