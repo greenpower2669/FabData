@@ -17,20 +17,22 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 private const val LIVE_FORECAST_INTERVAL_MS = 10L * 60L * 1000L
+private val LIVE_SLOT_FORMAT = DateTimeFormatter.ofPattern("HH:mm")
+
+private fun liveSlotLabel(slot: Long): String =
+    Instant.ofEpochMilli(slot).atZone(ZoneId.systemDefault()).format(LIVE_SLOT_FORMAT)
 
 /**
- * Orchestrateur toujours composé, indépendant des cartes LazyColumn.
+ * Foreground scheduler.
  *
- * - uniquement quand l'app est réellement au premier plan ;
- * - ouverture / retour au focus : météo fraîche de la référence déjà sélectionnée, jamais de rescan ;
- * - le scan des stations proches vit uniquement dans l'écran Sondes proches / Auto protection ;
- * - ensuite toutes les 10 minutes tant que l'utilisateur regarde l'app ;
- * - lorsqu'une vraie mesure intérieure change : météo fraîche puis futur avec le modèle figé ;
- * - un changement reçu en arrière-plan est seulement mémorisé, aucun calcul n'y est lancé ;
- * - ne réentraîne jamais le modèle et ne recalcule jamais le passé ;
- * - ne modifie jamais directement une mesure MEASURED.
+ * Network acquisition belongs to one canonical :00/:10/:20/... slot only. A new
+ * indoor measurement may immediately recalculate the local/Fab future from the cached
+ * weather snapshot, but can never force a second provider request in the same slot.
  */
 @Composable
 fun FabLiveUpdateCoordinator(
@@ -38,7 +40,7 @@ fun FabLiveUpdateCoordinator(
     lyonLab: LyonLabStore,
     credentials: MeteoFranceCredentialStore,
     dataVersion: Int,
-    onDataChanged: () -> Unit
+    onDataChanged: (String) -> Unit
 ) {
     val context = LocalContext.current
     val activity = context as? ComponentActivity
@@ -73,29 +75,83 @@ fun FabLiveUpdateCoordinator(
         onDispose { activity.lifecycle.removeObserver(observer) }
     }
 
-    suspend fun currentForecastSlotCaptured(referenceKey: String, now: Long = System.currentTimeMillis()): Boolean =
+    suspend fun slotClosed(referenceKey: String, now: Long = System.currentTimeMillis()): Boolean =
         withContext(Dispatchers.IO) {
-            ForecastMemoryStore.hasCaptureSlot(db.writableDatabase, referenceKey, now)
+            ForecastMemoryStore.captureSlotClosed(db.writableDatabase, referenceKey, now)
         }
 
-    suspend fun updateLive(force: Boolean = false): Boolean {
+    suspend fun recalculateLocal(trigger: String): Boolean {
         if (!foreground || working || FabDataWorkArbiter.criticalImportPending()) return false
         return FabDataWorkArbiter.withDataProducer producer@{
             if (!foreground || working) return@producer false
-            val referenceForOperation = weatherPrefs.selectedReference()
-            if (!force && currentForecastSlotCaptured(referenceForOperation.key)) return@producer false
+            val reference = weatherPrefs.selectedReference()
+            val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
+            val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId) ?: return@producer false
             val operationId = FabOperationRegistry.tryStart(
-                "weather:${referenceForOperation.key}",
-                "Mise à jour automatique",
-                "${referenceForOperation.label} · ouverture / focus"
+                key = "forecast-local:${reference.key}",
+                title = "Recalcul prévision locale",
+                detail = "Météo en cache · recalcul Fab uniquement",
+                cancellable = true,
+                trigger = trigger,
+                priority = "DATA",
+                network = false
             ) ?: return@producer false
             working = true
             try {
                 withContext(Dispatchers.IO) {
-                    // Important : le focus ne choisit jamais une autre station.
-                    val reference = referenceForOperation
                     FabOperationRegistry.ensureNotCancelled(operationId)
-                    FabOperationRegistry.update(operationId, "${reference.label} · météo récente…")
+                    engine.refreshForecasts(
+                        reference,
+                        trainedModel.sensorId,
+                        profileStore.load(),
+                        profileStore.forecastMode(),
+                        precalibratedModel = trainedModel
+                    )
+                }
+                onDataChanged("$trigger · recalcul local")
+                FabOperationRegistry.finish(operationId, "Prévision locale recalculée · aucun appel météo")
+                true
+            } catch (cancel: CancellationException) {
+                FabOperationRegistry.cancelled(operationId, "Recalcul local arrêté")
+                if (!currentCoroutineContext().isActive) throw cancel
+                false
+            } catch (error: Throwable) {
+                FabOperationRegistry.fail(operationId, error.message ?: "Recalcul local impossible")
+                false
+            } finally {
+                working = false
+            }
+        } ?: false
+    }
+
+    suspend fun captureWeatherSlot(trigger: String): Boolean {
+        if (!foreground || working || FabDataWorkArbiter.criticalImportPending()) return false
+        return FabDataWorkArbiter.withDataProducer producer@{
+            if (!foreground || working) return@producer false
+            val reference = weatherPrefs.selectedReference()
+            val now = System.currentTimeMillis()
+            val slot = ForecastMemoryStore.tryClaimCaptureSlot(
+                db.writableDatabase,
+                reference.key,
+                now,
+                trigger
+            ) ?: return@producer false
+            val operationId = FabOperationRegistry.tryStart(
+                key = "weather:${reference.key}",
+                title = "Mise à jour météo",
+                detail = "${reference.label} · jet unique H+1 → H+48",
+                cancellable = true,
+                trigger = "$trigger · créneau ${liveSlotLabel(slot)}",
+                priority = "DATA",
+                network = true,
+                captureSlot = slot
+            ) ?: return@producer false
+            working = true
+            var captured = false
+            try {
+                withContext(Dispatchers.IO) {
+                    FabOperationRegistry.ensureNotCancelled(operationId)
+                    FabOperationRegistry.update(operationId, "${reference.label} · acquisition réseau du créneau…")
 
                     if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
                         if (credentials.hasCredential()) {
@@ -107,47 +163,71 @@ fun FabLiveUpdateCoordinator(
 
                     FabOperationRegistry.ensureNotCancelled(operationId)
                     val dominanceNow = System.currentTimeMillis()
-                    val recentFrom = dominanceNow - 48L * 60L * 60L * 1000L
-                    val recentTo = dominanceNow + 12L * 60L * 60L * 1000L
-                    FabOperationRegistry.update(operationId, "${reference.label} · cohérence récente…")
-                    PointSourceStore.reconcileMeasuredDominance(db, recentFrom, recentTo)
+                    PointSourceStore.reconcileMeasuredDominance(
+                        db,
+                        dominanceNow - 48L * 60L * 60L * 1000L,
+                        dominanceNow + 12L * 60L * 60L * 1000L
+                    )
 
-                    FabOperationRegistry.ensureNotCancelled(operationId)
-                    FabOperationRegistry.update(operationId, "${reference.label} · référence récente…")
+                    FabOperationRegistry.update(operationId, "${reference.label} · snapshot complet H+1 → H+48…")
                     manager.refreshRecent(reference)
-                    FabOperationRegistry.ensureNotCancelled(operationId)
+                    captured = ForecastMemoryStore.hasCaptureSlot(db.writableDatabase, reference.key, slot)
 
-                    FabOperationRegistry.update(operationId, "${reference.label} · prévision / cohérence…")
-                    val profile = profileStore.load()
-                    val mode = profileStore.forecastMode()
                     val selectedSensorId = modelPrefs.getLong("selected_sensor_id", -1L).takeIf { it >= 0L }
                     val trainedModel = trainedModelStore.loadUsable(reference.key, selectedSensorId)
                     if (trainedModel != null) {
                         FabOperationRegistry.ensureNotCancelled(operationId)
                         engine.refreshForecasts(
-                            reference, trainedModel.sensorId, profile, mode,
+                            reference,
+                            trainedModel.sensorId,
+                            profileStore.load(),
+                            profileStore.forecastMode(),
                             precalibratedModel = trainedModel
                         )
-                        FabOperationRegistry.ensureNotCancelled(operationId)
                     }
+                    ForecastMemoryStore.finishCaptureSlot(
+                        db.writableDatabase,
+                        reference.key,
+                        slot,
+                        captured,
+                        if (captured) "snapshot H1-H48 archivé" else "cycle terminé sans snapshot futur"
+                    )
                 }
                 if (FabOperationRegistry.cancelRequested(operationId)) {
-                    FabOperationRegistry.cancelled(operationId, "Mise à jour automatique arrêtée · priorité supérieure")
+                    FabOperationRegistry.cancelled(operationId, "Mise à jour météo arrêtée · priorité supérieure")
                 } else {
-                    onDataChanged()
-                    FabOperationRegistry.finish(operationId, "Météo et prévision à jour")
+                    onDataChanged("météo · créneau ${liveSlotLabel(slot)}")
+                    FabOperationRegistry.finish(
+                        operationId,
+                        if (captured) "Créneau ${liveSlotLabel(slot)} archivé · H+1 → H+48"
+                        else "Créneau ${liveSlotLabel(slot)} consommé · aucune donnée future reçue"
+                    )
                 }
                 true
             } catch (cancel: CancellationException) {
+                ForecastMemoryStore.finishCaptureSlot(
+                    db.writableDatabase,
+                    reference.key,
+                    slot,
+                    false,
+                    "annulé au prochain point sûr"
+                )
                 val requested = FabOperationRegistry.cancelRequested(operationId)
                 FabOperationRegistry.cancelled(
                     operationId,
-                    if (requested) "Mise à jour automatique arrêtée · priorité supérieure" else "Routine remplacée / composition quittée"
+                    if (requested) "Mise à jour météo arrêtée · priorité supérieure" else "Routine quittée"
                 )
                 if (!requested || !currentCoroutineContext().isActive) throw cancel
                 false
             } catch (error: Throwable) {
-                FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour automatique impossible")
+                ForecastMemoryStore.finishCaptureSlot(
+                    db.writableDatabase,
+                    reference.key,
+                    slot,
+                    false,
+                    error.message ?: "erreur réseau"
+                )
+                FabOperationRegistry.fail(operationId, error.message ?: "Mise à jour météo impossible")
                 false
             } finally {
                 working = false
@@ -161,31 +241,33 @@ fun FabLiveUpdateCoordinator(
         measuredRevision = current
         if (previous != null && current != previous) {
             pendingMeasuredRefresh = true
-            if (foreground && updateLive(force = true)) {
+            if (foreground && recalculateLocal("nouvelle mesure intérieure")) {
                 pendingMeasuredRefresh = false
             }
         }
     }
 
-    // Horloge canonique : :00 / :10 / :20 / :30 / :40 / :50.
-    // Si le créneau courant manque (ouverture tardive), on le rattrape immédiatement ;
-    // sinon on dort jusqu'à la prochaine frontière. Le vrai issued_at reste conservé.
+    // One catch-up at resume if this slot has never been attempted, then exact 10-minute
+    // boundaries while the app remains in the foreground.
     LaunchedEffect(foreground) {
         if (!foreground) return@LaunchedEffect
         while (foreground) {
-            val hadPending = pendingMeasuredRefresh
-            if (!hadPending) {
-                val reference = weatherPrefs.selectedReference()
-                val now = System.currentTimeMillis()
-                if (currentForecastSlotCaptured(reference.key, now)) {
-                    val nextSlot = ForecastMemoryStore.captureSlot10m(now) + LIVE_FORECAST_INTERVAL_MS
-                    delay((nextSlot - now).coerceAtLeast(1_000L))
-                    if (!foreground) break
+            if (pendingMeasuredRefresh) {
+                if (recalculateLocal("nouvelle mesure intérieure en attente")) {
+                    pendingMeasuredRefresh = false
                 }
             }
-            val ran = updateLive(force = hadPending)
-            if (ran && hadPending) pendingMeasuredRefresh = false
-            if (!ran) delay(30_000L)
+
+            val reference = weatherPrefs.selectedReference()
+            val now = System.currentTimeMillis()
+            if (slotClosed(reference.key, now)) {
+                val nextSlot = ForecastMemoryStore.captureSlot10m(now) + LIVE_FORECAST_INTERVAL_MS
+                delay((nextSlot - now).coerceAtLeast(1_000L))
+                continue
+            }
+
+            val ran = captureWeatherSlot("horloge canonique")
+            if (!ran) delay(5_000L)
         }
     }
 }
