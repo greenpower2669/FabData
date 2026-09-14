@@ -292,7 +292,8 @@ private data class LoadedData(
     val annotations: List<AnnotationItem>,
     val allAnnotations: List<AnnotationItem>,
     val lyonReconstructedSamples: List<SamplePoint>,
-    val inertiaEstimate: ThermalInertiaEstimate?
+    val inertiaEstimate: ThermalInertiaEstimate?,
+    val latestUserDataTimestamp: Long?
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -343,6 +344,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var navigatorOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var explorationOverviewSampleMap by remember { mutableStateOf<Map<Long, List<SamplePoint>>>(emptyMap()) }
     var globalBounds by remember { mutableStateOf<LongRange?>(null) }
+    var latestUserDataTimestamp by remember { mutableStateOf<Long?>(null) }
     var viewBounds by remember { mutableStateOf<LongRange?>(null) }
     var wideOverviewRange by remember { mutableStateOf(uiPrefs.wideOverviewRange()) }
     var explorationOverviewRange by remember { mutableStateOf(uiPrefs.explorationOverviewRange()) }
@@ -658,7 +660,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
 
             // Les thermomètres physiques/importés définissent la période de navigation.
             // Lyon et les sondes HTTP complètent cette période sans pousser l'ancien hors écran.
-            val physicalBounds = db.physicalSensorBounds() ?: db.globalTimeBounds()
+            val userPhysicalBounds = db.physicalSensorBounds()
+            val physicalBounds = userPhysicalBounds ?: db.globalTimeBounds()
             val selectedWeatherReference = WeatherReferencePrefs(context).selectedReference()
             val weatherBounds = weatherReferenceStore.historyBounds(selectedWeatherReference.key)
             val historicalBounds = when {
@@ -700,7 +703,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             val allNotes = db.annotationsAll()
             FabOperationRegistry.ensureNotCancelled(reloadOperation)
             if (chosen == null || all == null) {
-                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null)
+                LoadedData(s, all, null, emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyMap(), emptyList(), allNotes, emptyList(), null, userPhysicalBounds?.last)
             } else {
                 fun centeredRange(center: Long, requestedSpan: Long, outer: LongRange): LongRange {
                     val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
@@ -883,7 +886,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     navigatorOverview,
                     withInertiaLod(explorationOverview, OVERVIEW_LOD_6H_MS, explorationScope),
                     stat,
-                    db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia
+                    db.annotations(chosen.first, chosen.last), allNotes, lyonReconstructed, inertia,
+                    userPhysicalBounds?.last
                 )
             }
         }
@@ -895,6 +899,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
         sensors = loaded.sensors
         globalBounds = loaded.globalBounds
+        latestUserDataTimestamp = loaded.latestUserDataTimestamp
         viewBounds = loaded.viewBounds
         sampleMap = loaded.samples
         lyonReconstructedSamples = loaded.lyonReconstructedSamples
@@ -1418,6 +1423,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             ?: inertiaEstimate?.diagnostics?.sourceSensorId,
                         historyBounds = overviewDisplayBounds,
                         presentAnchorTimestamp = overviewPresentAnchor,
+                        latestUserDataTimestamp = latestUserDataTimestamp ?: overviewPresentAnchor,
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
                         lowerZonesPending = lowerCascadeVeil,
@@ -2561,6 +2567,7 @@ private fun HistoryOverviewCard(
     preferredIndoorSensorId: Long?,
     historyBounds: LongRange?,
     presentAnchorTimestamp: Long,
+    latestUserDataTimestamp: Long,
     viewBounds: LongRange?,
     selectedTimestamp: Long?,
     lowerZonesPending: Boolean,
@@ -2734,7 +2741,7 @@ private fun HistoryOverviewCard(
                 // Exploration starts at an explicit multiple of the detailed graph.
                 // This gives the middle band enough context to spot hot/cold zones before opening detail.
                 val requestedContextSpan = mainSpan * explorationContextMultiplier.toLong()
-                val maxSpan = minOf(requestedContextSpan, fullSpan).coerceAtLeast(1L)
+                val maxSpan = minOf(requestedContextSpan, maxOf(1L, fullSpan / 2L)).coerceAtLeast(1L)
                 val minSpan = minOf(maxSpan, maxOf(6L * 60L * 60L * 1000L, mainSpan))
                 val maxZoom = (maxSpan.toDouble() / minSpan.toDouble()).toFloat().coerceAtLeast(1f)
                 val effectiveZoom = previewZoom.coerceIn(1f, maxZoom)
@@ -2772,13 +2779,9 @@ private fun HistoryOverviewCard(
                     return clampCenterToRange(start + span / 2L, span, outer)
                 }
 
-                // Niveau 1 : le giga est le seul historique complet.
-                // Sa sélection doit rester un VRAI niveau intermédiaire et non retomber
-                // automatiquement sur tout l'historique. Le milieu vaut environ 2x
-                // l'exploration, avec un plancher d'un mois pour les petits presets.
-                val minimumWideSpan = minOf(fullSpan, maxOf(PreviewPreset.M1.spanMs, previewSpan))
-                val desiredWideSpan = maxOf(previewSpan * 2L, minimumWideSpan)
-                val wideSpan = minOf(fullSpan, desiredWideSpan).coerceAtLeast(previewSpan)
+                // Cascade geometry: band 2 is always exactly twice band 3.
+                // The x3..x9 selector still chooses band 3 from the detailed graph.
+                val wideSpan = minOf(fullSpan, previewSpan * 2L).coerceAtLeast(previewSpan)
                 val effectiveWideCenter = clampCenter(wideCenter, wideSpan)
                 val wideFrom = if (wideSpan >= fullSpan) bounds.first else effectiveWideCenter - wideSpan / 2L
                 val wideTo = if (wideSpan >= fullSpan) bounds.last else wideFrom + wideSpan
@@ -2793,24 +2796,25 @@ private fun HistoryOverviewCard(
                 val previewTo = if (previewSpan >= wideSpan) wideTo else previewFrom + previewSpan
                 val previewWindow = previewFrom..previewTo
 
-                // Initial load and explicit refresh: align the complete lower cascade to the right
-                // edge of the PRESENT. The giga band may extend one month further, but we do not
-                // boot the useful views inside that intentionally empty future runway.
-                LaunchedEffect(presentAnchorTimestamp, viewBounds?.first, viewBounds?.last) {
+                // Initial load and explicit refresh: the temporal midpoint is the newest
+                // real timestamp from the user's physical probes. This keeps recent RAW on
+                // the left and leaves symmetric room for forecasts on the right.
+                // Upper-band drag/tap releases still cascade their children to the right edge.
+                LaunchedEffect(presentAnchorTimestamp, latestUserDataTimestamp, viewBounds?.first, viewBounds?.last) {
                     val detail = viewBounds ?: return@LaunchedEffect
                     if (appliedRightAnchor == presentAnchorTimestamp) return@LaunchedEffect
-                    val present = presentAnchorTimestamp.coerceIn(bounds.first, bounds.last)
-                    val initialWideCenter = rightAlignedCenterAt(present, wideSpan, bounds)
+                    val latestData = latestUserDataTimestamp.coerceIn(bounds.first, bounds.last)
+                    val initialWideCenter = clampCenter(latestData, wideSpan)
                     val initialWideRange = rangeForCenter(initialWideCenter, wideSpan, bounds)
-                    val initialPreviewCenter = rightAlignedCenterAt(present, previewSpan, initialWideRange)
+                    val initialPreviewCenter = clampCenterToRange(latestData, previewSpan, initialWideRange)
                     val initialPreviewRange = rangeForCenter(initialPreviewCenter, previewSpan, initialWideRange)
                     val detailSpan = (detail.last - detail.first).coerceAtLeast(1L).coerceAtMost(previewSpan)
-                    val initialDetailCenter = rightAlignedCenterAt(present, detailSpan, initialPreviewRange)
+                    val initialDetailCenter = clampCenterToRange(latestData, detailSpan, initialPreviewRange)
                     appliedRightAnchor = presentAnchorTimestamp
                     wideCenter = initialWideCenter
                     previewCenter = initialPreviewCenter
                     onNavigate(initialDetailCenter)
-                    onSelectTimestamp(present.coerceIn(initialPreviewRange.first, initialPreviewRange.last))
+                    onSelectTimestamp(latestData.coerceIn(initialPreviewRange.first, initialPreviewRange.last))
                 }
 
                 LaunchedEffect(temporalPageSyncToken, temporalPageSyncCenter) {
@@ -2858,10 +2862,17 @@ private fun HistoryOverviewCard(
                 val visiblePoints = remember(previewSensorPoints) {
                     previewSensorPoints.values.flatten()
                 }
+                val explorationWeatherPoints = remember(sampleMap, previewFrom, previewTo) {
+                    navigationWeatherPoints(sampleMap)
+                        .filter { it.timestamp in previewWindow }
+                }
                 val minPoint = visiblePoints.minByOrNull { it.temperature }
                 val maxPoint = visiblePoints.maxByOrNull { it.temperature }
-                val minTemp = minPoint?.temperature ?: 0.0
-                val maxTemp = maxPoint?.temperature ?: 1.0
+                val scalePoints = remember(visiblePoints, explorationWeatherPoints) {
+                    visiblePoints + explorationWeatherPoints
+                }
+                val minTemp = scalePoints.minOfOrNull { it.temperature } ?: 0.0
+                val maxTemp = scalePoints.maxOfOrNull { it.temperature } ?: 1.0
                 val tempRange = (maxTemp - minTemp).takeIf { it > 0.01 } ?: 1.0
                 val highlight = MaterialTheme.colorScheme.primary
                 val selectionColor = MaterialTheme.colorScheme.tertiary
@@ -3217,7 +3228,7 @@ private fun HistoryOverviewCard(
 
                 HorizontalDivider()
                 Text(
-                    "Sélection / exploration · LOD 6 h · limitée par le bandeau du milieu",
+                    "Sélection / exploration · LOD 6 h · météo colorée + sondes · 1/2 du bandeau 2",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -3260,7 +3271,7 @@ private fun HistoryOverviewCard(
                                     ?: (24L * 60L * 60L * 1000L)
                                 val oldMaxSpan = minOf(
                                     oldMainSpan * explorationContextMultiplier.toLong(),
-                                    fullSpan
+                                    maxOf(1L, fullSpan / 2L)
                                 ).coerceAtLeast(1L)
                                 val oldMinSpan = minOf(
                                     oldMaxSpan,
@@ -3398,6 +3409,26 @@ private fun HistoryOverviewCard(
                                     style = Stroke(width = 1.5.dp.toPx())
                                 )
                             }
+                        }
+                    }
+
+                    // Météo extérieure : même gradient température que les deux bandeaux supérieurs.
+                    val weatherGapLimit = maxOf(
+                        6L * 60L * 60L * 1000L,
+                        previewSpan / 150L
+                    )
+                    explorationWeatherPoints.zipWithNext().forEach { (a, b) ->
+                        if (b.timestamp - a.timestamp <= weatherGapLimit) {
+                            val x1 = (((a.timestamp - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
+                                .coerceIn(0f, size.width)
+                            val x2 = (((b.timestamp - previewFrom).toDouble() / previewSpan.toDouble()).toFloat() * size.width)
+                                .coerceIn(0f, size.width)
+                            val y1 = size.height - (((a.temperature - minTemp) / tempRange).toFloat() * size.height)
+                            val y2 = size.height - (((b.temperature - minTemp) / tempRange).toFloat() * size.height)
+                            drawLine(
+                                weatherTemperatureColor((a.temperature + b.temperature) / 2.0).copy(alpha = 0.86f),
+                                Offset(x1, y1), Offset(x2, y2), 1.7.dp.toPx()
+                            )
                         }
                     }
 
