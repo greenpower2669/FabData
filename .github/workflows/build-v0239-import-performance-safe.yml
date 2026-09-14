@@ -1,0 +1,104 @@
+name: Build v0.23.9 import performance-safe APK
+
+on:
+  push:
+    branches:
+      - fix/v0239-import-performance-safe
+    paths:
+      - 'app/**'
+      - 'tools/patch_v0239_import_performance.py'
+      - 'vigilance.md'
+      - '.github/workflows/build-v0239-import-performance-safe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact v0.23.9 correction branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/v0239-import-performance-safe
+          fetch-depth: 0
+
+      - name: Apply local import optimization once
+        shell: bash
+        run: |
+          if grep -q 'private fun upsertMeasuredFast' app/src/main/java/com/fabdata/app/BackupLayer.kt; then
+            echo 'Import optimization already present'
+          else
+            python tools/patch_v0239_import_performance.py
+          fi
+
+      - name: Commit optimized source
+        shell: bash
+        run: |
+          if ! git diff --quiet -- app/src/main/java/com/fabdata/app/BackupLayer.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add app/src/main/java/com/fabdata/app/BackupLayer.kt app/src/main/java/com/fabdata/app/BackupV3Support.kt
+            git commit -m 'Optimize v0.23.9 full backup restore with real progress'
+            git push origin HEAD:fix/v0239-import-performance-safe
+          else
+            echo 'No source changes to commit'
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Make test APK install beside normal FabData
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('app/build.gradle.kts')
+          text = p.read_text(encoding='utf-8')
+          needle = '''        release {\n            isMinifyEnabled = true\n'''
+          replacement = '''        release {\n            applicationIdSuffix = ".importfast239test"\n            versionNameSuffix = "-importfast239-test"\n            isMinifyEnabled = true\n'''
+          if needle not in text:
+              raise SystemExit('release block not found')
+          p.write_text(text.replace(needle, replacement, 1), encoding='utf-8')
+
+          manifest = Path('app/src/main/AndroidManifest.xml')
+          if manifest.exists():
+              m = manifest.read_text(encoding='utf-8')
+              m = m.replace('android:label="FabData"', 'android:label="FabData 0.23.9 TEST"')
+              manifest.write_text(m, encoding='utf-8')
+
+      - name: Build release candidate
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Stage candidate only
+        shell: bash
+        run: |
+          rm -rf ci-artifacts
+          mkdir -p ci-artifacts
+          cp app/build/outputs/apk/release/app-release.apk ci-artifacts/FabData-v0.23.9-import-performance-safe-test.apk
+          sha256sum ci-artifacts/FabData-v0.23.9-import-performance-safe-test.apk > ci-artifacts/FabData-v0.23.9-import-performance-safe-test-sha256.txt
+          ls -lh ci-artifacts/
+
+      - name: Upload candidate APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.23.9-import-performance-safe-test
+          path: |
+            ci-artifacts/FabData-v0.23.9-import-performance-safe-test.apk
+            ci-artifacts/FabData-v0.23.9-import-performance-safe-test-sha256.txt
+          if-no-files-found: error
+          retention-days: 30
