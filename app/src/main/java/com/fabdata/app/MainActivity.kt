@@ -321,8 +321,13 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val snackbar = remember { SnackbarHostState() }
     var reloadRequestGeneration by remember { mutableIntStateOf(1) }
     var reloadPendingPriority by remember { mutableIntStateOf(UiReloadPriority.DATA.rank) }
-    fun queueUiReload(priority: UiReloadPriority) {
+    var reloadPendingTrigger by remember { mutableStateOf("démarrage") }
+    var reloadMergedRequests by remember { mutableIntStateOf(0) }
+    var viewIntentGeneration by remember { mutableIntStateOf(0) }
+    fun queueUiReload(priority: UiReloadPriority, trigger: String) {
         reloadPendingPriority = maxOf(reloadPendingPriority, priority.rank)
+        reloadPendingTrigger = trigger
+        reloadMergedRequests++
         reloadRequestGeneration++
     }
 
@@ -347,6 +352,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var customViewSpanMs by remember { mutableStateOf(uiPrefs.customViewSpan()) }
     var showAllAnnotations by remember { mutableStateOf(uiPrefs.showAllAnnotations()) }
     var reloadToken by remember { mutableIntStateOf(0) }
+    fun notifyDataChanged(trigger: String, priority: UiReloadPriority = UiReloadPriority.DATA) {
+        reloadToken++
+        queueUiReload(priority, trigger)
+    }
     var busy by remember { mutableStateOf(false) }
     var lowerCascadeVeil by remember { mutableStateOf(false) }
     var lowerCascadeAwaitingReload by remember { mutableStateOf(false) }
@@ -395,9 +404,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         lyonLab = lyonLab,
         credentials = meteoCredentials,
         dataVersion = reloadToken,
-        onDataChanged = {
-            reloadToken++
-            queueUiReload(UiReloadPriority.DATA)
+        onDataChanged = { trigger ->
+            notifyDataChanged(trigger, UiReloadPriority.DATA)
         }
     )
 
@@ -468,7 +476,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     key = "import-data",
                     title = "Importation prioritaire",
                     detail = "Préparation · priorité maximale",
-                    cancellable = false
+                    cancellable = false,
+                    trigger = "sélection utilisateur",
+                    priority = "CRITICAL",
+                    network = false
                 )
                 if (importOperation == null) {
                     snackbar.showSnackbar("Une importation est déjà en cours")
@@ -509,9 +520,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 val eventsDuplicates = ok.sumOf { it.eventsDuplicates }
                 val invalid = ok.sumOf { it.invalid }
                 busy = false
-                reloadToken++
+                notifyDataChanged("import terminé", UiReloadPriority.CRITICAL)
                 FabOperationRegistry.update(importOperation, "Données importées · affichage prioritaire en file", uris.size, uris.size)
-                queueUiReload(UiReloadPriority.CRITICAL)
                 FabOperationRegistry.finish(
                     importOperation,
                     "Import terminé · $measuresAdded mesure(s) ajoutée(s) · affichage prioritaire demandé"
@@ -535,8 +545,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             withContext(Dispatchers.IO) {
                 configs.forEach { config -> runCatching { remoteSensorSync.sync(config) } }
             }
-            reloadToken++
-            queueUiReload(UiReloadPriority.BACKGROUND_DATA)
+            notifyDataChanged("sondes HTTP automatiques", UiReloadPriority.BACKGROUND_DATA)
         }
     }
 
@@ -547,7 +556,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 key = "import-data",
                 title = "Importation prioritaire",
                 detail = "Ouverture du fichier · priorité maximale",
-                cancellable = false
+                cancellable = false,
+                trigger = "ouverture fichier externe",
+                priority = "CRITICAL",
+                network = false
             )
             if (importOperation == null) return@LaunchedEffect
             FabOperationRegistry.requestYieldForImport()
@@ -565,8 +577,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 Result.failure(error)
             }
             busy = false
-            reloadToken++
-            queueUiReload(UiReloadPriority.CRITICAL)
+            notifyDataChanged("import initial terminé", UiReloadPriority.CRITICAL)
             result.fold(
                 onSuccess = {
                     FabOperationRegistry.finish(
@@ -589,10 +600,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     }
 
     LaunchedEffect(preset, windowCenterTimestamp, customViewSpanMs, wideOverviewRange, explorationOverviewRange) {
-        // UI-only movement is low priority. It is buffered and merged; it never cancels
-        // a reload already in progress.
+        // Mark the intent immediately. Older reads are forbidden from applying afterward.
+        viewIntentGeneration++
         delay(180L)
-        queueUiReload(UiReloadPriority.NAVIGATION)
+        queueUiReload(UiReloadPriority.NAVIGATION, "navigation / zoom / sélection")
     }
 
     LaunchedEffect(Unit) {
@@ -604,9 +615,16 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             .conflate()
             .collect {
                 val priorityRank = reloadPendingPriority
+                val trigger = reloadPendingTrigger
+                val mergedRequests = (reloadMergedRequests.coerceAtLeast(1) - 1)
+                val generation = reloadRequestGeneration
+                val viewGenerationAtStart = viewIntentGeneration
                 reloadPendingPriority = 0
+                reloadMergedRequests = 0
                 if (FabDataWorkArbiter.criticalImportPending()) {
                     reloadPendingPriority = maxOf(reloadPendingPriority, priorityRank)
+                    reloadPendingTrigger = trigger
+                    reloadMergedRequests += mergedRequests + 1
                     return@collect
                 }
                 reloadMutex.withLock {
@@ -617,7 +635,12 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 "Actualisation affichage",
                 if (priorityRank >= UiReloadPriority.CRITICAL.rank) "Priorité critique · lecture des courbes…"
                 else "Données mises à jour · lecture des courbes…",
-                cancellable = true
+                cancellable = true,
+                trigger = trigger,
+                priority = UiReloadPriority.entries.firstOrNull { it.rank == priorityRank }?.name ?: "MERGED",
+                network = false,
+                generation = generation,
+                mergedRequests = mergedRequests
             )
         } else null
         var reloadSucceeded = false
@@ -861,6 +884,11 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             }
         }
         FabOperationRegistry.ensureNotCancelled(reloadOperation)
+        if (viewGenerationAtStart != viewIntentGeneration) {
+            FabOperationRegistry.discard(reloadOperation)
+            queueUiReload(UiReloadPriority.NAVIGATION, "interaction utilisateur plus récente")
+            return@withLock
+        }
         sensors = loaded.sensors
         globalBounds = loaded.globalBounds
         viewBounds = loaded.viewBounds
@@ -883,8 +911,8 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
         }
 
         loaded.viewBounds?.let { bounds ->
-            val current = selectedTimestamp
-            if (current == null || current !in bounds) {
+            // A background/data refresh never moves an explicit user cursor.
+            if (selectedTimestamp == null) {
                 selectedTimestamp = bounds.first + (bounds.last - bounds.first) / 2L
             }
         }
@@ -1272,7 +1300,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                             if (FabOperationRegistry.cancelRequested(operationId)) {
                                 FabOperationRegistry.cancelled(operationId, "Arrêt demandé · bloc réseau terminé")
                             } else {
-                                reloadToken++
+                                notifyDataChanged("modification locale")
                             }
                             snackbar.showSnackbar(
                                 result.fold(
@@ -1388,7 +1416,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                         ThermalTrainingMaskStore(db).includeRange(sensorId, range.first, range.last)
                                     }
                                     if (changed > 0) trainedModelStore.markDirty("Sélection d’apprentissage modifiée")
-                                    reloadToken++
+                                    notifyDataChanged("modification locale")
                                     busy = false
                                     snackbar.showSnackbar(
                                         if (changed > 0) "Zone réintégrée · modèle à réentraîner"
@@ -1414,7 +1442,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                         )
                                     }
                                     trainedModelStore.markDirty("Sélection d’apprentissage modifiée")
-                                    reloadToken++
+                                    notifyDataChanged("modification locale")
                                     busy = false
                                     snackbar.showSnackbar("Zone exclue · RAW conservées · modèle à réentraîner")
                                 }
@@ -1457,7 +1485,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 if (target == ThermalTrainingTarget.INERTIA || target == ThermalTrainingTarget.BOTH) {
                                     trainedModelStore.markDirty("Sélection d’apprentissage inertiel modifiée")
                                 }
-                                reloadToken++
+                                notifyDataChanged("modification locale")
                                 busy = false
                                 val targetLabel = when (target) {
                                     ThermalTrainingTarget.INERTIA -> "inertie / sol · sonde ciblée"
@@ -1582,7 +1610,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                     }
                                 }
                                 busy = false
-                                reloadToken++
+                                notifyDataChanged("modification locale")
                                 snackbar.showSnackbar(
                                     result.fold(
                                         onSuccess = { "${it.label} · ${it.measured} réel(s) · ${it.reconstructed} reconstruit(s)" },
@@ -1596,7 +1624,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 busy = true
                                 val result = runCatching { completeLyonHybrid(db, lyonWeather, meteoOfficial, meteoCredentials) }
                                 busy = false
-                                reloadToken++
+                                notifyDataChanged("modification locale")
                                 snackbar.showSnackbar(
                                     result.fold(
                                         onSuccess = { "${it.label} : ${it.received} lot(s) · ${it.stored} valeur(s) stockée(s)" },
@@ -1611,7 +1639,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 busy = true
                                 val result = withContext(Dispatchers.IO) { runCatching { remoteSensorSync.sync(config) } }
                                 busy = false
-                                reloadToken++
+                                notifyDataChanged("modification locale")
                                 snackbar.showSnackbar(
                                     result.fold(
                                         onSuccess = { "${config.name} : ${if (it.added) "mesure ajoutée" else "déjà à jour"}" },
@@ -1666,7 +1694,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         lyonLab = lyonLab,
                         credentials = meteoCredentials,
                         dataVersion = reloadToken,
-                        onDataChanged = { reloadToken++ },
+                        onDataChanged = { notifyDataChanged("modification locale") },
                         onBusyChanged = { thermalBusy = it },
                         onProgressChanged = { thermalProgressText = it }
                     )
@@ -1750,7 +1778,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                                 withContext(Dispatchers.IO) { db.deleteAnnotation(id) }
                                 if (selectedAnnotation?.id == id) selectedAnnotation = null
                                 if (detailAnnotation?.id == id) detailAnnotation = null
-                                reloadToken++
+                                notifyDataChanged("modification locale")
                             }
                         }
                     )
@@ -1794,7 +1822,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     selectedTimestamp = null
                     selectedAnnotation = null
                     detailAnnotation = null
-                    reloadToken++
+                    notifyDataChanged("modification locale")
                     settingsOpen = false
                     snackbar.showSnackbar("Base FabData vidée")
                 }
@@ -1810,7 +1838,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             styleStore = curveStyleStore,
             initialBounds = viewBounds,
             onDismiss = { lyonDetailOpen = false },
-            onDataChanged = { reloadToken++ },
+            onDataChanged = { notifyDataChanged("modification locale") },
             onStyleEdit = { key, label -> styleEditKey = key to label }
         )
     }
@@ -1839,7 +1867,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     busy = true
                     val result = withContext(Dispatchers.IO) { runCatching { remoteSensorSync.sync(config) } }
                     busy = false
-                    reloadToken++
+                    notifyDataChanged("modification locale")
                     snackbar.showSnackbar(
                         result.fold(
                             onSuccess = { "${config.name} initialisée · synchro automatique activée" },
@@ -1872,7 +1900,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     }
                     annotationTimestamp = null
                     editingAnnotation = null
-                    reloadToken++
+                    notifyDataChanged("modification locale")
                 }
             }
         )
@@ -1886,7 +1914,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                 scope.launch {
                     withContext(Dispatchers.IO) { db.updateSensor(sensor.id, name, room, colorIndex) }
                     editSensor = null
-                    reloadToken++
+                    notifyDataChanged("modification locale")
                 }
             },
             onDelete = {
@@ -1895,7 +1923,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     showTemp.remove(sensor.id)
                     showHumidity.remove(sensor.id)
                     editSensor = null
-                    reloadToken++
+                    notifyDataChanged("modification locale")
                 }
             }
         )
@@ -1917,7 +1945,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                     withContext(Dispatchers.IO) { db.deleteAnnotation(note.id) }
                     selectedAnnotation = null
                     detailAnnotation = null
-                    reloadToken++
+                    notifyDataChanged("modification locale")
                 }
             }
         )
