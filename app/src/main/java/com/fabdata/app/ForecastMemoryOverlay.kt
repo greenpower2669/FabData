@@ -114,7 +114,8 @@ class ForecastMemoryBootstrapProvider : ContentProvider() {
 object ForecastMemoryStore {
     const val TABLE = "forecast_snapshot_archive"
     private const val LEGACY_TRIGGER = "trg_fabdata_forecast_memory_insert"
-    private const val TRIGGER = "trg_fabdata_forecast_memory_insert_v2"
+    private const val PREVIOUS_TRIGGER = "trg_fabdata_forecast_memory_insert_v2"
+    private const val TRIGGER = "trg_fabdata_forecast_memory_insert_v3"
     private const val ATTEMPT_TABLE = "forecast_capture_attempt"
     private const val ATTEMPT_RETENTION_MS = 7L * 24L * 60L * 60L * 1000L
 
@@ -180,9 +181,32 @@ object ForecastMemoryStore {
             """.trimIndent()
         )
 
-        // v2 is a versioned migration. The old trigger is retired once; the active trigger
-        // is never DROP/CREATE'd during normal reads, avoiding the former concurrency crash.
-        sql.execSQL("DROP TRIGGER IF EXISTS $LEGACY_TRIGGER")
+        // v3: the archive slot is the slot CLAIMED before the provider request, not the
+        // wall-clock minute at which an individual SQLite row happens to be inserted.
+        // This matters when a request starts at 14:09:59 and finishes after 14:10:00:
+        // every row still belongs to the single 14:00 emission. issued_at keeps the real time.
+        fun triggerExists(name: String): Boolean = sql.rawQuery(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=? LIMIT 1",
+            arrayOf(name)
+        ).use { it.moveToFirst() }
+
+        // Retire each obsolete trigger only if it actually exists. Normal ensure() calls are
+        // read-only with respect to old trigger names, avoiding the former DROP/CREATE race.
+        if (triggerExists(LEGACY_TRIGGER)) sql.execSQL("DROP TRIGGER $LEGACY_TRIGGER")
+        if (triggerExists(PREVIOUS_TRIGGER)) sql.execSQL("DROP TRIGGER $PREVIOUS_TRIGGER")
+
+        val claimedSlotSql = """
+            COALESCE(
+                (SELECT ca.capture_slot_10m
+                 FROM $ATTEMPT_TABLE ca
+                 WHERE ca.reference_key=NEW.reference_key
+                   AND ca.finished_at IS NULL
+                   AND ca.started_at<=NEW.updated_at
+                 ORDER BY ca.started_at DESC
+                 LIMIT 1),
+                (NEW.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
+            )
+        """.trimIndent()
         sql.execSQL(
             """
             CREATE TRIGGER IF NOT EXISTS $TRIGGER
@@ -200,7 +224,7 @@ object ForecastMemoryStore {
                     NEW.humidity,
                     NEW.confidence,
                     'active_reference',
-                    (NEW.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
+                    $claimedSlotSql
                 WHERE NOT EXISTS (
                     SELECT 1
                     FROM $TABLE a
@@ -210,35 +234,15 @@ object ForecastMemoryStore {
                       AND COALESCE(
                           a.capture_slot_10m,
                           (a.issued_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
-                      ) = (NEW.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
+                      ) = $claimedSlotSql
                 );
             END
             """.trimIndent()
         )
 
-        // Seed only the current logical slot. Existing historical timestamps are never changed.
-        sql.execSQL(
-            """
-            INSERT INTO $TABLE(
-                reference_key, issued_at, target_ts, temperature, humidity, confidence, provider, capture_slot_10m
-            )
-            SELECT
-                w.reference_key, w.updated_at, w.timestamp, w.temperature, w.humidity, w.confidence,
-                'active_reference', (w.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
-            FROM weather_reference_samples w
-            WHERE w.source='forecast'
-              AND NOT EXISTS (
-                  SELECT 1 FROM $TABLE a
-                  WHERE a.reference_key=w.reference_key
-                    AND a.target_ts=w.timestamp
-                    AND a.provider='active_reference'
-                    AND COALESCE(
-                        a.capture_slot_10m,
-                        (a.issued_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
-                    ) = (w.updated_at / $FORECAST_CAPTURE_SLOT_MS) * $FORECAST_CAPTURE_SLOT_MS
-              )
-            """.trimIndent()
-        )
+        // No recurring cache seeding here. The v3 trigger archives each newly acquired raw
+        // provider row exactly once. Re-seeding weather_reference_samples on every ensure()
+        // could manufacture a second logical slot after a request crossed a 10-minute boundary.
     }
 
     fun hasCaptureSlot(sql: SQLiteDatabase, referenceKey: String, timestamp: Long): Boolean {
