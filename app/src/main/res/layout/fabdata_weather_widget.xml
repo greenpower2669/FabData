@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="10dp"
+    android:background="@drawable/fabdata_widget_background">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="FabData · MÉTÉO"
+            android:textStyle="bold"
+            android:textSize="14sp"
+            android:textColor="#FFFFFFFF" />
+
+        <TextView
+            android:id="@+id/widget_reference"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Lyon"
+            android:textSize="10sp"
+            android:textColor="#CCFFFFFF" />
+    </LinearLayout>
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1.15"
+        android:layout_marginTop="4dp">
+
+        <ImageView
+            android:id="@+id/widget_weather_curve"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitXY"
+            android:contentDescription="Courbe météo colorée" />
+
+        <TextView
+            android:id="@+id/widget_weather_values"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:paddingLeft="10dp"
+            android:paddingRight="10dp"
+            android:paddingTop="5dp"
+            android:paddingBottom="5dp"
+            android:background="@drawable/fabdata_widget_value_pill"
+            android:text="Maintenant  —        +1 h  —"
+            android:textStyle="bold"
+            android:textSize="16sp"
+            android:textColor="#FFFFFFFF" />
+    </FrameLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="5dp"
+        android:background="#33FFFFFF" />
+
+    <TextView
+        android:id="@+id/widget_inertia_values"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:text="Sol inertiel   —     +1 h —     +2 h —"
+        android:textStyle="bold"
+        android:textSize="12sp"
+        android:textColor="#FFE6DAFF" />
+
+    <TextView
+        android:id="@+id/widget_adaptive_caption"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="3dp"
+        android:text="Fab adaptative H+1 → H+48"
+        android:textSize="10sp"
+        android:textColor="#FFFFD77A" />
+
+    <ImageView
+        android:id="@+id/widget_adaptive_curve"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="0.85"
+        android:layout_marginTop="2dp"
+        android:scaleType="fitXY"
+        android:contentDescription="Courbe adaptative de H plus 1 à H plus 48" />
+
+</LinearLayout>
