@@ -28,6 +28,44 @@ class FabDataBackupV3Support(
         )
     }
 
+    // Import restore stores are cached for the whole backup. Constructing e.g.
+    // WeatherReferenceStore for every WEATHER row re-ran schema checks thousands
+    // of times and could contend with the forecast overlay reader.
+    private val restoreWeatherStore by lazy(LazyThreadSafetyMode.NONE) { WeatherReferenceStore(db) }
+    private val restoreWallStore by lazy(LazyThreadSafetyMode.NONE) { ThermalWallConfigStore(db) }
+    private val restoreWallSolarStore by lazy(LazyThreadSafetyMode.NONE) { ThermalWallSolarModelStore(db) }
+    private val restoreTrainingPolicyStore by lazy(LazyThreadSafetyMode.NONE) { ThermalTrainingPolicyStore(db) }
+    private var restorePrepared = false
+
+    /** Prepare every additive schema once, outside the bulk restore transaction. */
+    fun prepareRestore() {
+        if (restorePrepared) return
+        val sql = db.writableDatabase
+        ThermalTrainingPolicyStore.ensure(sql)
+        ThermalWallConfigStore.ensure(sql)
+        ThermalWallSolarModelStore.ensure(sql)
+        WeatherReferenceStore.ensure(sql)
+        ForecastMemoryStore.ensure(sql)
+        ForecastLocalSnapshotStore.ensure(sql)
+        ForecastPastArchiveStore.ensure(sql)
+        ForecastCurve10mStore.ensure(sql)
+        ForecastAdaptiveStore.ensure(sql)
+        // Force the cached constructors now too; subsequent rows perform data writes only.
+        restoreWeatherStore
+        restoreWallStore
+        restoreWallSolarStore
+        restoreTrainingPolicyStore
+        restorePrepared = true
+    }
+
+    private fun sensorIdByStableKey(stableKey: String): Long? {
+        if (stableKey.isBlank()) return null
+        return db.readableDatabase.rawQuery(
+            "SELECT id FROM sensors WHERE stable_key=? LIMIT 1",
+            arrayOf(stableKey)
+        ).use { c -> if (c.moveToFirst()) c.getLong(0) else null }
+    }
+
     fun writeExtraRows(writer: Writer) {
         ThermalTrainingPolicyStore.ensure(db.writableDatabase)
         ThermalWallConfigStore.ensure(db.writableDatabase)
@@ -260,6 +298,7 @@ class FabDataBackupV3Support(
 
     /** Returns true when the v3 record was recognized and restored. */
     fun importRecord(record: String, values: Map<String, String>): Boolean {
+        if (!restorePrepared) prepareRestore()
         return runCatching {
             when (record) {
                 "UI_PREFERENCES" -> restorePersonalization(json(values))
@@ -457,7 +496,7 @@ class FabDataBackupV3Support(
     }
 
     private fun restoreWeatherReferenceMeta(o: JSONObject) {
-        WeatherReferenceStore(db).rememberReference(
+        restoreWeatherStore.rememberReference(
             WeatherReference(
                 key = o.getString("key"),
                 city = o.getString("city"),
@@ -487,8 +526,7 @@ class FabDataBackupV3Support(
 
     private fun restoreTrainedModel(o: JSONObject) {
         val stableKey = o.optString("sensorStableKey", "")
-        val sensorId = db.sensors().firstOrNull { it.stableKey == stableKey }?.id
-            ?: o.optLong("sensorId", -1L)
+        val sensorId = sensorIdByStableKey(stableKey) ?: o.optLong("sensorId", -1L)
         if (sensorId < 0L) return
         val coeffJson = o.optJSONArray("coefficients") ?: JSONArray()
         val coeff = DoubleArray(coeffJson.length()) { coeffJson.optDouble(it, 0.0) }
@@ -531,7 +569,7 @@ class FabDataBackupV3Support(
     }
 
     private fun restoreWall(o: JSONObject) {
-        ThermalWallConfigStore(db).upsertWall(
+        restoreWallStore.upsertWall(
             ThermalWallSegment(
                 id = o.getString("id"),
                 index = o.optInt("index", 0),
@@ -545,10 +583,10 @@ class FabDataBackupV3Support(
     }
 
     private fun restoreSensorThermal(o: JSONObject) {
-        val sensor = db.sensors().firstOrNull { it.stableKey == o.optString("stableKey") } ?: return
-        ThermalWallConfigStore(db).setSensorConfig(
+        val sensorId = sensorIdByStableKey(o.optString("stableKey")) ?: return
+        restoreWallStore.setSensorConfig(
             SensorThermalConfig(
-                sensorId = sensor.id,
+                sensorId = sensorId,
                 role = enumValueOr(o.optString("role"), ThermalSensorRole.UNDEFINED),
                 outdoorKind = enumValueOr(o.optString("outdoorKind"), OutdoorSensorKind.UNSPECIFIED),
                 wallId = nullableString(o, "wallId"),
@@ -558,7 +596,7 @@ class FabDataBackupV3Support(
     }
 
     private fun restoreWallSolarModel(o: JSONObject) {
-        ThermalWallSolarModelStore(db).save(
+        restoreWallSolarStore.save(
             WallSolarModel(
                 wallId = o.getString("wallId"),
                 orientationDeg = o.optDouble("orientationDeg", 0.0),
@@ -581,14 +619,14 @@ class FabDataBackupV3Support(
         if (!o.optBoolean("enabled", true)) return
         val target = enumValueOr(o.optString("target"), ThermalTrainingTarget.INERTIA)
         val mode = enumValueOr(o.optString("mode"), ThermalTrainingRangeMode.EXCLUDE)
-        ThermalTrainingPolicyStore(db).apply(target, mode, o.getLong("from"), o.getLong("to"))
+        restoreTrainingPolicyStore.apply(target, mode, o.getLong("from"), o.getLong("to"))
     }
 
     private fun restoreTrainingExclusion(o: JSONObject) {
         if (!o.optBoolean("enabled", true)) return
-        val sensor = db.sensors().firstOrNull { it.stableKey == o.optString("stableKey") } ?: return
+        val sensorId = sensorIdByStableKey(o.optString("stableKey")) ?: return
         ThermalTrainingMaskStore(db).addMerged(
-            sensor.id,
+            sensorId,
             o.getLong("from"),
             o.getLong("to"),
             o.optString("reason", "Sauvegarde v3")
@@ -596,7 +634,6 @@ class FabDataBackupV3Support(
     }
 
     private fun restoreForecastArchive(o: JSONObject) {
-        ForecastMemoryStore.ensure(db.writableDatabase)
         val key = o.optString("referenceKey", "").trim()
         val issuedAt = o.optLong("issuedAt", -1L)
         val targetAt = o.optLong("targetAt", -1L)
@@ -717,7 +754,7 @@ class FabDataBackupV3Support(
         val source = PointSource.fromDb(values["Source"])
         val confidence = values["Confiance"].orEmpty().trim().replace(',', '.').toDoubleOrNull() ?: 1.0
         if (key.isBlank()) return
-        WeatherReferenceStore(db).upsert(
+        restoreWeatherStore.upsert(
             key,
             WeatherReferencePoint(ts, temp, humidity, source, confidence.coerceIn(0.0, 1.0))
         )

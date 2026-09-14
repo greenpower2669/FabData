@@ -170,6 +170,15 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                 record == "SAMPLE" -> "Mesures RAW $doneSamples/$totalSamples"
                 record == "WEATHER" -> "Météo $doneWeather/$totalWeather"
                 record == "UI_PREFERENCES" -> "Personnalisation $donePreferences/$totalPreferences"
+                record == "WEATHER_META" -> "Référence météo"
+                record == "WEATHER_REFERENCE_META" -> "Métadonnées station météo"
+                record == "THERMAL_PROFILE" -> "Profil thermique"
+                record == "TRAINED_MODEL" -> "Modèle thermique entraîné"
+                record == "WALL" -> "Configuration des murs"
+                record == "SENSOR_THERMAL" -> "Rôles thermiques des sondes"
+                record == "WALL_SOLAR_MODEL" -> "Modèle solaire des murs"
+                record == "TRAINING_POLICY" -> "Sélections d’apprentissage"
+                record == "TRAINING_EXCLUSION" -> "Exclusions d’apprentissage"
                 record in archiveTypes -> "Archives $doneArchives/$totalArchives"
                 record == "SENSOR" -> "Capteurs"
                 record == "EVENT" -> "Événements"
@@ -199,6 +208,16 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
 
             PointSourceStore.ensure(db.writableDatabase)
             val v3Support = FabDataBackupV3Support(context, db)
+            // Prépare une seule fois les tables/index/stores AVANT la grosse transaction.
+            // Cela évite des CREATE TABLE/INDEX répétés pendant la restauration et les
+            // attentes de verrou de schéma face aux lecteurs UI/overlay.
+            FabOperationRegistry.update(
+                operationId,
+                "Préparation des structures de restauration…",
+                0,
+                totalRecords
+            )
+            v3Support.prepareRestore()
 
             db.inTransaction {
                 records.forEachIndexed { rowIndex, line ->
@@ -324,6 +343,17 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
                             "META", "BACKUP_END" -> Unit
 
                             else -> {
+                                // Pour les petites lignes d’état, annonce la ligne AVANT son
+                                // traitement. Si un store attend un verrou, l’écran nomme donc
+                                // exactement l’étape courante au lieu d’afficher la ligne précédente.
+                                if (record != "WEATHER" && record !in archiveTypes && operationId != null) {
+                                    FabOperationRegistry.update(
+                                        operationId,
+                                        "Traitement · ${stageFor(record)} · ligne ${rowIndex + 1}/$totalRecords",
+                                        rowIndex,
+                                        totalRecords
+                                    )
+                                }
                                 if (record == "WEATHER") doneWeather++
                                 if (record == "UI_PREFERENCES") donePreferences++
                                 if (record in archiveTypes) doneArchives++
