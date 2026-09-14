@@ -1,4 +1,4 @@
-name: Build v0.23.7 canonical scheduler
+name: Build v0.23.8 complete canonical horizon grid
 
 on:
   workflow_dispatch:
@@ -6,9 +6,7 @@ on:
     branches:
       - 'feature/forecast-fixed-lead-h24'
     paths:
-      - 'tools/patch_v0237_slot_store.py'
-      - 'tools/patch_v0237_horizon_windows.py'
-      - 'tools/patch_v0237_ui_queue.py'
+      - 'tools/patch_v0238_canonical_horizon_grid.py'
       - '.github/workflows/build-v0234-startup-help-dials.yml'
 
 permissions:
@@ -25,33 +23,28 @@ jobs:
           ref: feature/forecast-fixed-lead-h24
           fetch-depth: 0
 
-      - name: Validate patches
-        run: |
-          python3 -m py_compile tools/patch_v0237_slot_store.py
-          python3 -m py_compile tools/patch_v0237_horizon_windows.py
-          python3 -m py_compile tools/patch_v0237_ui_queue.py
+      - name: Validate patch
+        run: python3 -m py_compile tools/patch_v0238_canonical_horizon_grid.py
 
-      - name: Apply v0.23.7 patches
-        run: |
-          python3 tools/patch_v0237_slot_store.py
-          python3 tools/patch_v0237_horizon_windows.py
-          python3 tools/patch_v0237_ui_queue.py
+      - name: Apply v0.23.8 patch
+        run: python3 tools/patch_v0238_canonical_horizon_grid.py
 
       - name: Regression guards
         run: |
           git diff --check
-          grep -n 'versionName = "0.23.7"' app/build.gradle.kts
-          grep -n 'forecast_capture_attempt' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'fun tryClaimCaptureSlot' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'fun captureSlotClosed' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt
-          grep -n 'fixed-window-10m-v2' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
+          grep -n 'versionName = "0.23.8"' app/build.gradle.kts
+          grep -n 'includeForecastAfterCanonicalClaim' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'canonicalSlotClaimed: Boolean = false' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'now - 70L \* 60L \* 1000L' app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt
+          grep -n 'includeForecastAfterCanonicalClaim = true' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'canonicalSlotClaimed = true' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
+          ! grep -R -n 'refreshForecast(reference)' app/src/main/java/com/fabdata/app
           grep -n 'H1 = +10..+60 min' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
-          grep -n 'latestSnapshotWeatherByLead' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
-          grep -n 'jet unique H+1 → H+48' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
-          grep -n 'recalcul Fab uniquement' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
-          ! grep -n 'updateLive(force = true)' app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt
+          grep -n 'var target = slot + HORIZON_STEP_10M_MS' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
+          grep -n 'fun latestSnapshotWeatherByLead' app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt
+          grep -n 'val liveWeather = ForecastHorizonArchive(db).latestSnapshotWeatherByLead' app/src/main/java/com/fabdata/app/ForecastAdaptive.kt
+          grep -n 'forecastHorizonCurves.weatherByLead\[24\]' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'Déclenché par :' app/src/main/java/com/fabdata/app/FabOperationRegistry.kt
-          grep -n 'reloadPendingTrigger' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'interaction utilisateur plus récente' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'if (selectedTimestamp == null)' app/src/main/java/com/fabdata/app/MainActivity.kt
           grep -n 'tryClaimCaptureSlot' app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt
@@ -80,25 +73,29 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Normalize APK filename
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.7-release-canonical-scheduler.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/FabData-v0.23.8-release-canonical-horizon-grid.apk
 
       - name: Commit validated generated source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt \
+          git add app/build.gradle.kts \
+            app/src/main/java/com/fabdata/app/WeatherReferenceLayer.kt \
+            app/src/main/java/com/fabdata/app/LiveUpdateCoordinator.kt \
+            app/src/main/java/com/fabdata/app/ForecastArchiveWorker.kt \
             app/src/main/java/com/fabdata/app/ForecastHorizonArchive.kt \
+            app/src/main/java/com/fabdata/app/ForecastAdaptive.kt \
             app/src/main/java/com/fabdata/app/MainActivity.kt
           if git diff --cached --quiet; then
-            echo "v0.23.7 generated source already committed"
+            echo "v0.23.8 generated source already committed"
           else
-            git commit -m "Finalize canonical 10-minute scheduler and traced UI queue [skip ci]"
+            git commit -m "Enforce one forecast jet per slot and complete H1-H48 grid [skip ci]"
             git push origin HEAD:feature/forecast-fixed-lead-h24
           fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: FabData-v0.23.7-release-canonical-scheduler
-          path: app/build/outputs/apk/debug/FabData-v0.23.7-release-canonical-scheduler.apk
+          name: FabData-v0.23.8-release-canonical-horizon-grid
+          path: app/build/outputs/apk/debug/FabData-v0.23.8-release-canonical-horizon-grid.apk
           if-no-files-found: error
