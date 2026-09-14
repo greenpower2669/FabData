@@ -36,6 +36,8 @@ Le panneau des cadrans doit conserver simultanément :
 - Ne jamais modifier silencieusement les RAW/MEASURED historiques.
 - Conserver la priorité `MEASURED > RECONSTRUCTED > FORECAST`.
 - Conserver tous les enregistrements étendus gérés par `FabDataBackupV3Support` et les modules de prévisions/archives actuels.
+- Les lignes JSON de courbes/archives déjà contenues dans le backup doivent être restaurées directement par leur store. Ne pas ajouter une seconde vérification lourde, un recalcul de courbe ou un appel météo pendant l'import : l'intégrité du backup + le parseur typé existant font foi.
+- `UI_PREFERENCES` doit conserver la personnalisation de l'interface et des cadrans. Les fichiers de préférences FabData liés aux animations/mouvements/transitions doivent également être inclus, sans jamais inclure credential/token/secret/password/auth.
 - Une erreur de ligne ne doit pas disparaître silencieusement : garder au minimum la première anomalie avec ligne/type/message.
 - La progression d'un gros backup doit porter sur les enregistrements réels, pas rester uniquement à `0/1 fichier`.
 
@@ -49,13 +51,14 @@ Le panneau des cadrans doit conserver simultanément :
 
 ## Tests obligatoires avant candidate
 
-- Import du gros backup réel (~21 Mo) dans une base vide.
+- Import du gros backup réel (~23 Mo) dans une base vide.
 - Import du même backup dans une base déjà remplie.
 - Comparaison des compteurs avec le footer.
 - Vérification que la progression évolue rapidement après la phase de lecture/validation.
 - Test d'une sauvegarde v4 historique.
-- Export v5 puis réimport immédiat si le format courant est v5.
+- Export v5 puis réimport immédiat.
 - Vérification des cadrans : double tap, appui long, déplacement, resize, persistance.
+- Vérification de la restauration des personnalisations/animations.
 - Vérification des archives météo, horizons H+N, courbes sélectionnables, replay et slots déterministes.
 - Comparaison visuelle/fonctionnelle avec l'APK v0.23.9 de référence avant toute promotion.
 
