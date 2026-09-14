@@ -163,6 +163,7 @@ private const val OVERVIEW_LOD_6H_MS = 6L * 60L * 60L * 1000L
 private const val OVERVIEW_LOD_DAY_MS = 24L * 60L * 60L * 1000L
 private const val OVERVIEW_LOD_MONTH_MS = 30L * 24L * 60L * 60L * 1000L
 private const val FORECAST_DISPLAY_FUTURE_MS = 48L * 60L * 60L * 1000L
+private const val OVERVIEW_FUTURE_MONTH_MS = 31L * 24L * 60L * 60L * 1000L
 private const val LYON_DETAIL_GAP_MS = 90L * 60L * 1000L
 private const val LYON_NEAREST_TOLERANCE_MS = 75L * 60L * 1000L
 private const val WEATHER_OFFICIAL_SENSOR_ID = -6902900102L
@@ -352,6 +353,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     var customViewSpanMs by remember { mutableStateOf(uiPrefs.customViewSpan()) }
     var showAllAnnotations by remember { mutableStateOf(uiPrefs.showAllAnnotations()) }
     var reloadToken by remember { mutableIntStateOf(0) }
+    // Stable present anchor for the overview. It advances only at startup or explicit refresh,
+    // so normal recompositions do not make the selectors drift by a few milliseconds.
+    var overviewPresentAnchor by remember { mutableStateOf(System.currentTimeMillis()) }
     fun notifyDataChanged(trigger: String, priority: UiReloadPriority = UiReloadPriority.DATA) {
         reloadToken++
         queueUiReload(priority, trigger)
@@ -1156,11 +1160,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
     val chartNavigatorOverviewSampleMap = chartLodMap(navigatorOverviewSampleMap, OVERVIEW_LOD_DAY_MS)
     val chartExplorationOverviewSampleMap = chartLodMap(explorationOverviewSampleMap, OVERVIEW_LOD_6H_MS)
 
-    // Navigation is allowed to continue beyond the last terrain point up to NOW + 48 h.
-    // The terrain curve simply stops at its last real/reconstructed point while forecast curves continue.
+    // The giga overview always keeps one month of temporal runway after the anchored present.
+    // RAW/terrain data still stops where it really stops; only the navigable/display terrain extends.
     val overviewDisplayBounds = globalBounds?.let { historical ->
-        val now = System.currentTimeMillis()
-        historical.first..maxOf(historical.last, now + FORECAST_DISPLAY_FUTURE_MS)
+        historical.first..maxOf(historical.last, overviewPresentAnchor + OVERVIEW_FUTURE_MONTH_MS)
     }
 
     fun centeredTemporalRange(center: Long, requestedSpan: Long, outer: LongRange): LongRange {
@@ -1285,6 +1288,9 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         Icon(Icons.Default.FileDownload, contentDescription = "Exporter / sauvegarder FabData")
                     }
                     IconButton(onClick = {
+                        // Refresh also advances the visual future runway to NOW + 1 month.
+                        // History is untouched; this only enlarges the allowed navigation terrain.
+                        overviewPresentAnchor = System.currentTimeMillis()
                         val selected = WeatherReferencePrefs(context).selectedReference()
                         val operationId = FabOperationRegistry.tryStart(
                             "weather:${selected.key}",
@@ -1373,6 +1379,7 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
                         preferredIndoorSensorId = trainingTargetPrefs.indoorSensorId()
                             ?: inertiaEstimate?.diagnostics?.sourceSensorId,
                         historyBounds = overviewDisplayBounds,
+                        presentAnchorTimestamp = overviewPresentAnchor,
                         viewBounds = viewBounds,
                         selectedTimestamp = selectedTimestamp,
                         lowerZonesPending = lowerCascadeVeil,
@@ -2515,6 +2522,7 @@ private fun HistoryOverviewCard(
     sampleMap: Map<Long, List<SamplePoint>>,
     preferredIndoorSensorId: Long?,
     historyBounds: LongRange?,
+    presentAnchorTimestamp: Long,
     viewBounds: LongRange?,
     selectedTimestamp: Long?,
     lowerZonesPending: Boolean,
@@ -2606,6 +2614,13 @@ private fun HistoryOverviewCard(
                 val bandPrefs = remember {
                     helpContext.getSharedPreferences("fabdata_overview_band_curves", Context.MODE_PRIVATE)
                 }
+                var explorationContextMultiplier by rememberSaveable {
+                    mutableIntStateOf(bandPrefs.getInt("exploration_context_multiplier", 6).coerceIn(3, 9))
+                }
+                LaunchedEffect(explorationContextMultiplier) {
+                    bandPrefs.edit().putInt("exploration_context_multiplier", explorationContextMultiplier).apply()
+                }
+                var appliedRightAnchor by remember { mutableStateOf<Long?>(null) }
                 val availableBandSensors = remember(sensors, gigaSampleMap, navigatorSampleMap, sampleMap) {
                     sensors.filter { sensor ->
                         sensor.id != FORECAST_ACTIVE_SENSOR_ID &&
@@ -2676,9 +2691,12 @@ private fun HistoryOverviewCard(
                 }
 
                 val fullSpan = (bounds.last - bounds.first).coerceAtLeast(1L)
-                val maxSpan = minOf(previewPreset.spanMs, fullSpan).coerceAtLeast(1L)
                 val mainSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
                     ?: (24L * 60L * 60L * 1000L)
+                // Exploration starts at an explicit multiple of the detailed graph.
+                // This gives the middle band enough context to spot hot/cold zones before opening detail.
+                val requestedContextSpan = mainSpan * explorationContextMultiplier.toLong()
+                val maxSpan = minOf(requestedContextSpan, fullSpan).coerceAtLeast(1L)
                 val minSpan = minOf(maxSpan, maxOf(6L * 60L * 60L * 1000L, mainSpan))
                 val maxZoom = (maxSpan.toDouble() / minSpan.toDouble()).toFloat().coerceAtLeast(1f)
                 val effectiveZoom = previewZoom.coerceIn(1f, maxZoom)
@@ -2708,6 +2726,13 @@ private fun HistoryOverviewCard(
                     if (span >= outerSpan) return outer.first + outerSpan / 2L
                     return clampCenterToRange(outer.last - span / 2L, span, outer)
                 }
+                fun rightAlignedCenterAt(edge: Long, span: Long, outer: LongRange): Long {
+                    val outerSpan = (outer.last - outer.first).coerceAtLeast(1L)
+                    if (span >= outerSpan) return outer.first + outerSpan / 2L
+                    val safeEdge = edge.coerceIn(outer.first, outer.last)
+                    val start = (safeEdge - span).coerceIn(outer.first, outer.last - span)
+                    return clampCenterToRange(start + span / 2L, span, outer)
+                }
 
                 // Niveau 1 : le giga est le seul historique complet.
                 // Sa sélection doit rester un VRAI niveau intermédiaire et non retomber
@@ -2729,6 +2754,26 @@ private fun HistoryOverviewCard(
                 val previewFrom = if (previewSpan >= wideSpan) wideFrom else effectiveCenter - previewSpan / 2L
                 val previewTo = if (previewSpan >= wideSpan) wideTo else previewFrom + previewSpan
                 val previewWindow = previewFrom..previewTo
+
+                // Initial load and explicit refresh: align the complete lower cascade to the right
+                // edge of the PRESENT. The giga band may extend one month further, but we do not
+                // boot the useful views inside that intentionally empty future runway.
+                LaunchedEffect(presentAnchorTimestamp, viewBounds?.first, viewBounds?.last) {
+                    val detail = viewBounds ?: return@LaunchedEffect
+                    if (appliedRightAnchor == presentAnchorTimestamp) return@LaunchedEffect
+                    val present = presentAnchorTimestamp.coerceIn(bounds.first, bounds.last)
+                    val initialWideCenter = rightAlignedCenterAt(present, wideSpan, bounds)
+                    val initialWideRange = rangeForCenter(initialWideCenter, wideSpan, bounds)
+                    val initialPreviewCenter = rightAlignedCenterAt(present, previewSpan, initialWideRange)
+                    val initialPreviewRange = rangeForCenter(initialPreviewCenter, previewSpan, initialWideRange)
+                    val detailSpan = (detail.last - detail.first).coerceAtLeast(1L).coerceAtMost(previewSpan)
+                    val initialDetailCenter = rightAlignedCenterAt(present, detailSpan, initialPreviewRange)
+                    appliedRightAnchor = presentAnchorTimestamp
+                    wideCenter = initialWideCenter
+                    previewCenter = initialPreviewCenter
+                    onNavigate(initialDetailCenter)
+                    onSelectTimestamp(present.coerceIn(initialPreviewRange.first, initialPreviewRange.last))
+                }
 
                 LaunchedEffect(temporalPageSyncToken, temporalPageSyncCenter) {
                     if (temporalPageSyncToken > 0) {
@@ -2760,22 +2805,9 @@ private fun HistoryOverviewCard(
                     if (previewCenter != clamped) previewCenter = clamped
                 }
 
-                // v0.21.3 : le détail est le quatrième étage de la cascade.
-                // Il ne peut jamais rester hors de la sélection du bandeau 6 h.
-                LaunchedEffect(previewFrom, previewTo, viewBounds?.first, viewBounds?.last) {
-                    val detail = viewBounds ?: return@LaunchedEffect
-                    if (detail.first < previewFrom || detail.last > previewTo) {
-                        val detailSpan = (detail.last - detail.first).coerceAtLeast(1L)
-                            .coerceAtMost(previewSpan)
-                        val currentDetailCenter = detail.first + (detail.last - detail.first) / 2L
-                        val constrainedCenter = clampCenterToRange(
-                            currentDetailCenter,
-                            detailSpan,
-                            previewWindow
-                        )
-                        onNavigate(constrainedCenter)
-                    }
-                }
+                // Band 3 is intentionally independent while exploring/selecting training ranges.
+                // It never drags the detailed graph automatically. Detail moves only after an
+                // upper-band release, explicit navigation/double-tap, startup, or refresh.
                 // v0.20.8 : le bandeau exploré ne recalcule que sa fenêtre courante.
                 // Le bandeau supérieur reste volontairement grossier et global.
                 val previewSensorPoints = remember(sampleMap, sensors, bandSensorIds, previewFrom, previewTo) {
@@ -3116,6 +3148,35 @@ private fun HistoryOverviewCard(
                     Text(formatDateTime(wideTo), style = MaterialTheme.typography.labelSmall)
                 }
 
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Contexte du détail",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    (3..9).forEach { factor ->
+                        Surface(
+                            onClick = {
+                                explorationContextMultiplier = factor
+                                previewZoom = 1f
+                            },
+                            color = if (factor == explorationContextMultiplier)
+                                MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text(
+                                "×$factor",
+                                Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                fontWeight = if (factor == explorationContextMultiplier) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+
                 HorizontalDivider()
                 Text(
                     "Sélection / exploration · LOD 6 h · limitée par le bandeau du milieu",
@@ -3155,11 +3216,14 @@ private fun HistoryOverviewCard(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(surface, RoundedCornerShape(12.dp))
-                        .pointerInput(bounds, previewPreset, rangeSelectionMode) {
+                        .pointerInput(bounds, explorationContextMultiplier, rangeSelectionMode) {
                             if (!rangeSelectionMode) detectTransformGestures { centroid, pan, zoomChange, _ ->
-                                val oldMaxSpan = minOf(previewPreset.spanMs, fullSpan).coerceAtLeast(1L)
                                 val oldMainSpan = viewBounds?.let { (it.last - it.first).coerceAtLeast(1L) }
                                     ?: (24L * 60L * 60L * 1000L)
+                                val oldMaxSpan = minOf(
+                                    oldMainSpan * explorationContextMultiplier.toLong(),
+                                    fullSpan
+                                ).coerceAtLeast(1L)
                                 val oldMinSpan = minOf(
                                     oldMaxSpan,
                                     maxOf(24L * 60L * 60L * 1000L, oldMainSpan)
@@ -3477,7 +3541,7 @@ private fun HistoryOverviewCard(
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     Text(formatDateTime(previewFrom), style = MaterialTheme.typography.labelSmall)
                     Text(
-                        "fenêtre ${previewPreset.label} → détail RAW",
+                        "contexte ×$explorationContextMultiplier → détail RAW",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -3631,32 +3695,11 @@ private fun HistoryOverviewCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    PreviewPreset.entries.forEach { item ->
-                        Surface(
-                            onClick = {
-                                previewPreset = item
-                                previewZoom = 1f
-                                val targetCenter = (selectedTimestamp
-                                    ?: viewBounds?.let { it.first + (it.last - it.first) / 2L }
-                                    ?: previewCenter).coerceIn(bounds.first, bounds.last)
-                                previewCenter = targetCenter
-                                wideCenter = targetCenter
-                            },
-                            color = if (item == previewPreset) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
-                            shape = RoundedCornerShape(14.dp)
-                        ) {
-                            Text(
-                                item.label,
-                                Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                                fontWeight = if (item == previewPreset) FontWeight.Bold else FontWeight.Normal
-                            )
-                        }
-                    }
-                }
+                Text(
+                    "Largeur d’exploration pilotée par le sélecteur ×3…×9 placé entre les bandeaux 2 et 3.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
                 OutlinedButton(
                     onClick = { bandChooserOpen = !bandChooserOpen },
