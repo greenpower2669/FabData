@@ -5,11 +5,12 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 
 /**
- * Persistent life-cycle for the three forecast dials.
+ * Persistent life-cycle for the canonical ten-minute multiverse dial strip.
  *
- * A target is born as FUTURE, is enriched when it becomes PRESENT, then is sealed when it
- * reaches HISTORY. The original forecast fields never move after creation; only terrain/error
- * fields may be enriched before the row is sealed.
+ * A target is born as the single FUTURE slot, is enriched while it is the single PRESENT,
+ * then is sealed forever when it enters one of the nine visible HISTORY slots. The original
+ * forecast fields never move after creation; only terrain/error fields may be enriched before
+ * the row is sealed. Older rows remain in the full archive after leaving the nine-slot strip.
  */
 data class ForecastDialRecord(
     val referenceKey: String,

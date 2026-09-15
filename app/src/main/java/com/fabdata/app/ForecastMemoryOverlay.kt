@@ -402,12 +402,17 @@ private class ForecastDialDataSource(
             )
         }
 
-        val nowHour = hourBucket(now)
-        val targets = listOf(
-            "PASSÉ" to (nowHour - HOUR_MS),
-            "PRÉSENT" to nowHour,
-            "FUTUR" to (nowHour + HOUR_MS)
-        )
+        // v0.24.4 : the cockpit itself now lives on the same canonical ten-minute clock
+        // as forecast acquisition. Nine sealed past universes + one live present + one frozen
+        // future move left by one slot every :00/:10/:20/:30/:40/:50 boundary.
+        val nowSlot = ForecastMemoryStore.captureSlot10m(now)
+        val targets = buildList {
+            for (stepsBack in 9 downTo 1) {
+                add("P−${stepsBack * 10}" to (nowSlot - stepsBack.toLong() * FORECAST_CAPTURE_SLOT_MS))
+            }
+            add("PRÉSENT" to nowSlot)
+            add("FUTUR" to (nowSlot + FORECAST_CAPTURE_SLOT_MS))
+        }
         val result = targets.map { (label, target) ->
             persistentDial(reference.key, label, target, weatherHorizon, adaptiveHorizon)
         }
@@ -455,17 +460,22 @@ private class ForecastDialDataSource(
             updatedAt = now
         )
 
-        val allowTerrain = label != "FUTUR"
+        val isFuture = label == "FUTUR"
+        val isPresent = label == "PRÉSENT"
+        val allowTerrain = !isFuture
         val actual = if (allowTerrain) live.actualTemp ?: base.actualTemp else base.actualTemp
         val actualMeasured = if (allowTerrain && live.actualTemp != null) {
             live.actualIsMeasured
         } else base.actualIsMeasured
-        val phase = when (label) {
-            "FUTUR" -> ForecastDialHistoryStore.PHASE_FUTURE
-            "PRÉSENT" -> ForecastDialHistoryStore.PHASE_PRESENT
+        val phase = when {
+            isFuture -> ForecastDialHistoryStore.PHASE_FUTURE
+            isPresent -> ForecastDialHistoryStore.PHASE_PRESENT
             else -> ForecastDialHistoryStore.PHASE_HISTORY
         }
-        val lock = label == "PASSÉ"
+        // PRESENT may still receive a better real/reconstructed terrain value during its
+        // ten-minute slot. The instant it moves left, it is sealed forever. FUTURE is also
+        // forecast-immutable: its forecast fields are created once and never replaced.
+        val lock = !isFuture && !isPresent
         val merged = base.copy(
             actualTemp = actual,
             actualIsMeasured = actualMeasured,
@@ -961,23 +971,23 @@ private class ForecastDialStripView(
     }
 
     private fun drawBackgroundDials(canvas: Canvas, night: Boolean, current: DialState?) {
-        val dials = current?.samples ?: listOf(
-            emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
+        val dials = current?.samples ?: (
+            List(9) { index -> emptyDial("P−${90 - index * 10}") } +
+                listOf(emptyDial("PRÉSENT"), emptyDial("FUTUR"))
         )
-        val slotWidth = width / 3f
-        val cy = height * 0.47f
-        val radius = min(slotWidth * 0.42f, height * 0.23f)
-        val alphas = intArrayOf(28, 38, 50)
-        dials.take(3).forEachIndexed { index, sample ->
-            val cx = slotWidth * (index + 0.5f)
-            val alpha = alphas[index.coerceIn(0, 2)]
+        val presentIndex = (dials.size - 2).coerceAtLeast(0)
+        val past = dials.take(presentIndex)
+        val present = dials.getOrNull(presentIndex) ?: emptyDial("PRÉSENT")
+        val future = dials.getOrNull(presentIndex + 1) ?: emptyDial("FUTUR")
+        val cy = height * 0.48f
 
+        fun ghostDial(sample: DialSample, cx: Float, radius: Float, alpha: Int, major: Boolean) {
             paint.style = Paint.Style.FILL
-            paint.color = withAlpha(comparisonFill(sample, night), (alpha * 0.72f).toInt())
+            paint.color = withAlpha(comparisonFill(sample, night), (alpha * 0.68f).toInt())
             canvas.drawCircle(cx, cy, radius, paint)
 
             paint.style = Paint.Style.STROKE
-            paint.strokeWidth = dp(1.5f)
+            paint.strokeWidth = dp(if (major) 1.6f else 0.9f)
             paint.color = withAlpha(officialBorder(sample, night), alpha)
             canvas.drawCircle(cx, cy, radius, paint)
 
@@ -985,27 +995,49 @@ private class ForecastDialStripView(
                 cx - radius * 0.82f, cy - radius * 0.82f,
                 cx + radius * 0.82f, cy + radius * 0.82f
             )
-            paint.strokeWidth = dp(0.8f)
-            paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, (alpha * 0.75f).toInt())
+            paint.strokeWidth = dp(if (major) 0.8f else 0.55f)
+            paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, (alpha * 0.70f).toInt())
             canvas.drawArc(outer, 135f, 270f, false, paint)
-            for (i in 0..8) {
-                val angle = valueAngle(-2.0 + i * 0.5, -2.0, 2.0)
-                val p1 = polar(cx, cy, radius * 0.72f, angle)
-                val p2 = polar(cx, cy, radius * 0.81f, angle)
-                canvas.drawLine(p1.first, p1.second, p2.first, p2.second, paint)
+            if (major) {
+                for (i in 0..8) {
+                    val angle = valueAngle(-2.0 + i * 0.5, -2.0, 2.0)
+                    val p1 = polar(cx, cy, radius * 0.72f, angle)
+                    val p2 = polar(cx, cy, radius * 0.81f, angle)
+                    canvas.drawLine(p1.first, p1.second, p2.first, p2.second, paint)
+                }
             }
 
             drawNeedle(canvas, sample.officialSlope, cx, cy, radius * 0.72f, OFFICIAL_RED, alpha)
             drawNeedle(canvas, sample.localSlope, cx, cy, radius * 0.67f, LOCAL_YELLOW, alpha)
             drawNeedle(canvas, sample.actualSlope, cx, cy, radius * 0.61f, REAL_GREEN, alpha)
         }
+
+        // Nine smaller sealed pasts occupy the left side. Their opacity grows slightly toward
+        // the present, so the eye naturally reads the strip from old -> recent.
+        val pastStart = dp(10f)
+        val pastEnd = width * 0.61f
+        val spacing = (pastEnd - pastStart) / past.size.coerceAtLeast(1).toFloat()
+        val miniRadius = min(dp(8.5f), spacing * 0.34f)
+        past.forEachIndexed { index, sample ->
+            val cx = pastStart + spacing * (index + 0.5f)
+            ghostDial(sample, cx, miniRadius, 22 + index * 3, major = false)
+        }
+
+        // PRESENT and FUTURE remain the two large anchors of the multiverse strip.
+        val majorRadius = min(dp(25f), height * 0.16f)
+        ghostDial(present, width * 0.76f, majorRadius, 58, major = true)
+        ghostDial(future, width * 0.91f, majorRadius * 0.92f, 66, major = true)
     }
 
     private fun drawCompact(canvas: Canvas, night: Boolean, current: DialState?) {
-        val dials = current?.samples ?: listOf(
-            emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
+        val dials = current?.samples ?: (
+            List(9) { index -> emptyDial("P−${90 - index * 10}") } +
+                listOf(emptyDial("PRÉSENT"), emptyDial("FUTUR"))
         )
-        val present = dials.getOrNull(1) ?: emptyDial("PRÉSENT")
+        val presentIndex = (dials.size - 2).coerceAtLeast(0)
+        val past = dials.take(presentIndex)
+        val present = dials.getOrNull(presentIndex) ?: emptyDial("PRÉSENT")
+        val future = dials.getOrNull(presentIndex + 1) ?: emptyDial("FUTUR")
         val fill = comparisonFill(present, night)
         val border = officialBorder(present, night)
         val corner = dp(18f)
@@ -1019,16 +1051,27 @@ private class ForecastDialStripView(
         canvas.drawRoundRect(dp(1.1f), dp(1.1f), width - dp(1.1f), height - dp(1.1f), corner, corner, paint)
 
         val centerY = height / 2f
-        val spacing = width / 4f
-        dials.take(3).forEachIndexed { index, sample ->
-            val cx = spacing * (index + 1)
-            val radius = dp(if (index == 1) 7.0f else 5.0f)
+        val pastStart = dp(5f)
+        val pastEnd = width * 0.58f
+        val spacing = (pastEnd - pastStart) / past.size.coerceAtLeast(1).toFloat()
+        past.forEachIndexed { index, sample ->
+            val cx = pastStart + spacing * (index + 0.5f)
+            val radius = dp(1.55f + index * 0.05f)
             paint.style = Paint.Style.FILL
-            paint.color = withAlpha(comparisonFill(sample, night), if (index == 1) 255 else 205)
+            paint.color = withAlpha(comparisonFill(sample, night), 125 + index * 8)
+            canvas.drawCircle(cx, centerY, radius, paint)
+        }
+
+        listOf(present to (width * 0.74f), future to (width * 0.90f)).forEachIndexed { index, pair ->
+            val sample = pair.first
+            val cx = pair.second
+            val radius = dp(if (index == 0) 6.0f else 5.2f)
+            paint.style = Paint.Style.FILL
+            paint.color = withAlpha(comparisonFill(sample, night), if (index == 0) 255 else 220)
             canvas.drawCircle(cx, centerY, radius, paint)
             paint.style = Paint.Style.STROKE
-            paint.strokeWidth = dp(if (index == 1) 2.0f else 1.4f)
-            paint.color = withAlpha(officialBorder(sample, night), if (index == 1) 255 else 220)
+            paint.strokeWidth = dp(if (index == 0) 2.0f else 1.5f)
+            paint.color = withAlpha(officialBorder(sample, night), if (index == 0) 255 else 230)
             canvas.drawCircle(cx, centerY, radius, paint)
         }
     }
@@ -1220,7 +1263,7 @@ private class ForecastDialStripView(
     private fun updateAccessibility(state: DialState) {
         contentDescription = buildString {
             append("Cadrans tangentiels ${state.referenceLabel}. ")
-            append(if (compact) "Mode compact. Double-tape pour ouvrir la vue météo. " else "Mode complet : cadrans passé présent futur en arrière-plan, météo douze heures, inertie et Fab adaptative. Double-tape le cadre pour réduire. ")
+            append(if (compact) "Mode compact. Neuf passés, présent et futur. Double-tape pour ouvrir la vue météo. " else "Mode complet : neuf cadrans passés scellés de dix minutes, un présent vivant et un futur figé en arrière-plan, météo douze heures, inertie et Fab adaptative. Double-tape le cadre pour réduire. ")
             state.samples.forEach { s ->
                 append("${s.label.lowercase()} ${timeFormatter.format(Instant.ofEpochMilli(s.targetTs))}. ")
                 if (s.actualTemp == null) {

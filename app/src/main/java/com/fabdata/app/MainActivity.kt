@@ -666,7 +666,10 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             if (priorityRank >= UiReloadPriority.DATA.rank) {
                 FabOperationRegistry.update(reloadOperation, "Terrain récent · reconstruction locale 48 h…")
                 FabOperationRegistry.ensureNotCancelled(reloadOperation)
-                val terrainAnchor = userPhysicalBounds?.last ?: System.currentTimeMillis()
+                // Terrain is an autonomous 48 h weather reference. It must not stop at the
+                // last indoor/user probe sample: real station data + local reconstruction keep
+                // progressing even when no physical probe is connected.
+                val terrainAnchor = System.currentTimeMillis()
                 runCatching {
                     weatherReferenceManager.reconstructRecentLocalOnly(
                         selectedWeatherReference,
