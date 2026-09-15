@@ -669,11 +669,13 @@ private class ForecastDialStripView(
     }
 
     private val dataSource = ForecastDialDataSource(context, db)
+    private val dashboardSource = ForecastDashboardOverlayDataSource(context, db)
     private val executor = Executors.newSingleThreadExecutor()
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val timeFormatter = DateTimeFormatter.ofPattern("HH:mm")
         .withZone(ZoneId.systemDefault())
     private var state: DialState? = null
+    private var dashboardState: ForecastDashboardSnapshot? = null
     private var lastRawX = 0f
     private var lastRawY = 0f
     private var startX = 0f
@@ -693,10 +695,14 @@ private class ForecastDialStripView(
             if (!isAttachedToWindow) return
             executor.execute {
                 val next = runCatching { dataSource.load() }.getOrNull()
-                if (next != null) {
+                val dashboard = runCatching { dashboardSource.load() }.getOrNull()
+                if (next != null || dashboard != null) {
                     post {
-                        state = next
-                        updateAccessibility(next)
+                        if (next != null) {
+                            state = next
+                            updateAccessibility(next)
+                        }
+                        if (dashboard != null) dashboardState = dashboard
                         invalidate()
                     }
                 }
@@ -724,7 +730,7 @@ private class ForecastDialStripView(
         compact = true
         prefs.edit().putBoolean(KEY_COMPACT, true).apply()
         val expandedMinWidth = dp(270f).toInt()
-        val expandedMinHeight = dp(130f).toInt()
+        val expandedMinHeight = dp(245f).toInt()
         val maxWidth = maxOf(expandedMinWidth, root.width - dp(8f).toInt())
         val maxHeight = maxOf(expandedMinHeight, root.height - dp(8f).toInt())
         layoutParams = layoutParams.apply {
@@ -733,7 +739,7 @@ private class ForecastDialStripView(
                 height = dp(COMPACT_HEIGHT_DP).toInt().coerceAtMost(root.height.coerceAtLeast(1))
             } else {
                 width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(expandedMinWidth, maxWidth)
-                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(expandedMinHeight, maxHeight)
+                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 286f)).toInt().coerceIn(expandedMinHeight, maxHeight)
             }
         }
         requestLayout()
@@ -773,7 +779,7 @@ private class ForecastDialStripView(
                 if (abs(event.rawX - downRawX) > dp(5f) || abs(event.rawY - downRawY) > dp(5f)) moved = true
                 if (resizing) {
                     val minWidth = dp(270f).toInt()
-                    val minHeight = dp(130f).toInt()
+                    val minHeight = dp(245f).toInt()
                     val maxWidth = maxOf(minWidth, (parentView.width - x).toInt())
                     val maxHeight = maxOf(minHeight, (parentView.height - y).toInt())
                     layoutParams = layoutParams.apply {
@@ -885,7 +891,7 @@ private class ForecastDialStripView(
         prefs.edit().putBoolean(KEY_COMPACT, compact).apply()
 
         val minWidth = dp(270f).toInt()
-        val minHeight = dp(130f).toInt()
+        val minHeight = dp(245f).toInt()
         val maxWidth = maxOf(minWidth, root.width - dp(8f).toInt())
         val maxHeight = maxOf(minHeight, root.height - dp(8f).toInt())
         layoutParams = layoutParams.apply {
@@ -894,7 +900,7 @@ private class ForecastDialStripView(
                 height = dp(COMPACT_HEIGHT_DP).toInt().coerceAtMost(root.height.coerceAtLeast(1))
             } else {
                 width = dp(prefs.getFloat(KEY_WIDTH_DP, 348f)).toInt().coerceIn(minWidth, maxWidth)
-                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 154f)).toInt().coerceIn(minHeight, maxHeight)
+                height = dp(prefs.getFloat(KEY_HEIGHT_DP, 286f)).toInt().coerceIn(minHeight, maxHeight)
             }
         }
         requestLayout()
@@ -939,19 +945,15 @@ private class ForecastDialStripView(
         paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, 55)
         canvas.drawRoundRect(dp(0.5f), dp(0.5f), width - dp(0.5f), height - dp(0.5f), dp(16f), dp(16f), paint)
 
-        drawLegend(canvas, night, current)
-        val dials = current?.samples ?: listOf(
-            emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
+        ForecastDashboardPainter.draw(
+            canvas = canvas,
+            width = width.toFloat(),
+            height = height.toFloat(),
+            snapshot = dashboardState,
+            night = night,
+            density = resources.displayMetrics.density,
+            scaledDensity = resources.displayMetrics.scaledDensity
         )
-        val top = dp(30f)
-        val availableH = height - top - dp(4f)
-        val slotWidth = width / 3f
-        dials.take(3).forEachIndexed { index, sample ->
-            val cx = slotWidth * (index + 0.5f)
-            val cy = top + availableH * 0.48f
-            val radius = min(slotWidth * 0.41f, availableH * 0.35f)
-            drawDial(canvas, sample, cx, cy, radius, index, night)
-        }
         drawResizeHandle(canvas, night)
     }
 
@@ -1174,7 +1176,7 @@ private class ForecastDialStripView(
     private fun updateAccessibility(state: DialState) {
         contentDescription = buildString {
             append("Cadrans tangentiels ${state.referenceLabel}. ")
-            append(if (compact) "Mode compact. Double-tape pour ouvrir les cadrans. " else "Mode complet. Double-tape le cadre pour réduire les cadrans. ")
+            append(if (compact) "Mode compact. Double-tape pour ouvrir la vue météo. " else "Mode complet : météo douze heures, inertie et Fab adaptative. Double-tape le cadre pour réduire. ")
             state.samples.forEach { s ->
                 append("${s.label.lowercase()} ${timeFormatter.format(Instant.ofEpochMilli(s.targetTs))}. ")
                 if (s.actualTemp == null) {
