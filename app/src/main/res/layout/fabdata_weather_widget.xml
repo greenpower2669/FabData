@@ -60,13 +60,12 @@
             android:textColor="#FFFFFFFF" />
     </FrameLayout>
 
-    <TextView
+    <View
         android:layout_width="match_parent"
         android:layout_height="1dp"
         android:layout_marginTop="4dp"
         android:layout_marginBottom="5dp"
-        android:background="#33FFFFFF"
-        android:text="" />
+        android:background="#33FFFFFF" />
 
     <TextView
         android:id="@+id/widget_inertia_values"
