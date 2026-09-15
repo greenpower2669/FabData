@@ -1,0 +1,114 @@
+name: Build FabData v0.24.1 release
+
+on:
+  push:
+    branches:
+      - release/v0241-dial-memory-widget12h
+    paths:
+      - 'app/**'
+      - 'tools/patch_v0241_dial_memory_widget12h.py'
+      - '.github/workflows/build-v0241-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: release/v0241-dial-memory-widget12h
+          fetch-depth: 0
+
+      - name: Apply v0.24.1 patch once
+        shell: bash
+        run: |
+          if grep -q 'versionName = "0.24.1"' app/build.gradle.kts && \
+             grep -q 'persistentDial' app/src/main/java/com/fabdata/app/ForecastMemoryOverlay.kt && \
+             grep -q 'DIAL_HISTORY' app/src/main/java/com/fabdata/app/BackupV3Support.kt; then
+            echo 'v0.24.1 patch already present'
+          else
+            python tools/patch_v0241_dial_memory_widget12h.py
+          fi
+
+      - name: Commit release source
+        shell: bash
+        run: |
+          if ! git diff --quiet -- app; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add app
+            git commit -m 'Release v0.24.1 persistent dials and 12h widget [skip ci]'
+            git push origin HEAD:release/v0241-dial-memory-widget12h
+          else
+            echo 'No source changes to commit'
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Use preinstalled Android SDK
+        shell: bash
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo 'sdkmanager not found on hosted runner' >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Verify release invariants
+        shell: bash
+        run: |
+          grep -q 'applicationId = "com.fabdata.app"' app/build.gradle.kts
+          grep -q 'versionCode = 68' app/build.gradle.kts
+          grep -q 'versionName = "0.24.1"' app/build.gradle.kts
+          grep -q 'FabDataWeatherWidget' app/src/main/AndroidManifest.xml
+          grep -q 'DIAL_HISTORY' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -q 'TRAINED_MODEL' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -q 'TRAINING_POLICY' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -q 'TRAINING_EXCLUSION' app/src/main/java/com/fabdata/app/BackupV3Support.kt
+          grep -q 'setOf("1", "2", "3", "4", FORMAT_VERSION)' app/src/main/java/com/fabdata/app/BackupLayer.kt
+          grep -q 'now + 12L \* WIDGET_HOUR_MS' app/src/main/java/com/fabdata/app/FabDataWeatherWidget.kt
+          if grep -q 'applicationIdSuffix' app/build.gradle.kts; then
+            echo 'Unexpected applicationIdSuffix in production release' >&2
+            exit 1
+          fi
+
+      - name: Build production release APK
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Stage release APK
+        shell: bash
+        run: |
+          rm -rf ci-artifacts
+          mkdir -p ci-artifacts
+          cp app/build/outputs/apk/release/app-release.apk ci-artifacts/FabData-v0.24.1-release.apk
+          sha256sum ci-artifacts/FabData-v0.24.1-release.apk > ci-artifacts/FabData-v0.24.1-release-sha256.txt
+          ls -lh ci-artifacts/
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FabData-v0.24.1-release
+          path: |
+            ci-artifacts/FabData-v0.24.1-release.apk
+            ci-artifacts/FabData-v0.24.1-release-sha256.txt
+          if-no-files-found: error
+          retention-days: 90
