@@ -50,6 +50,7 @@ class FabDataBackupV3Support(
         ForecastPastArchiveStore.ensure(sql)
         ForecastCurve10mStore.ensure(sql)
         ForecastAdaptiveStore.ensure(sql)
+        ForecastDialHistoryStore.ensure(sql)
         // Force the cached constructors now too; subsequent rows perform data writes only.
         restoreWeatherStore
         restoreWallStore
@@ -76,6 +77,7 @@ class FabDataBackupV3Support(
         ForecastPastArchiveStore.ensure(db.writableDatabase)
         ForecastCurve10mStore.ensure(db.writableDatabase)
         ForecastAdaptiveStore.ensure(db.writableDatabase)
+        ForecastDialHistoryStore.ensure(db.writableDatabase)
 
         writePersonalizationRows(writer)
         writeJson(writer, "WEATHER_META", weatherMetaJson())
@@ -274,6 +276,32 @@ class FabDataBackupV3Support(
             }
         }
 
+        ForecastDialHistoryStore.all(db.readableDatabase).forEach { dial ->
+            writeJson(writer, "DIAL_HISTORY", JSONObject().apply {
+                put("referenceKey", dial.referenceKey)
+                put("targetTs", dial.targetTs)
+                put("weatherHorizon", dial.weatherHorizon)
+                put("adaptiveHorizon", dial.adaptiveHorizon)
+                putNullable("officialTemp", dial.officialTemp)
+                putNullable("localTemp", dial.localTemp)
+                putNullable("actualTemp", dial.actualTemp)
+                put("actualIsMeasured", dial.actualIsMeasured)
+                putNullable("officialSlope", dial.officialSlope)
+                putNullable("localSlope", dial.localSlope)
+                putNullable("actualSlope", dial.actualSlope)
+                putNullable("officialAcceleration", dial.officialAcceleration)
+                putNullable("localAcceleration", dial.localAcceleration)
+                putNullable("actualAcceleration", dial.actualAcceleration)
+                putNullable("officialError", dial.officialError)
+                putNullable("localError", dial.localError)
+                put("trainingSamples", dial.trainingSamples)
+                put("phase", dial.phase)
+                put("locked", dial.locked)
+                put("createdAt", dial.createdAt)
+                put("updatedAt", dial.updatedAt)
+            })
+        }
+
         db.readableDatabase.rawQuery(
             """
             SELECT reference_key, timestamp, temperature, humidity, source, confidence
@@ -316,6 +344,7 @@ class FabDataBackupV3Support(
                 "FORECAST_PAST_API_ARCHIVE" -> restoreForecastPastApiArchive(json(values))
                 "FORECAST_CURVE_10M_ARCHIVE" -> restoreForecastCurve10mArchive(json(values))
                 "FORECAST_ADAPTIVE_ARCHIVE" -> restoreForecastAdaptiveArchive(json(values))
+                "DIAL_HISTORY" -> restoreDialHistory(json(values))
                 "WEATHER" -> restoreWeather(values)
                 else -> return false
             }
@@ -743,6 +772,44 @@ class FabDataBackupV3Support(
             provider = o.optString("provider", "active_reference"),
             modelVersion = o.optString("modelVersion", ForecastAdaptiveStore.MODEL_VERSION),
             createdAt = o.optLong("createdAt", issuedAt)
+        )
+    }
+
+    private fun restoreDialHistory(o: JSONObject) {
+        val key = o.optString("referenceKey", "").trim()
+        val targetTs = o.optLong("targetTs", -1L)
+        if (key.isBlank() || targetTs < 0L) return
+        val weatherHorizon = o.optInt("weatherHorizon", 1).coerceIn(1, 48)
+        val requestedAdaptive = o.optInt("adaptiveHorizon", 1)
+        val adaptiveHorizon = requestedAdaptive.takeIf { it in FORECAST_ADAPTIVE_HORIZONS } ?: 1
+        val phase = o.optString("phase", ForecastDialHistoryStore.PHASE_HISTORY).ifBlank {
+            ForecastDialHistoryStore.PHASE_HISTORY
+        }
+        ForecastDialHistoryStore.restore(
+            db.writableDatabase,
+            ForecastDialRecord(
+                referenceKey = key,
+                targetTs = targetTs,
+                weatherHorizon = weatherHorizon,
+                adaptiveHorizon = adaptiveHorizon,
+                officialTemp = nullableDouble(o, "officialTemp"),
+                localTemp = nullableDouble(o, "localTemp"),
+                actualTemp = nullableDouble(o, "actualTemp"),
+                actualIsMeasured = o.optBoolean("actualIsMeasured", false),
+                officialSlope = nullableDouble(o, "officialSlope"),
+                localSlope = nullableDouble(o, "localSlope"),
+                actualSlope = nullableDouble(o, "actualSlope"),
+                officialAcceleration = nullableDouble(o, "officialAcceleration"),
+                localAcceleration = nullableDouble(o, "localAcceleration"),
+                actualAcceleration = nullableDouble(o, "actualAcceleration"),
+                officialError = nullableDouble(o, "officialError"),
+                localError = nullableDouble(o, "localError"),
+                trainingSamples = o.optInt("trainingSamples", 0),
+                phase = phase,
+                locked = o.optBoolean("locked", phase == ForecastDialHistoryStore.PHASE_HISTORY),
+                createdAt = o.optLong("createdAt", targetTs),
+                updatedAt = o.optLong("updatedAt", targetTs)
+            )
         )
     }
 

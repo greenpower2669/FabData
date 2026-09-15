@@ -14,10 +14,11 @@
         android:gravity="center_vertical">
 
         <TextView
+            android:id="@+id/widget_title"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="FabData · MÉTÉO"
+            android:text="FabData · MÉTÉO 12 h"
             android:textStyle="bold"
             android:textSize="14sp"
             android:textColor="#FFFFFFFF" />
@@ -31,7 +32,22 @@
             android:textColor="#CCFFFFFF" />
     </LinearLayout>
 
+    <TextView
+        android:id="@+id/widget_compact_values"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:gravity="center"
+        android:padding="6dp"
+        android:background="@drawable/fabdata_widget_value_pill"
+        android:text="Météo 12 h · maintenant — · +1 h —"
+        android:textStyle="bold"
+        android:textSize="14sp"
+        android:textColor="#FFFFFFFF"
+        android:visibility="gone" />
+
     <FrameLayout
+        android:id="@+id/widget_weather_panel"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1.15"
@@ -61,6 +77,7 @@
     </FrameLayout>
 
     <View
+        android:id="@+id/widget_separator"
         android:layout_width="match_parent"
         android:layout_height="1dp"
         android:layout_marginTop="4dp"

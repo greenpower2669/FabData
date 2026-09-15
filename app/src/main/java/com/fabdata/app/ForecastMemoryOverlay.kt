@@ -388,6 +388,7 @@ private class ForecastDialDataSource(
         ForecastMemoryStore.ensure(db.writableDatabase)
         ForecastHorizonArchiveStore.ensure(db.writableDatabase)
         ForecastAdaptiveStore.ensure(db.writableDatabase)
+        ForecastDialHistoryStore.ensure(db.writableDatabase)
         val reference = WeatherReferencePrefs(appContext).selectedReference()
         val weatherHorizon = dialPrefs.getInt(DIAL_WEATHER_HORIZON_KEY, 1).coerceIn(1, 48)
         val requestedAdaptive = dialPrefs.getInt(DIAL_ADAPTIVE_HORIZON_KEY, 1)
@@ -408,10 +409,94 @@ private class ForecastDialDataSource(
             "FUTUR" to (nowHour + HOUR_MS)
         )
         val result = targets.map { (label, target) ->
-            buildDial(reference.key, label, target, weatherHorizon, adaptiveHorizon)
+            persistentDial(reference.key, label, target, weatherHorizon, adaptiveHorizon)
         }
         return DialState(reference.label, weatherHorizon, adaptiveHorizon, result)
     }
+
+    private fun persistentDial(
+        referenceKey: String,
+        label: String,
+        target: Long,
+        weatherHorizon: Int,
+        adaptiveHorizon: Int
+    ): DialSample {
+        val sql = db.writableDatabase
+        val existing = ForecastDialHistoryStore.get(
+            sql, referenceKey, target, weatherHorizon, adaptiveHorizon
+        )
+        // A left/history dial is immutable forever: this is the exact prediction that lived
+        // on the right, later enriched by terrain when it crossed the present.
+        if (existing?.locked == true) return existing.toDialSample(label)
+
+        val live = buildDial(referenceKey, label, target, weatherHorizon, adaptiveHorizon)
+        val now = System.currentTimeMillis()
+        val base = existing ?: ForecastDialRecord(
+            referenceKey = referenceKey,
+            targetTs = target,
+            weatherHorizon = weatherHorizon,
+            adaptiveHorizon = adaptiveHorizon,
+            officialTemp = live.officialTemp,
+            localTemp = live.localTemp,
+            actualTemp = null,
+            actualIsMeasured = false,
+            officialSlope = live.officialSlope,
+            localSlope = live.localSlope,
+            actualSlope = null,
+            officialAcceleration = live.officialAcceleration,
+            localAcceleration = live.localAcceleration,
+            actualAcceleration = null,
+            officialError = null,
+            localError = null,
+            trainingSamples = live.trainingSamples,
+            phase = ForecastDialHistoryStore.PHASE_FUTURE,
+            locked = false,
+            createdAt = now,
+            updatedAt = now
+        )
+
+        val allowTerrain = label != "FUTUR"
+        val actual = if (allowTerrain) live.actualTemp ?: base.actualTemp else base.actualTemp
+        val actualMeasured = if (allowTerrain && live.actualTemp != null) {
+            live.actualIsMeasured
+        } else base.actualIsMeasured
+        val phase = when (label) {
+            "FUTUR" -> ForecastDialHistoryStore.PHASE_FUTURE
+            "PRÉSENT" -> ForecastDialHistoryStore.PHASE_PRESENT
+            else -> ForecastDialHistoryStore.PHASE_HISTORY
+        }
+        val lock = label == "PASSÉ"
+        val merged = base.copy(
+            actualTemp = actual,
+            actualIsMeasured = actualMeasured,
+            actualSlope = if (allowTerrain) live.actualSlope ?: base.actualSlope else base.actualSlope,
+            actualAcceleration = if (allowTerrain) live.actualAcceleration ?: base.actualAcceleration else base.actualAcceleration,
+            officialError = if (base.officialTemp != null && actual != null) abs(base.officialTemp - actual) else base.officialError,
+            localError = if (base.localTemp != null && actual != null) abs(base.localTemp - actual) else base.localError,
+            phase = phase,
+            locked = lock,
+            updatedAt = now
+        )
+        return ForecastDialHistoryStore.save(sql, merged).toDialSample(label)
+    }
+
+    private fun ForecastDialRecord.toDialSample(label: String) = DialSample(
+        label = label,
+        targetTs = targetTs,
+        officialTemp = officialTemp,
+        localTemp = localTemp,
+        actualTemp = actualTemp,
+        actualIsMeasured = actualIsMeasured,
+        officialSlope = officialSlope,
+        localSlope = localSlope,
+        actualSlope = actualSlope,
+        officialAcceleration = officialAcceleration,
+        localAcceleration = localAcceleration,
+        actualAcceleration = actualAcceleration,
+        officialError = officialError,
+        localError = localError,
+        trainingSamples = trainingSamples
+    )
 
     private fun buildDial(
         referenceKey: String,

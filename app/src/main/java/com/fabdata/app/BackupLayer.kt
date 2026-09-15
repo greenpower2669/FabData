@@ -95,7 +95,7 @@ class FabDataBackup(private val context: Context, private val db: FabDataDb) {
             val totalPreferences = recordTypes.count { it == "UI_PREFERENCES" }
             val archiveTypes = setOf(
                 "FORECAST_ARCHIVE", "FORECAST_LOCAL_ARCHIVE", "FORECAST_PAST_API_ARCHIVE",
-                "FORECAST_CURVE_10M_ARCHIVE", "FORECAST_ADAPTIVE_ARCHIVE"
+                "FORECAST_CURVE_10M_ARCHIVE", "FORECAST_ADAPTIVE_ARCHIVE", "DIAL_HISTORY"
             )
             val totalArchives = recordTypes.count { it in archiveTypes }
 

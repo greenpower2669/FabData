@@ -18,6 +18,9 @@ import kotlin.math.min
 
 private const val WIDGET_HOUR_MS = 60L * 60L * 1000L
 private const val WIDGET_MINUTE_MS = 60L * 1000L
+private const val ACTION_WIDGET_TAP = "com.fabdata.app.action.WIDGET_DOUBLE_TAP"
+private const val WIDGET_DOUBLE_TAP_MS = 520L
+private const val WIDGET_PREFS = "fabdata_android_widget"
 
 private data class WidgetCurvePoint(
     val timestamp: Long,
@@ -62,31 +65,74 @@ class FabDataWeatherWidget : AppWidgetProvider() {
         renderAsync(context.applicationContext, appWidgetManager, appWidgetId)
     }
 
+    override fun onReceive(context: Context, intent: Intent) {
+        super.onReceive(context, intent)
+        if (intent.action != ACTION_WIDGET_TAP) return
+        val id = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
+        if (id == AppWidgetManager.INVALID_APPWIDGET_ID) return
+        val prefs = context.getSharedPreferences(WIDGET_PREFS, Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val key = "last_tap_$id"
+        val previous = prefs.getLong(key, 0L)
+        if (previous > 0L && now - previous <= WIDGET_DOUBLE_TAP_MS) {
+            val collapsedKey = "collapsed_$id"
+            prefs.edit()
+                .putBoolean(collapsedKey, !prefs.getBoolean(collapsedKey, false))
+                .putLong(key, 0L)
+                .apply()
+            renderAsync(context.applicationContext, AppWidgetManager.getInstance(context), id)
+        } else {
+            prefs.edit().putLong(key, now).apply()
+        }
+    }
+
     companion object {
         private val executor = Executors.newSingleThreadExecutor()
 
         private fun renderAsync(context: Context, manager: AppWidgetManager, id: Int) {
             executor.execute {
                 val snapshot = runCatching { loadSnapshot(context) }.getOrNull()
-                val views = buildRemoteViews(context, snapshot)
+                val views = buildRemoteViews(context, snapshot, id)
                 manager.updateAppWidget(id, views)
             }
         }
 
-        private fun buildRemoteViews(context: Context, snapshot: WidgetSnapshot?): RemoteViews {
+        private fun buildRemoteViews(context: Context, snapshot: WidgetSnapshot?, widgetId: Int): RemoteViews {
             val views = RemoteViews(context.packageName, R.layout.fabdata_weather_widget)
             val launchIntent = Intent(context, MainActivity::class.java)
-            val pendingIntent = PendingIntent.getActivity(
+            val openIntent = PendingIntent.getActivity(
                 context,
-                2400,
+                2400 + widgetId,
                 launchIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
-            views.setOnClickPendingIntent(R.id.widget_root, pendingIntent)
+            val tapIntent = Intent(context, FabDataWeatherWidget::class.java).apply {
+                action = ACTION_WIDGET_TAP
+                putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId)
+            }
+            val tapPendingIntent = PendingIntent.getBroadcast(
+                context,
+                24000 + widgetId,
+                tapIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            views.setOnClickPendingIntent(R.id.widget_root, tapPendingIntent)
+            views.setOnClickPendingIntent(R.id.widget_title, openIntent)
+            views.setOnClickPendingIntent(R.id.widget_reference, openIntent)
+
+            val collapsed = context.getSharedPreferences(WIDGET_PREFS, Context.MODE_PRIVATE)
+                .getBoolean("collapsed_$widgetId", false)
+            views.setViewVisibility(R.id.widget_compact_values, if (collapsed) android.view.View.VISIBLE else android.view.View.GONE)
+            views.setViewVisibility(R.id.widget_weather_panel, if (collapsed) android.view.View.GONE else android.view.View.VISIBLE)
+            views.setViewVisibility(R.id.widget_separator, if (collapsed) android.view.View.GONE else android.view.View.VISIBLE)
+            views.setViewVisibility(R.id.widget_inertia_values, if (collapsed) android.view.View.GONE else android.view.View.VISIBLE)
+            views.setViewVisibility(R.id.widget_adaptive_caption, if (collapsed) android.view.View.GONE else android.view.View.VISIBLE)
+            views.setViewVisibility(R.id.widget_adaptive_curve, if (collapsed) android.view.View.GONE else android.view.View.VISIBLE)
 
             if (snapshot == null) {
                 views.setTextViewText(R.id.widget_reference, "FabData")
-                views.setTextViewText(R.id.widget_weather_values, "Météo  —     +1 h  —")
+                views.setTextViewText(R.id.widget_weather_values, "Météo 12 h · maintenant — · +1 h —")
+                views.setTextViewText(R.id.widget_compact_values, "Météo 12 h · maintenant — · +1 h —")
                 views.setTextViewText(R.id.widget_inertia_values, "Sol inertiel  —   +1 h —   +2 h —")
                 views.setTextViewText(R.id.widget_adaptive_caption, "Fab adaptative H+1 → H+48 · données en attente")
                 views.setImageViewBitmap(R.id.widget_weather_curve, emptyChart(720, 180))
@@ -105,6 +151,10 @@ class FabDataWeatherWidget : AppWidgetProvider() {
             views.setTextViewText(
                 R.id.widget_weather_values,
                 "Maintenant  $weatherNow        +1 h  $weatherPlus1"
+            )
+            views.setTextViewText(
+                R.id.widget_compact_values,
+                "Météo 12 h · maintenant $weatherNow · +1 h $weatherPlus1"
             )
             views.setTextViewText(
                 R.id.widget_inertia_values,
@@ -127,7 +177,8 @@ class FabDataWeatherWidget : AppWidgetProvider() {
                 R.id.widget_root,
                 "FabData ${snapshot.referenceLabel}. Météo maintenant $weatherNow, dans une heure $weatherPlus1. " +
                     "Sol inertiel maintenant $inertiaNow, dans une heure $inertiaPlus1, dans deux heures $inertiaPlus2. " +
-                    "Prévision Fab adaptative de H plus 1 à H plus 48. Touchez pour ouvrir FabData."
+                    "Prévision météo visible sur douze heures et Fab adaptative de H plus 1 à H plus 48. " +
+                    "Double-tapez le widget pour le replier ou le déplier; touchez le titre pour ouvrir FabData."
             )
             return views
         }
@@ -154,8 +205,9 @@ class FabDataWeatherWidget : AppWidgetProvider() {
         }
 
         private fun readWeatherCurve(db: FabDataDb, referenceKey: String, now: Long): List<WidgetCurvePoint> {
-            val from = now - 3L * WIDGET_HOUR_MS
-            val to = now + 3L * WIDGET_HOUR_MS
+            // Keep one hour of context, then show the next twelve forecast hours.
+            val from = now - 1L * WIDGET_HOUR_MS
+            val to = now + 12L * WIDGET_HOUR_MS
             val byTimestamp = linkedMapOf<Long, Double>()
             db.readableDatabase.rawQuery(
                 """
