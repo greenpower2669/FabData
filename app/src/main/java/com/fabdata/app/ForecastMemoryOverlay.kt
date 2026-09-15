@@ -945,6 +945,9 @@ private class ForecastDialStripView(
         paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, 55)
         canvas.drawRoundRect(dp(0.5f), dp(0.5f), width - dp(0.5f), height - dp(0.5f), dp(16f), dp(16f), paint)
 
+        // Keep the beautiful curve dashboard in the foreground, but never throw away
+        // the scientific cockpit: PASSÉ / PRÉSENT / FUTUR remain visible as ghost instruments.
+        drawBackgroundDials(canvas, night, current)
         ForecastDashboardPainter.draw(
             canvas = canvas,
             width = width.toFloat(),
@@ -955,6 +958,47 @@ private class ForecastDialStripView(
             scaledDensity = resources.displayMetrics.scaledDensity
         )
         drawResizeHandle(canvas, night)
+    }
+
+    private fun drawBackgroundDials(canvas: Canvas, night: Boolean, current: DialState?) {
+        val dials = current?.samples ?: listOf(
+            emptyDial("PASSÉ"), emptyDial("PRÉSENT"), emptyDial("FUTUR")
+        )
+        val slotWidth = width / 3f
+        val cy = height * 0.47f
+        val radius = min(slotWidth * 0.42f, height * 0.23f)
+        val alphas = intArrayOf(28, 38, 50)
+        dials.take(3).forEachIndexed { index, sample ->
+            val cx = slotWidth * (index + 0.5f)
+            val alpha = alphas[index.coerceIn(0, 2)]
+
+            paint.style = Paint.Style.FILL
+            paint.color = withAlpha(comparisonFill(sample, night), (alpha * 0.72f).toInt())
+            canvas.drawCircle(cx, cy, radius, paint)
+
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = dp(1.5f)
+            paint.color = withAlpha(officialBorder(sample, night), alpha)
+            canvas.drawCircle(cx, cy, radius, paint)
+
+            val outer = RectF(
+                cx - radius * 0.82f, cy - radius * 0.82f,
+                cx + radius * 0.82f, cy + radius * 0.82f
+            )
+            paint.strokeWidth = dp(0.8f)
+            paint.color = withAlpha(if (night) Color.WHITE else Color.DKGRAY, (alpha * 0.75f).toInt())
+            canvas.drawArc(outer, 135f, 270f, false, paint)
+            for (i in 0..8) {
+                val angle = valueAngle(-2.0 + i * 0.5, -2.0, 2.0)
+                val p1 = polar(cx, cy, radius * 0.72f, angle)
+                val p2 = polar(cx, cy, radius * 0.81f, angle)
+                canvas.drawLine(p1.first, p1.second, p2.first, p2.second, paint)
+            }
+
+            drawNeedle(canvas, sample.officialSlope, cx, cy, radius * 0.72f, OFFICIAL_RED, alpha)
+            drawNeedle(canvas, sample.localSlope, cx, cy, radius * 0.67f, LOCAL_YELLOW, alpha)
+            drawNeedle(canvas, sample.actualSlope, cx, cy, radius * 0.61f, REAL_GREEN, alpha)
+        }
     }
 
     private fun drawCompact(canvas: Canvas, night: Boolean, current: DialState?) {
@@ -1176,7 +1220,7 @@ private class ForecastDialStripView(
     private fun updateAccessibility(state: DialState) {
         contentDescription = buildString {
             append("Cadrans tangentiels ${state.referenceLabel}. ")
-            append(if (compact) "Mode compact. Double-tape pour ouvrir la vue météo. " else "Mode complet : météo douze heures, inertie et Fab adaptative. Double-tape le cadre pour réduire. ")
+            append(if (compact) "Mode compact. Double-tape pour ouvrir la vue météo. " else "Mode complet : cadrans passé présent futur en arrière-plan, météo douze heures, inertie et Fab adaptative. Double-tape le cadre pour réduire. ")
             state.samples.forEach { s ->
                 append("${s.label.lowercase()} ${timeFormatter.format(Instant.ofEpochMilli(s.targetTs))}. ")
                 if (s.actualTemp == null) {

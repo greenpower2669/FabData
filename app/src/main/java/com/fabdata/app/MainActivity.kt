@@ -663,6 +663,18 @@ private fun FabDataApp(db: FabDataDb, initialImport: android.net.Uri?) {
             val userPhysicalBounds = db.physicalSensorBounds()
             val physicalBounds = userPhysicalBounds ?: db.globalTimeBounds()
             val selectedWeatherReference = WeatherReferencePrefs(context).selectedReference()
+            if (priorityRank >= UiReloadPriority.DATA.rank) {
+                FabOperationRegistry.update(reloadOperation, "Terrain récent · reconstruction locale 48 h…")
+                FabOperationRegistry.ensureNotCancelled(reloadOperation)
+                val terrainAnchor = userPhysicalBounds?.last ?: System.currentTimeMillis()
+                runCatching {
+                    weatherReferenceManager.reconstructRecentLocalOnly(
+                        selectedWeatherReference,
+                        anchorTimestamp = terrainAnchor,
+                        hours = 48
+                    )
+                }
+            }
             val weatherBounds = weatherReferenceStore.historyBounds(selectedWeatherReference.key)
             val historicalBounds = when {
                 physicalBounds == null -> weatherBounds
@@ -3226,6 +3238,35 @@ private fun HistoryOverviewCard(
                     }
                 }
 
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Start,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AssistChip(
+                        onClick = {
+                            rangeSelectionMode = !rangeSelectionMode
+                            rangeMenuOpen = false
+                            rangeStart = null
+                            rangeEnd = null
+                            if (rangeSelectionMode) {
+                                helpOpen = false
+                                demoOpen = false
+                            }
+                        },
+                        label = {
+                            Text(if (rangeSelectionMode) "✓ Sélection active" else "Sélectionner une période")
+                        }
+                    )
+                }
+                if (rangeSelectionMode) {
+                    Text(
+                        "↔ Mode sélection : glisse sur le bandeau 3. Désactive pour retrouver zoom, pincement et déplacement.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
                 HorizontalDivider()
                 Text(
                     "Sélection / exploration · LOD 6 h · météo colorée + sondes · 1/2 du bandeau 2",
@@ -3625,21 +3666,6 @@ private fun HistoryOverviewCard(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    AssistChip(
-                        onClick = {
-                            rangeSelectionMode = !rangeSelectionMode
-                            rangeMenuOpen = false
-                            rangeStart = null
-                            rangeEnd = null
-                            if (rangeSelectionMode) {
-                                helpOpen = false
-                                demoOpen = false
-                            }
-                        },
-                        label = {
-                            Text(if (rangeSelectionMode) "✓ Sélection active" else "Sélectionner une période")
-                        }
-                    )
                     OutlinedButton(
                         onClick = {
                             helpOpen = !helpOpen
@@ -3654,13 +3680,6 @@ private fun HistoryOverviewCard(
                             demoOpen = false
                         }
                     ) { Text("! Alertes / astuce") }
-                }
-                if (rangeSelectionMode) {
-                    Text(
-                        "↔ Une seule zone à la fois : glisse, valide l'action, puis refais une sélection pour en ajouter une autre.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
                 }
 
                 if (helpOpen) {

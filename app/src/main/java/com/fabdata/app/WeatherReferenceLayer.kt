@@ -712,6 +712,66 @@ class WeatherReferenceManager(
         )
     }
 
+    /**
+     * Rebuild the recent terrain window strictly from data already present on the device.
+     *
+     * This is deliberately separate from refreshRecent/refreshSelected: opening FabData,
+     * refreshing the UI or changing a viewport must never consume another provider forecast
+     * capture. MEASURED keeps absolute priority; reconstruction only fills what local material
+     * can support. The returned forecast count is therefore always zero.
+     */
+    fun reconstructRecentLocalOnly(
+        reference: WeatherReference,
+        anchorTimestamp: Long = System.currentTimeMillis(),
+        hours: Int = 48
+    ): WeatherReferenceSyncResult {
+        val safeHours = hours.coerceIn(1, 168)
+        val now = System.currentTimeMillis()
+        val to = minOf(anchorTimestamp, now).coerceAtLeast(0L)
+        val from = (to - safeHours.toLong() * hourMs).coerceAtLeast(0L)
+        store.rememberReference(reference)
+
+        if (reference.key == WeatherReferenceCatalog.DEFAULT_KEY) {
+            // Lyon has a complete local reconstruction engine. Feed it first, then overlay
+            // every real observation. WeatherReferenceStore.upsert protects that priority too.
+            val sensor = db.getOrCreateSensor(LyonWeatherSync.STABLE_KEY, LyonWeatherSync.DISPLAY_NAME)
+            lyonLab.reconstruct(from, to).points.forEach { p ->
+                store.upsert(
+                    reference.key,
+                    WeatherReferencePoint(
+                        p.timestamp, p.temperature, p.humidity,
+                        PointSource.RECONSTRUCTED, 0.72
+                    )
+                )
+            }
+            db.querySamples(sensor.id, from, to, maxPoints = 30_000).forEach { p ->
+                val source = PointSourceStore.sourceFor(db, sensor.id, p.timestamp)
+                store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, source))
+            }
+            lyonLab.queryOfficial(LyonSeriesKind.HOURLY, from, to).forEach { p ->
+                store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.MEASURED))
+            }
+            lyonLab.queryOfficial(LyonSeriesKind.SIX_MIN, from, to).forEach { p ->
+                store.upsert(reference.key, WeatherReferencePoint(p.timestamp, p.temperature, p.humidity, PointSource.MEASURED))
+            }
+        } else {
+            // Dynamic stations cannot invent unavailable observations. We only interpolate
+            // short holes bounded by real local observations; existing reconstructed points
+            // remain available and are never allowed to outrank MEASURED.
+            reconstructShortGaps(reference.key, from, to)
+        }
+
+        store.reconcileMeasuredDominance(reference.key, from, to)
+        val actual = store.query(reference.key, from, to)
+            .filter { it.source != PointSource.FORECAST }
+        return WeatherReferenceSyncResult(
+            measured = actual.count { it.source == PointSource.MEASURED },
+            reconstructed = actual.count { it.source == PointSource.RECONSTRUCTED },
+            forecast = 0,
+            label = reference.label
+        )
+    }
+
     fun ensureLocalCache(reference: WeatherReference, from: Long, to: Long): WeatherReferenceSyncResult {
         store.rememberReference(reference)
         store.keepOnly(reference.key)
